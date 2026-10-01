@@ -1,0 +1,32 @@
+# Belaku TradeBot dependencies
+
+# Core dependencies
+asyncio>=3.4.3
+logging>=0.5.0
+pydantic>=2.0.0
+python-dateutil>=2.8.0
+
+# Data handling
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Zerodha integration
+requests>=2.28.0
+websockets>=10.0.0
+python-dotenv>=0.19.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.19.0
+black>=22.0.0
+flake8>=4.0.0
+mypy>=0.991
+
+# Monitoring and metrics
+prometheus-client>=0.14.0
+
+# Configuration
+pyyaml>=6.0
+
+# Testing and validation
+pytest-cov>=3.0.0
