@@ -19,8 +19,8 @@ import requests
 import websockets
 from enum import Enum
 
-from ..core.engine import Order, OrderStatus, PositionSide
-from .base import BaseExchange
+from core.types import Order, OrderStatus, PositionSide
+from exchanges.base import BaseExchange
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,16 @@ class ZerodhaOrderType(Enum):
 class ZerodhaTransactionType(Enum):
     """Zerodha transaction type enumeration."""
     BUY = "BUY"
-    SELL = "SELL"pe: str
+    SELL = "SELL"
+
+
+@dataclass
+class ZerodhaToken:
+    """Zerodha token/instrument data structure."""
+    symbol: str
+    name: str
+    exchange: str
+    instrument_type: str
     lot_size: int
     tick_size: float
     price_precision: int
