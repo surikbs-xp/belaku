@@ -11,9 +11,9 @@ import sys
 from datetime import datetime
 from typing import Dict, Any
 
-from .core.engine import TradingEngine
-from .exchanges.zerodha import ZerodhaExchange
-from .core.strategy.giftnifty import GiftNiftyStrategy
+from core.engine import TradingEngine
+from exchanges.zerodha import ZerodhaExchange
+from core.strategy.giftnifty import GiftNiftyStrategy
 
 # Configure logging
 logging.basicConfig(

@@ -8,7 +8,7 @@ Belaku TradeBot is a comprehensive trading automation platform that combines adv
 
 ## Features
 
-- **Multi-exchange support**: Binance, Coinbase, Kraken, and more
+- **Multi-exchange support**: Zerodha and other exchanges
 - **Advanced strategies**: Technical analysis, machine learning, sentiment analysis
 - **Risk management**: Position sizing, stop-loss, take-profit, portfolio optimization
 - **Real-time monitoring**: Live P&L tracking, performance analytics
@@ -24,15 +24,20 @@ belaku/
 ├── core/
 │   ├── engine.py          # Main trading engine
 │   ├── strategy/          # Strategy implementations
+│   │   ├── base.py        # Base strategy class
+│   │   └── giftnifty.py   # GiftNifty-specific strategy
 │   ├── risk/              # Risk management
+│   │   └── manager.py     # Risk control logic
 │   └── data/              # Data handling
+│       └── handler.py     # Market data processing
 ├── exchanges/             # Exchange integrations
-├── backtesting/           # Backtesting framework
-├── paper_trading/         # Paper trading module
-├── monitoring/            # Monitoring and analytics
-├── config/                # Configuration management
-├── utils/                 # Utility functions
-└── tests/                 # Test suite
+│   ├── base.py            # Base exchange class
+│   └── zerodha.py         # Zerodha integration
+├── core/types.py          # Shared data types
+├── main.py                # Entry point
+├── requirements.txt       # Dependencies
+├── .env.example          # Environment configuration
+└── test_structure.py      # Structure test script
 ```
 
 ## Quick Start

@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 
-from ..engine import Order, PositionSide
+from core.types import Order, PositionSide
 
 logger = logging.getLogger(__name__)
 

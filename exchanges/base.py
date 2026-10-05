@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from ..core.engine import Order
+from core.types import Order
 
 logger = logging.getLogger(__name__)
 

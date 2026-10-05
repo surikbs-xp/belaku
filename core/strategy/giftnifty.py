@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 import pandas as pd
 import numpy as np
 
-from .base import BaseStrategy, Signal
-from ..engine import Order, PositionSide
+from core.strategy.base import BaseStrategy, Signal
+from core.types import Order, PositionSide
 
 logger = logging.getLogger(__name__)
 
