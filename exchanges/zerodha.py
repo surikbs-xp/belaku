@@ -127,8 +127,8 @@ class ZerodhaAPI:
         self.api_key = api_key
         self.api_secret = api_secret
         self.access_token = access_token
-        self.base_url = "https://api.zerodha.com"
-        self.websocket_url = "wss://ws.zerodha.com"
+        self.base_url = "https://api.kite.trade"
+        self.websocket_url = "wss://ws.kite.trade"
         self.session = requests.Session()
         self.session.headers.update({
             'X-KITE-APIKEY': api_key,

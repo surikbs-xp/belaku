@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 import numpy as np
 
-from core.types import Order, PositionSide
+from core.types import Order, PositionSide, Position
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +327,44 @@ class RiskManager:
             
         except Exception as e:
             logger.error(f"Error updating risk metrics for {symbol}: {str(e)}")
+
+    async def update_position(self, position: Position) -> None:
+        """
+        Update position and recalculate risk metrics.
+        
+        Args:
+            position: Position to update
+        """
+        try:
+            # Update position in position sizes
+            key = f"{position.symbol}_{position.exchange}"
+            self.position_sizes[key] = PositionSize(
+                symbol=position.symbol,
+                exchange=position.exchange,
+                quantity=position.quantity,
+                entry_price=position.entry_price,
+                stop_loss_price=position.stop_loss,
+                take_profit_price=position.take_profit,
+                risk_amount=position.unrealized_pnl,
+                expected_return=position.unrealized_pnl,
+                risk_reward_ratio=1.0
+            )
+            
+            # Update risk metrics
+            price_data = {
+                'prices': [position.entry_price, position.current_price or position.entry_price],
+                'volume': 1000,  # Default volume
+                'beta': 1.0,  # Default beta
+                'returns': [(position.current_price or position.entry_price) / position.entry_price - 1],
+                'std_dev': 0.2  # Default standard deviation
+            }
+            
+            await self.update_risk_metrics(position.symbol, position.exchange, price_data)
+            
+            logger.info(f"Updated position for {position.symbol}: {position.quantity} shares")
+            
+        except Exception as e:
+            logger.error(f"Error updating position for {position.symbol}: {str(e)}")
 
     async def check_portfolio_risk(self, positions: Dict[str, Any]) -> Dict[str, Any]:
         """
