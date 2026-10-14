@@ -41,6 +41,13 @@ def test_imports():
     except ImportError as e:
         print(f"❌ core.strategy.giftnifty import failed: {e}")
         return False
+
+    try:
+        from core.strategy.supertrend_divergence import SuperTrendWeightedDivergenceStrategy
+        print("✅ core.strategy.supertrend_divergence imported successfully")
+    except ImportError as e:
+        print(f"❌ core.strategy.supertrend_divergence import failed: {e}")
+        return False
     
     try:
         from core.risk.manager import RiskManager
@@ -135,6 +142,36 @@ async def test_strategy_functionality():
         assert strategy.name == 'GiftNifty'
         assert strategy.enabled == True
         print("✅ Strategy properties work correctly")
+
+        from core.strategy.supertrend_divergence import SuperTrendWeightedDivergenceStrategy
+        st_strategy = SuperTrendWeightedDivergenceStrategy({
+            'atr_period': 10,
+            'multiplier': 3.0,
+            'rsi_period': 14,
+            'rsi_weight': 0.6,
+            'macd_weight': 0.4,
+            'min_strength': 0.55,
+        })
+
+        sample_series = [
+            {'open': 100.0, 'high': 101.0, 'low': 99.5, 'close': 100.8},
+            {'open': 100.8, 'high': 101.5, 'low': 100.2, 'close': 101.2},
+            {'open': 101.2, 'high': 102.0, 'low': 100.9, 'close': 101.8},
+            {'open': 101.8, 'high': 102.2, 'low': 101.0, 'close': 102.4},
+            {'open': 102.4, 'high': 102.8, 'low': 101.5, 'close': 102.1},
+            {'open': 102.1, 'high': 102.6, 'low': 101.7, 'close': 102.5},
+            {'open': 102.5, 'high': 103.1, 'low': 101.9, 'close': 103.0},
+            {'open': 103.0, 'high': 103.6, 'low': 102.2, 'close': 103.2},
+            {'open': 103.2, 'high': 103.8, 'low': 102.9, 'close': 103.4},
+            {'open': 103.4, 'high': 103.9, 'low': 102.8, 'close': 103.1},
+            {'open': 103.1, 'high': 103.7, 'low': 102.5, 'close': 103.6},
+            {'open': 103.6, 'high': 104.1, 'low': 103.0, 'close': 104.0},
+            {'open': 104.0, 'high': 104.5, 'low': 103.2, 'close': 104.2},
+            {'open': 104.2, 'high': 104.8, 'low': 103.5, 'close': 104.6},
+        ]
+        signals = await st_strategy.analyze({'NIFTY': {'candles': sample_series}})
+        assert isinstance(signals, list)
+        print("✅ SuperTrendWeightedDivergenceStrategy generated valid signal output")
         
         return True
         

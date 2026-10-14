@@ -38,3 +38,13 @@
 2026-10-13 13:17:30,904 - core.data.handler - INFO - Data handler initialized
 2026-10-13 13:17:30,905 - core.engine - INFO - Trading engine initialized
 2026-10-13 13:17:30,905 - core.data.handler - INFO - Data handler initialized
+2026-10-13 15:25:06,372 - core.risk.manager - INFO - Risk manager initialized
+2026-10-13 15:25:06,373 - core.risk.manager - INFO - Risk manager initialized
+2026-10-13 15:25:06,373 - core.data.handler - INFO - Data handler initialized
+2026-10-13 15:25:06,373 - core.engine - INFO - Trading engine initialized
+2026-10-13 15:25:06,373 - core.data.handler - INFO - Data handler initialized
+2026-10-13 15:34:30,583 - core.risk.manager - INFO - Risk manager initialized
+2026-10-13 15:34:30,584 - core.risk.manager - INFO - Risk manager initialized
+2026-10-13 15:34:30,584 - core.data.handler - INFO - Data handler initialized
+2026-10-13 15:34:30,585 - core.engine - INFO - Trading engine initialized
+2026-10-13 15:34:30,585 - core.data.handler - INFO - Data handler initialized
