@@ -13248,3 +13248,24 @@
 2026-10-14 15:36:28,500 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
 2026-10-14 15:36:28,560 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
 2026-10-14 15:36:28,561 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:29,562 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:29,612 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:29,612 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:30,614 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:30,664 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:30,664 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:31,666 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:31,720 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:31,720 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:32,721 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:32,785 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:32,785 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:33,786 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:33,849 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:33,849 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:34,850 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:34,911 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:34,912 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:35,913 - core.strategy.giftnifty - INFO - Generated 0 signals from GiftNifty events
+2026-10-14 15:36:35,980 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
+2026-10-14 15:36:35,981 - exchanges.zerodha - ERROR - Failed to get positions: 403 Client Error: Forbidden for url: https://api.kite.trade/portfolio/positions
