@@ -14,7 +14,7 @@ from enum import Enum
 import json
 import time
 
-from core.strategy.base import BaseStrategy
+from core.strategy.base import BaseStrategy, Signal
 from core.risk.manager import RiskManager
 from core.data.handler import DataHandler
 from exchanges.base import BaseExchange
@@ -88,20 +88,26 @@ class TradingEngine:
         
         This method initializes all components and begins the main trading loop.
         """
-        logger.info("Starting trading engine")
+        logger.info("[ENGINE] Starting trading engine")
         self.running = True
         
         # Initialize exchanges
+        logger.info("[ENGINE] Connecting %d exchange(s)", len(self.exchanges))
         for exchange in self.exchanges.values():
+            logger.info("[ENGINE] Connecting exchange: %s", exchange.name)
             await exchange.connect()
+            logger.info("[ENGINE] Exchange connected: %s", exchange.name)
         
         # Start data handler
+        logger.info("[ENGINE] Starting data handler")
         await self.data_handler.start()
+        logger.info("[ENGINE] Data handler started")
         
         # Start main trading loop
+        logger.info("[ENGINE] Launching trading loop task")
         asyncio.create_task(self._trading_loop())
         
-        logger.info("Trading engine started successfully")
+        logger.info("[ENGINE] Trading engine started successfully")
 
     async def stop(self) -> None:
         """
@@ -131,23 +137,25 @@ class TradingEngine:
         Returns:
             True if order was submitted successfully, False otherwise
         """
+        logger.info("[ORDER] Attempting to submit order %s for %s %s %s", order.id, order.side, order.quantity, order.symbol)
         try:
             # Validate order
             if not await self._validate_order(order):
-                logger.error(f"Order validation failed for {order.id}")
+                logger.error("[ORDER] Validation failed for %s", order.id)
                 return False
             
             # Check risk management
             if not await self.risk_manager.check_order(order):
-                logger.error(f"Risk check failed for order {order.id}")
+                logger.error("[ORDER] Risk check failed for order %s", order.id)
                 return False
             
             # Submit to exchange
             exchange = self.exchanges.get(order.exchange)
             if not exchange:
-                logger.error(f"Exchange {order.exchange} not found")
+                logger.error("[ORDER] Exchange %s not found for order %s", order.exchange, order.id)
                 return False
             
+            logger.info("[ORDER] Sending to exchange %s", exchange.name)
             exchange_order_id = await exchange.submit_order(order)
             order.order_id = exchange_order_id
             order.status = OrderStatus.SUBMITTED
@@ -156,11 +164,11 @@ class TradingEngine:
             self.orders[order.id] = order
             self.order_history.append(order)
             
-            logger.info(f"Order submitted: {order.id} - {order.symbol} {order.side} {order.quantity}")
+            logger.info("[ORDER] Submitted successfully: %s - %s %s %s", order.id, order.symbol, order.side, order.quantity)
             return True
             
         except Exception as e:
-            logger.error(f"Error submitting order {order.id}: {str(e)}")
+            logger.error("[ORDER] Error submitting order %s: %s", order.id, str(e))
             order.status = OrderStatus.REJECTED
             return False
 
@@ -263,72 +271,113 @@ class TradingEngine:
         
         This method handles strategy execution, order management, and position updates.
         """
+        logger.info("[LOOP] Trading loop started")
         while self.running:
             try:
                 # Get current market data
-                market_data = await self.data_handler.get_latest_data()
+                logger.info("[LOOP] Fetching latest market snapshot")
+                market_data = await self.data_handler.get_latest_snapshot()
+                market_status = self.data_handler.is_market_active('NSE')
+                logger.info("[MARKET] NSE market active=%s", market_status)
+                logger.info("[LOOP] Snapshot received for %d symbol(s)", len(market_data))
+
+                if not market_data:
+                    if market_status:
+                        logger.warning("[MARKET] No live price data yet; seeding debug candle feed")
+                        await self.data_handler.seed_debug_market_data(symbol='NIFTY', exchange='NSE')
+                        market_data = await self.data_handler.get_latest_snapshot()
+                        logger.info("[LOOP] Snapshot after debug seed: %d symbol(s)", len(market_data))
+                    else:
+                        logger.info("[MARKET] Market is closed; strategy evaluation skipped")
+                        await asyncio.sleep(self.config.get('loop_interval', 1.0))
+                        continue
                 
                 # Execute strategies
                 for strategy in self.strategies:
+                    logger.info("[LOOP] Running strategy: %s", strategy.name)
                     signals = await strategy.analyze(market_data)
+                    logger.info("[LOOP] Strategy %s produced %d signal(s)", strategy.name, len(signals))
                     await self._process_signals(signals)
                 
                 # Update positions
+                logger.info("[LOOP] Refreshing positions from exchange")
                 await self._update_positions()
                 
                 # Check for stop-loss and take-profit
+                logger.info("[LOOP] Checking exit conditions")
                 await self._check_exit_conditions()
                 
                 # Sleep for next iteration
+                logger.info("[LOOP] Sleeping for %.2f seconds", self.config.get('loop_interval', 1.0))
                 await asyncio.sleep(self.config.get('loop_interval', 1.0))
                 
             except Exception as e:
-                logger.error(f"Error in trading loop: {str(e)}")
+                logger.error("[LOOP] Error in trading loop: %s", str(e))
                 await asyncio.sleep(5.0)  # Wait before retrying
 
-    async def _process_signals(self, signals: List[Dict[str, Any]]) -> None:
+    async def _process_signals(self, signals: List[Signal]) -> None:
         """
         Process trading signals from strategies.
         
         Args:
             signals: List of trading signals
         """
+        if not signals:
+            logger.info("[SIGNAL] No signals to process")
+            return
+
         for signal in signals:
             try:
+                logger.info("[SIGNAL] Processing signal: %s %s @ %.2f strength=%.2f", signal.signal_type, signal.symbol, signal.price or 0.0, signal.strength)
                 # Create order from signal
                 order = self._create_order_from_signal(signal)
                 if order:
+                    logger.info("[SIGNAL] Created order %s from signal for %s", order.id, signal.symbol)
                     # Submit order
                     await self.submit_order(order)
+                else:
+                    logger.warning("[SIGNAL] Could not create order from signal for %s", signal.symbol)
             except Exception as e:
-                logger.error(f"Error processing signal: {str(e)}")
+                logger.error("[SIGNAL] Error processing signal for %s: %s", signal.symbol if signal else 'unknown', str(e))
 
     async def _update_positions(self) -> None:
         """
         Update current positions from exchanges.
+
+        Exchange payloads are keyed by ``EXCHANGE:SYMBOL`` and carry a signed net
+        quantity, so the direction of a position comes from the sign.
         """
         for exchange in self.exchanges.values():
             exchange_positions = await exchange.get_positions()
             
-            for symbol, position_data in exchange_positions.items():
-                if symbol in self.positions:
+            for position_key, position_data in exchange_positions.items():
+                quantity = float(position_data['quantity'])
+                if not quantity:
+                    continue
+                
+                symbol = position_key.split(':', 1)[-1]
+                average_price = float(position_data.get('average_price') or 0.0)
+                current_price = float(position_data.get('last_price') or average_price)
+                side = PositionSide.LONG if quantity > 0 else PositionSide.SHORT
+                
+                position = self.positions.get(symbol)
+                if position:
                     # Update existing position
-                    position = self.positions[symbol]
-                    position.quantity = position_data['quantity']
-                    position.current_price = position_data['price']
-                    position.update_pnl(position_data['price'])
+                    position.side = side
+                    position.quantity = abs(quantity)
+                    position.update_pnl(current_price)
                 else:
                     # Create new position
-                    side = PositionSide.LONG if position_data['side'] == 'buy' else PositionSide.SHORT
                     position = Position(
                         symbol=symbol,
                         side=side,
-                        quantity=position_data['quantity'],
-                        entry_price=position_data['entry_price'],
+                        quantity=abs(quantity),
+                        entry_price=average_price or current_price,
+                        current_price=current_price,
                         exchange=exchange.name
                     )
+                    position.update_pnl(current_price)
                     self.positions[symbol] = position
-                    self.position_history.append(position)
 
     async def _check_exit_conditions(self) -> None:
         """
@@ -380,46 +429,41 @@ class TradingEngine:
         
         return True
 
-    def _create_order_from_signal(self, signal: Dict[str, Any]) -> Optional[Order]:
+    def _create_order_from_signal(self, signal: Signal) -> Optional[Order]:
         """
         Create an order from a trading signal.
         
         Args:
-            signal: Trading signal dictionary
+            signal: Trading signal
             
         Returns:
             Order object or None if signal cannot be converted
         """
-        try:
-            signal_type = signal.get('type', '')
-            symbol = signal.get('symbol', '')
-            quantity = signal.get('quantity', 0.0)
-            price = signal.get('price')
-            
-            if signal_type == 'buy' and quantity > 0:
-                return Order(
-                    id=f"signal_{symbol}_{int(time.time())}",
-                    symbol=symbol,
-                    side='buy',
-                    order_type='market',
-                    quantity=quantity,
-                    price=price
-                )
-            elif signal_type == 'sell' and quantity > 0:
-                return Order(
-                    id=f"signal_{symbol}_{int(time.time())}",
-                    symbol=symbol,
-                    side='sell',
-                    order_type='market',
-                    quantity=quantity,
-                    price=price
-                )
-            
+        if signal.signal_type not in ('buy', 'sell') or not signal.quantity or signal.quantity <= 0:
             return None
-            
-        except Exception as e:
-            logger.error(f"Error creating order from signal: {str(e)}")
+        
+        exchange = self._default_exchange_name()
+        if exchange is None:
+            logger.error(
+                f"Cannot route signal for {signal.symbol}: register exactly one exchange"
+            )
             return None
+        
+        return Order(
+            id=f"signal_{signal.symbol}_{int(time.time())}",
+            symbol=signal.symbol,
+            side=signal.signal_type,
+            order_type='market',
+            quantity=signal.quantity,
+            price=signal.price,
+            exchange=exchange
+        )
+
+    def _default_exchange_name(self) -> Optional[str]:
+        """Return the only registered exchange name, if there is exactly one."""
+        if len(self.exchanges) == 1:
+            return next(iter(self.exchanges))
+        return None
 
     def get_stats(self) -> Dict[str, Any]:
         """

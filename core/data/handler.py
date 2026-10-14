@@ -218,6 +218,57 @@ class DataHandler:
         data = list(self.market_data_streams[stream_key])[-limit:]
         return data
 
+    async def get_latest_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Return the latest market values keyed by symbol for strategies."""
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for stream in self.market_data_streams.values():
+            if not stream:
+                continue
+            latest = stream[-1]
+            snapshot[latest.symbol] = {
+                'price': latest.close_price,
+                'open_price': latest.open_price,
+                'high_price': latest.high_price,
+                'low_price': latest.low_price,
+                'volume': latest.volume,
+                'timestamp': latest.timestamp,
+            }
+        return snapshot
+
+    def is_market_active(self, exchange: str = 'NSE', now: Optional[datetime] = None) -> bool:
+        """Return whether the exchange is currently in normal trading hours."""
+        current = now or datetime.now()
+        weekday = current.weekday()
+        if weekday >= 5:
+            return False
+
+        market_open = current.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = current.replace(hour=15, minute=30, second=0, microsecond=0)
+
+        if exchange.upper() not in {'NSE', 'BSE', 'NFO'}:
+            return False
+
+        return market_open <= current <= market_close
+
+    async def seed_debug_market_data(self, symbol: str = 'NIFTY', exchange: str = 'NSE') -> None:
+        """Seed a synthetic candle series to validate strategy logic when no live feed is present."""
+        if not self.is_market_active(exchange=exchange):
+            logger.info("[MARKET] %s market is closed; debug seed skipped", exchange)
+            return
+
+        if symbol not in {stream.split('_', 1)[0] for stream in self.market_data_streams.keys()}:
+            await self.add_data_stream(symbol, exchange, max_size=200)
+
+        candles = [
+            {'symbol': symbol, 'exchange': exchange, 'timestamp': (datetime.now() - timedelta(minutes=30 - i)).isoformat(), 'open_price': 100 + i, 'high_price': 101 + i, 'low_price': 99 + i, 'close_price': 100.5 + i, 'volume': 1000 + i * 10, 'timeframe': '1minute'}
+            for i in range(30)
+        ]
+
+        for candle in candles:
+            await self._process_new_data(candle)
+
+        logger.info("[DEBUG] Seeded %d synthetic candles for %s/%s", len(candles), exchange, symbol)
+
     async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "1minute") -> List[MarketData]:
         """
         Get historical data for a symbol.

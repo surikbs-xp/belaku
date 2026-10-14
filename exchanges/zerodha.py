@@ -7,14 +7,14 @@ commodities, and currencies.
 """
 
 import asyncio
+import csv
+import io
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 import json
-import time
-import hmac
-import hashlib
+from urllib.parse import urlencode
 import requests
 import websockets
 from enum import Enum
@@ -23,6 +23,9 @@ from core.types import Order, OrderStatus, PositionSide
 from exchanges.base import BaseExchange
 
 logger = logging.getLogger(__name__)
+
+# Every Kite REST call gets a hard deadline so a stalled socket cannot freeze the event loop.
+REQUEST_TIMEOUT = 15
 
 
 class ZerodhaOrderStatus(Enum):
@@ -36,12 +39,10 @@ class ZerodhaOrderStatus(Enum):
 
 
 class ZerodhaProductType(Enum):
-    """Zerodha product type enumeration."""
-    CNC = "CNC"  # Cash and Carry
-    INTRADAY = "MIS"  # Mis
-    MARGIN = "MARGIN"  # Margin
-    CO = "CO"  # Cover Order
-    BO = "BO"  # Bracket Order
+    """Kite margin products."""
+    CNC = "CNC"    # Cash and Carry, equity delivery
+    NRML = "NRML"  # Normal, carry-forward futures and options
+    MIS = "MIS"    # Margin Intraday Squareoff
 
 
 class ZerodhaOrderType(Enum):
@@ -65,6 +66,7 @@ class ZerodhaToken:
     symbol: str
     name: str
     exchange: str
+    instrument_token: int
     instrument_type: str
     lot_size: int
     tick_size: float
@@ -86,8 +88,6 @@ class ZerodhaPosition:
     product_type: str
     exchange: str
     timestamp: datetime = field(default_factory=datetime.now)
-    m2m_pnl: float = 0.0
-    overnight_pnl: float = 0.0
 
 
 @dataclass
@@ -96,11 +96,10 @@ class ZerodhaOrderRequest:
     symbol: str
     transaction_type: str
     quantity: int
+    exchange: str = "NSE"
     price: Optional[float] = None
     product: str = "CNC"
     order_type: str = "MARKET"
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
     validity: str = "DAY"
     disclosed_quantity: int = 0
     trigger_price: Optional[float] = None
@@ -130,10 +129,7 @@ class ZerodhaAPI:
         self.base_url = "https://api.kite.trade"
         self.websocket_url = "wss://ws.kite.trade"
         self.session = requests.Session()
-        self.session.headers.update({
-            'X-KITE-APIKEY': api_key,
-            'Content-Type': 'application/json'
-        })
+        self.session.headers.update({'X-Kite-ApiKey': api_key})
         
         # Event handlers
         self.order_update_handlers: List[Callable] = []
@@ -145,25 +141,6 @@ class ZerodhaAPI:
         self.ws_connection = None
         self.websocket_tasks = []
 
-    def _generate_access_token(self) -> str:
-        """
-        Generate access token using API key and secret.
-        
-        Returns:
-            Access token string
-        """
-        # This is a simplified version - in production, you'd need to handle
-        # the actual OAuth flow with Zerodha
-        timestamp = str(int(time.time()))
-        message = timestamp + self.api_key + self.api_secret
-        signature = hmac.new(
-            self.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest().upper()
-        
-        return f"{self.api_key}:{timestamp}:{signature}"
-
     def _get_headers(self) -> Dict[str, str]:
         """
         Get request headers with authentication.
@@ -173,7 +150,8 @@ class ZerodhaAPI:
         """
         headers = self.session.headers.copy()
         if self.access_token:
-            headers['Authorization'] = f'Bearer {self.access_token}'
+            headers['Authorization'] = f'token {self.api_key}:{self.access_token}'
+            headers['X-Kite-Version'] = '3'
         return headers
 
     async def connect(self) -> None:
@@ -181,14 +159,14 @@ class ZerodhaAPI:
         Connect to Zerodha API.
         """
         try:
-            # Generate access token if not provided
             if not self.access_token:
-                self.access_token = self._generate_access_token()
+                raise ValueError("Kite access token is required; start main.py to authorize")
             
             # Test connection
             response = self.session.get(
-                f"{self.base_url}/api/user/profile",
-                headers=self._get_headers()
+                f"{self.base_url}/user/profile",
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
@@ -222,25 +200,32 @@ class ZerodhaAPI:
         """
         try:
             response = self.session.get(
-                f"{self.base_url}/api/instruments",
-                params={'exchange': exchange},
-                headers=self._get_headers()
+                f"{self.base_url}/instruments/{exchange}",
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
             instruments = []
-            for instrument_data in response.json():
+            for instrument_data in csv.DictReader(io.StringIO(response.text)):
+                tick_size = float(instrument_data['tick_size'])
+                tick_text = f"{tick_size:.10f}".rstrip('0').rstrip('.')
+                price_precision = len(tick_text.partition('.')[2])
+                expiry = instrument_data['expiry']
+                strike = instrument_data['strike']
+                instrument_type = instrument_data['instrument_type']
                 token = ZerodhaToken(
                     symbol=instrument_data['tradingsymbol'],
                     name=instrument_data['name'],
                     exchange=instrument_data['exchange'],
-                    instrument_type=instrument_data['instrumenttype'],
-                    lot_size=instrument_data['lotsize'],
-                    tick_size=instrument_data['ticksize'],
-                    price_precision=instrument_data['priceprecision'],
-                    expiry_date=datetime.fromisoformat(instrument_data['expiry']) if instrument_data.get('expiry') else None,
-                    strike_price=float(instrument_data['strike']) if instrument_data.get('strike') else None,
-                    option_type=instrument_data['optiontype'] if instrument_data.get('optiontype') else None
+                    instrument_token=int(instrument_data['instrument_token']),
+                    instrument_type=instrument_type,
+                    lot_size=int(instrument_data['lot_size']),
+                    tick_size=tick_size,
+                    price_precision=price_precision,
+                    expiry_date=datetime.fromisoformat(expiry) if expiry else None,
+                    strike_price=float(strike) if strike else None,
+                    option_type=instrument_type if instrument_type in {'CE', 'PE'} else None
                 )
                 instruments.append(token)
             
@@ -263,14 +248,17 @@ class ZerodhaAPI:
             Dictionary containing quote data
         """
         try:
+            instrument_key = f"{exchange}:{symbol}"
             response = self.session.get(
-                f"{self.base_url}/api/quote",
-                params={'symbol': symbol, 'exchange': exchange},
-                headers=self._get_headers()
+                f"{self.base_url}/quote",
+                params={'i': instrument_key},
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
-            
-            return response.json()
+
+            payload = response.json()
+            return payload.get('data', {}).get(instrument_key, {})
             
         except Exception as e:
             logger.error(f"Failed to get quote for {symbol}: {str(e)}")
@@ -288,9 +276,10 @@ class ZerodhaAPI:
         """
         try:
             order_data = {
-                'symbol': order_request.symbol,
+                'tradingsymbol': order_request.symbol,
+                'exchange': order_request.exchange,
                 'transaction_type': order_request.transaction_type,
-                'quantity': order_request.quantity,
+                'quantity': int(order_request.quantity),
                 'product': order_request.product,
                 'order_type': order_request.order_type,
                 'validity': order_request.validity,
@@ -300,12 +289,6 @@ class ZerodhaAPI:
             if order_request.price:
                 order_data['price'] = order_request.price
             
-            if order_request.stop_loss:
-                order_data['stop_loss'] = order_request.stop_loss
-            
-            if order_request.take_profit:
-                order_data['take_profit'] = order_request.take_profit
-            
             if order_request.trigger_price:
                 order_data['trigger_price'] = order_request.trigger_price
             
@@ -313,15 +296,16 @@ class ZerodhaAPI:
                 order_data['tag'] = order_request.tag
             
             response = self.session.post(
-                f"{self.base_url}/api/order/regular",
-                json=order_data,
-                headers=self._get_headers()
+                f"{self.base_url}/orders/regular",
+                data=order_data,
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
-            order_response = response.json()
-            logger.info(f"Order placed: {order_response.get('orderid', 'unknown')}")
-            return order_response
+            order_id = response.json().get('data', {}).get('order_id', '')
+            logger.info(f"Order placed: {order_id or 'unknown'}")
+            return {'order_id': order_id}
             
         except Exception as e:
             logger.error(f"Failed to place order: {str(e)}")
@@ -339,14 +323,14 @@ class ZerodhaAPI:
         """
         try:
             response = self.session.delete(
-                f"{self.base_url}/api/order/regular/{order_id}",
-                headers=self._get_headers()
+                f"{self.base_url}/orders/regular/{order_id}",
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
-            cancel_response = response.json()
             logger.info(f"Order canceled: {order_id}")
-            return cancel_response
+            return response.json().get('data', {})
             
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {str(e)}")
@@ -361,26 +345,30 @@ class ZerodhaAPI:
         """
         try:
             response = self.session.get(
-                f"{self.base_url}/api/positions",
-                headers=self._get_headers()
+                f"{self.base_url}/portfolio/positions",
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
             positions = []
-            for position_data in response.json():
-                position = ZerodhaPosition(
-                    symbol=position_data['symbol'],
-                    quantity=float(position_data['quantity']),
-                    average_price=float(position_data['average_price']),
-                    last_price=float(position_data['last_price']),
-                    pnl=float(position_data['pnl']),
-                    pnl_percent=float(position_data['pnl_percent']),
-                    product_type=position_data['product'],
-                    exchange=position_data['exchange'],
-                    m2m_pnl=float(position_data.get('m2m_pnl', 0)),
-                    overnight_pnl=float(position_data.get('overnight_pnl', 0))
+            for position_data in response.json().get('data', {}).get('net', []):
+                average_price = float(position_data.get('average_price') or 0)
+                last_price = float(position_data.get('last_price') or 0)
+                pnl_percent = (
+                    (last_price - average_price) / average_price * 100
+                    if average_price else 0.0
                 )
-                positions.append(position)
+                positions.append(ZerodhaPosition(
+                    symbol=position_data['tradingsymbol'],
+                    quantity=float(position_data['quantity']),
+                    average_price=average_price,
+                    last_price=last_price,
+                    pnl=float(position_data.get('pnl') or 0),
+                    pnl_percent=pnl_percent,
+                    product_type=position_data.get('product', ''),
+                    exchange=position_data.get('exchange', '')
+                ))
             
             logger.info(f"Retrieved {len(positions)} positions")
             return positions
@@ -389,32 +377,26 @@ class ZerodhaAPI:
             logger.error(f"Failed to get positions: {str(e)}")
             raise
 
-    async def get_order_history(self, days: int = 30) -> List[Dict[str, Any]]:
+    async def get_order_history(self) -> List[Dict[str, Any]]:
         """
-        Get order history from Zerodha.
+        Get today's orders from Zerodha.
         
-        Args:
-            days: Number of days of history to retrieve
+        Kite only keeps the order book for the current trading day.
             
         Returns:
             List of order history entries
         """
         try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
             response = self.session.get(
-                f"{self.base_url}/api/orders",
-                params={
-                    'from': start_date.isoformat(),
-                    'to': end_date.isoformat()
-                },
-                headers=self._get_headers()
+                f"{self.base_url}/orders",
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
-            logger.info(f"Retrieved {len(response.json())} orders from history")
-            return response.json()
+            orders = response.json().get('data', [])
+            logger.info(f"Retrieved {len(orders)} orders from history")
+            return orders
             
         except Exception as e:
             logger.error(f"Failed to get order history: {str(e)}")
@@ -425,21 +407,53 @@ class ZerodhaAPI:
         Start WebSocket connection for real-time data.
         """
         try:
-            # Connect to WebSocket
-            self.ws_connection = await websockets.connect(self.websocket_url)
-            
-            # Start WebSocket tasks
-            order_task = asyncio.create_task(self._handle_order_updates())
-            trade_task = asyncio.create_task(self._handle_trade_updates())
-            position_task = asyncio.create_task(self._handle_position_updates())
-            
-            self.websocket_tasks = [order_task, trade_task, position_task]
+            if not self.access_token:
+                raise ValueError("Kite access token is required for the WebSocket")
+
+            ws_params = urlencode({
+                'api_key': self.api_key,
+                'access_token': self.access_token,
+            })
+            ws_url = f"{self.websocket_url}/?{ws_params}"
+            self.ws_connection = await websockets.connect(ws_url)
+            self.websocket_tasks = [
+                asyncio.create_task(self._handle_websocket_messages())
+            ]
             
             logger.info("WebSocket connection started")
             
         except Exception as e:
             logger.error(f"Failed to start WebSocket: {str(e)}")
             raise
+
+    async def _handle_websocket_messages(self) -> None:
+        """Dispatch text updates from Kite's single WebSocket stream."""
+        try:
+            async for message in self.ws_connection:
+                if isinstance(message, bytes):
+                    logger.debug("Received %d bytes of market data", len(message))
+                    continue
+
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.warning("Ignoring malformed Kite WebSocket message")
+                    continue
+
+                message_type = data.get('type')
+                payload = data.get('data', {})
+                if message_type == 'order':
+                    await self._process_order_update(payload)
+                elif message_type == 'trade':
+                    await self._process_trade_update(payload)
+                elif message_type == 'position':
+                    await self._process_position_update(payload)
+                elif message_type == 'error':
+                    logger.error("Kite WebSocket error: %s", payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Error receiving Kite WebSocket messages: %s", e)
 
     async def stop_websocket(self) -> None:
         """
@@ -658,12 +672,13 @@ class ZerodhaExchange(BaseExchange):
             for exchange in exchanges:
                 instruments = await self.api.get_instruments(exchange)
                 for instrument in instruments:
-                    self.instruments[instrument.symbol] = instrument
+                    self.instruments[f"{instrument.exchange}:{instrument.symbol}"] = instrument
             
             logger.info(f"Loaded {len(self.instruments)} instruments")
             
         except Exception as e:
             logger.error(f"Failed to load instruments: {str(e)}")
+            raise
 
     async def submit_order(self, order: Order) -> str:
         """
@@ -676,22 +691,33 @@ class ZerodhaExchange(BaseExchange):
             Order ID
         """
         try:
+            instrument = self.instruments.get(f"{order.exchange}:{order.symbol}")
+            if instrument is None:
+                raise ValueError(
+                    f"Unknown instrument {order.exchange}:{order.symbol}; "
+                    "cannot determine the Kite exchange for this order"
+                )
+            
             # Convert Order to ZerodhaOrderRequest
             order_request = ZerodhaOrderRequest(
                 symbol=order.symbol,
+                exchange=instrument.exchange,
                 transaction_type=ZerodhaTransactionType.BUY.value if order.side == 'buy' else ZerodhaTransactionType.SELL.value,
                 quantity=int(order.quantity),
                 price=order.price,
-                product=ZerodhaProductType.CNC.value,
+                product=(
+                    ZerodhaProductType.NRML.value
+                    if instrument.instrument_type in {'FUT', 'CE', 'PE'}
+                    else ZerodhaProductType.CNC.value
+                ),
                 order_type=ZerodhaOrderType.MARKET.value if order.price is None else ZerodhaOrderType.LIMIT.value,
-                stop_loss=order.stop_price,
-                take_profit=order.take_profit
+                trigger_price=order.stop_price
             )
             
             # Place order
             response = await self.api.place_order(order_request)
             
-            return response.get('orderid', '')
+            return response.get('order_id', '')
             
         except Exception as e:
             logger.error(f"Failed to submit order: {str(e)}")
@@ -728,16 +754,14 @@ class ZerodhaExchange(BaseExchange):
             # Convert to standard format
             result = {}
             for position in positions:
-                result[position.symbol] = {
+                result[f"{position.exchange}:{position.symbol}"] = {
                     'quantity': position.quantity,
                     'average_price': position.average_price,
                     'last_price': position.last_price,
                     'pnl': position.pnl,
                     'pnl_percent': position.pnl_percent,
                     'product_type': position.product_type,
-                    'exchange': position.exchange,
-                    'm2m_pnl': position.m2m_pnl,
-                    'overnight_pnl': position.overnight_pnl
+                    'exchange': position.exchange
                 }
             
             return result
@@ -768,21 +792,35 @@ class ZerodhaExchange(BaseExchange):
             List of historical data candles
         """
         try:
-            # Zerodha API endpoint for historical data
-            response = self.session.get(
-                f"{self.api.base_url}/api/historical",
+            instrument = self.instruments.get(f"{exchange}:{symbol}")
+            if instrument is None:
+                logger.error(f"Unknown instrument for historical data: {exchange}:{symbol}")
+                return []
+            
+            response = self.api.session.get(
+                f"{self.api.base_url}/instruments/historical/"
+                f"{instrument.instrument_token}/{timeframe}",
                 params={
-                    'symbol': symbol,
-                    'exchange': exchange,
-                    'from': start_time.isoformat(),
-                    'to': end_time.isoformat(),
-                    'interval': timeframe
+                    'from': start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'to': end_time.strftime('%Y-%m-%d %H:%M:%S')
                 },
-                headers=self.api._get_headers()
+                headers=self.api._get_headers(),
+                timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
             
-            return response.json()
+            candles = response.json().get('data', {}).get('candles', [])
+            return [
+                {
+                    'timestamp': candle[0],
+                    'open': candle[1],
+                    'high': candle[2],
+                    'low': candle[3],
+                    'close': candle[4],
+                    'volume': candle[5]
+                }
+                for candle in candles
+            ]
             
         except Exception as e:
             logger.error(f"Failed to get historical data for {symbol}: {str(e)}")
@@ -833,19 +871,35 @@ class ZerodhaExchange(BaseExchange):
         # Process position update
         logger.info(f"Position update: {position_data}")
 
-    async def extract_giftnifty_events(self, symbol: str = "giftnifty") -> List[Dict[str, Any]]:
+    def _find_giftnifty_instrument(self) -> Optional[ZerodhaToken]:
+        """Return the nearest-expiry GiftNifty futures instrument, if Kite lists one."""
+        candidates = [
+            instrument for instrument in self.instruments.values()
+            if instrument.symbol.upper().startswith('GIFTNIFTY')
+            and instrument.instrument_type == 'FUT'
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda instrument: instrument.expiry_date or datetime.max,
+        )
+
+    async def extract_giftnifty_events(self) -> List[Dict[str, Any]]:
         """
-        Extract events for giftnifty from Zerodha.
-        
-        Args:
-            symbol: Symbol to extract events for (default: giftnifty)
+        Extract events for the GiftNifty futures contract from Zerodha.
             
         Returns:
             List of giftnifty events
         """
         try:
+            instrument = self._find_giftnifty_instrument()
+            if instrument is None:
+                logger.debug("Kite lists no GiftNifty futures instrument; skipping event extraction")
+                return []
+            
             # Get current quote for giftnifty
-            quote = await self.api.get_quote(symbol, "NSE")
+            quote = await self.api.get_quote(instrument.symbol, instrument.exchange)
             
             # Extract events from quote data
             events = []
@@ -854,7 +908,7 @@ class ZerodhaExchange(BaseExchange):
             if quote.get('gift', False):
                 events.append({
                     'type': 'gift',
-                    'symbol': symbol,
+                    'symbol': instrument.symbol,
                     'timestamp': datetime.now(),
                     'data': quote.get('gift_data', {})
                 })
@@ -863,7 +917,7 @@ class ZerodhaExchange(BaseExchange):
             if quote.get('nifty', False):
                 events.append({
                     'type': 'nifty',
-                    'symbol': symbol,
+                    'symbol': instrument.symbol,
                     'timestamp': datetime.now(),
                     'data': quote.get('nifty_data', {})
                 })
@@ -873,7 +927,7 @@ class ZerodhaExchange(BaseExchange):
                 for event in quote['special_events']:
                     events.append({
                         'type': 'special',
-                        'symbol': symbol,
+                        'symbol': instrument.symbol,
                         'timestamp': datetime.now(),
                         'data': event
                     })
