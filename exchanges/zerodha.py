@@ -371,7 +371,7 @@ class ZerodhaAPI:
                     exchange=position_data.get('exchange', '')
                 ))
             
-            logger.info(f"Retrieved {len(positions)} positions")
+            logger.debug("Retrieved %d positions", len(positions))
             return positions
             
         except Exception as e:
@@ -1005,7 +1005,7 @@ class ZerodhaExchange(BaseExchange):
         )
         self._giftnifty_bar['volume'] += volume_delta
         self._giftnifty_last_volume = tick_volume
-        logger.info(
+        logger.debug(
             "[LIVE] %s:%s timeframe=%s LTP=%.2f candle_OHLC=%.2f/%.2f/%.2f/%.2f",
             instrument.exchange,
             instrument.symbol,
@@ -1021,13 +1021,14 @@ class ZerodhaExchange(BaseExchange):
             'exchange': instrument.exchange,
             **self._giftnifty_bar,
             'timeframe': self._giftnifty_timeframe,
+            'indicators': {'last_tick_at': datetime.now()},
         })
 
     async def _handle_nifty_future_tick(self, tick: Dict[str, Any]) -> None:
         instrument = self._nifty_future_instrument
         if instrument and tick.get('instrument_token') == instrument.instrument_token:
             self._nifty_future_ltp = float(tick['ltp'])
-            logger.info(
+            logger.debug(
                 "[LIVE] %s:%s LTP=%.2f lot_size=%s",
                 instrument.exchange,
                 instrument.symbol,

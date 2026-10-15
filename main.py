@@ -18,13 +18,35 @@ from exchanges.zerodha import ZerodhaExchange
 from core.strategy.supertrend_divergence import SuperTrendWeightedDivergenceStrategy
 
 # Configure logging
+load_dotenv()
+log_level = getattr(logging, os.getenv('BOT_LOG_LEVEL', 'INFO').upper(), logging.INFO)
+
+
+class StrategyPhaseLogFilter(logging.Filter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.strategy_only = False
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return (
+            not self.strategy_only
+            or record.name == 'core.strategy'
+            or record.name.startswith('core.strategy.')
+        )
+
+
+strategy_log_filter = StrategyPhaseLogFilter()
+log_handlers = [
+    logging.FileHandler('tradebot.log'),
+    logging.StreamHandler(sys.stdout),
+]
+for handler in log_handlers:
+    handler.addFilter(strategy_log_filter)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('tradebot.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=log_handlers,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +178,7 @@ async def main() -> None:
     await engine.start()
 
     logger.info("[BOOT] Belaku TradeBot started successfully")
+    strategy_log_filter.strategy_only = True
     
     try:
         # Keep the bot running
@@ -164,6 +187,7 @@ async def main() -> None:
     except KeyboardInterrupt:
         logger.info("[SHUTDOWN] Received interrupt signal")
     finally:
+        strategy_log_filter.strategy_only = False
         # Stop trading engine (also disconnects the exchanges)
         logger.info("[SHUTDOWN] Stopping engine and disconnecting exchanges")
         await engine.stop()
