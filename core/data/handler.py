@@ -227,11 +227,22 @@ class DataHandler:
             latest = stream[-1]
             snapshot[latest.symbol] = {
                 'price': latest.close_price,
+                'ltp': latest.close_price,
                 'open_price': latest.open_price,
                 'high_price': latest.high_price,
                 'low_price': latest.low_price,
                 'volume': latest.volume,
                 'timestamp': latest.timestamp,
+                'candles': [
+                    {
+                        'open': candle.open_price,
+                        'high': candle.high_price,
+                        'low': candle.low_price,
+                        'close': candle.close_price,
+                        'volume': candle.volume,
+                    }
+                    for candle in list(stream)[-100:]
+                ],
             }
         return snapshot
 
@@ -422,8 +433,15 @@ class DataHandler:
             # Store data
             stream_key = f"{processed_data.symbol}_{processed_data.exchange}"
             if stream_key in self.market_data_streams:
-                self.market_data_streams[stream_key].append(processed_data)
-                self.data_cache[stream_key].append(processed_data)
+                stream = self.market_data_streams[stream_key]
+                cache = self.data_cache[stream_key]
+                if stream and stream[-1].timestamp == processed_data.timestamp:
+                    stream[-1] = processed_data
+                    if cache and cache[-1].timestamp == processed_data.timestamp:
+                        cache[-1] = processed_data
+                else:
+                    stream.append(processed_data)
+                    cache.append(processed_data)
                 
                 # Notify subscribers
                 for callback in self.data_subscribers.get(stream_key, []):

@@ -153,6 +153,49 @@ async def test_strategy_functionality():
             'min_strength': 0.55,
         })
 
+        import numpy as np
+        rising_prices = np.arange(20.0, 40.0)
+        falling_prices = np.arange(40.0, 20.0, -1.0)
+        psar_bullish, bull_stop = st_strategy._parabolic_sar_direction(
+            rising_prices,
+            rising_prices - 1,
+            rising_prices - 0.2,
+        )
+        psar_bearish, bear_stop = st_strategy._parabolic_sar_direction(
+            falling_prices,
+            falling_prices - 1,
+            falling_prices - 0.8,
+        )
+        assert psar_bullish == 1 and bull_stop < rising_prices[-1]
+        assert psar_bearish == -1 and bear_stop > falling_prices[-1]
+
+        rising_candles = [
+            {'open': price - 0.2, 'high': price + 1, 'low': price - 1, 'close': price}
+            for price in rising_prices
+        ]
+        falling_candles = [
+            {'open': price - 0.2, 'high': price + 1, 'low': price - 1, 'close': price}
+            for price in falling_prices
+        ]
+        for trend_direction, prices, expected_signal in (
+            (1, rising_candles, 'buy'),
+            (-1, falling_candles, 'sell'),
+            (-1, rising_candles, None),
+        ):
+            confirmation_strategy = SuperTrendWeightedDivergenceStrategy({
+                'min_strength': 1.0,
+                'cooldown_period': 0,
+            })
+            confirmation_strategy._supertrend_direction = lambda closes, highs, lows: (trend_direction, 0.0)
+            confirmation_strategy._weighted_divergence = lambda closes: 0.0
+            confirmation_signals = await confirmation_strategy.analyze(
+                {'GIFT NIFTY': {'candles': prices}}
+            )
+            if expected_signal is None:
+                assert confirmation_signals == []
+            else:
+                assert confirmation_signals[0].signal_type == expected_signal
+
         sample_series = [
             {'open': 100.0, 'high': 101.0, 'low': 99.5, 'close': 100.8},
             {'open': 100.8, 'high': 101.5, 'low': 100.2, 'close': 101.2},

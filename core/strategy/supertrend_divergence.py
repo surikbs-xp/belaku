@@ -20,12 +20,15 @@ logger = logging.getLogger(__name__)
 
 
 class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
-    """Trend-following strategy driven by SuperTrend and weighted divergence."""
+    """Trend-following strategy with SuperTrend, PSAR, and weighted divergence."""
 
     def __init__(self, parameters: Optional[Dict[str, Any]] = None):
         default_parameters = {
+            'timeframe': '15m',
             'atr_period': 10,
             'multiplier': 3.0,
+            'psar_step': 0.02,
+            'psar_max_step': 0.2,
             'rsi_period': 14,
             'rsi_weight': 0.6,
             'macd_weight': 0.4,
@@ -42,6 +45,7 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
         self.last_signal_time: Optional[datetime] = None
         self.signals_this_hour = 0
         self.last_hour = datetime.now().hour
+        self._last_logged_candle: Dict[str, datetime] = {}
 
     async def analyze(self, market_data: Dict[str, Any]) -> List[Signal]:
         """Generate Trading signals based on SuperTrend with weighted divergence."""
@@ -49,24 +53,41 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             return []
 
         now = datetime.now()
-        if self.last_signal_time:
-            elapsed = (now - self.last_signal_time).total_seconds()
-            if elapsed < self.parameters.get('cooldown_period', 60):
-                return []
+        cooldown_active = bool(
+            self.last_signal_time
+            and (now - self.last_signal_time).total_seconds()
+            < self.parameters.get('cooldown_period', 60)
+        )
 
         if now.hour != self.last_hour:
             self.signals_this_hour = 0
             self.last_hour = now.hour
 
-        if self.signals_this_hour >= self.parameters.get('max_signals_per_hour', 10):
-            return []
+        hourly_limit_reached = (
+            self.signals_this_hour >= self.parameters.get('max_signals_per_hour', 10)
+        )
 
         signals: List[Signal] = []
         for symbol, payload in market_data.items():
             if not symbol or symbol == 'symbol':
                 continue
 
+            log_candle = self._should_log_candle(symbol, payload, now)
             candles = self._extract_candles(payload)
+            ltp_value = next(
+                (payload[key] for key in ('ltp', 'last_price', 'price')
+                 if isinstance(payload, dict) and payload.get(key) is not None),
+                float(candles[-1]['close']) if candles else None,
+            )
+            if log_candle and ltp_value is not None and len(candles) < max(self.parameters.get('rsi_period', 14), self.parameters.get('atr_period', 10) + 5):
+                strategy_price = float(candles[-1]['close']) if candles else float(ltp_value)
+                logger.info(
+                    "[STRATEGY] symbol=%s current_price=%.2f ltp=%.2f decision=WAITING_FOR_CANDLES",
+                    symbol,
+                    strategy_price,
+                    float(ltp_value),
+                )
+
             if len(candles) < max(self.parameters.get('rsi_period', 14), self.parameters.get('atr_period', 10) + 5):
                 continue
 
@@ -75,33 +96,53 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             lows = np.asarray([float(c['low']) for c in candles], dtype=float)
 
             trend_direction, trend_strength = self._supertrend_direction(closes, highs, lows)
+            psar_direction, psar_value = self._parabolic_sar_direction(highs, lows, closes)
             divergence_score = self._weighted_divergence(closes)
             current_price = float(closes[-1])
+            ltp = float(ltp_value) if ltp_value is not None else current_price
+            conditions_met = self._should_generate_signal(trend_direction, psar_direction)
+            trend_label = 'BUY' if trend_direction > 0 else 'SELL' if trend_direction < 0 else 'FLAT'
+            psar_label = 'BUY' if psar_direction > 0 else 'SELL' if psar_direction < 0 else 'FLAT'
+            if not conditions_met:
+                signal_status = 'NO_SIGNAL'
+            elif cooldown_active:
+                signal_status = f'{trend_label}_BLOCKED_COOLDOWN'
+            elif hourly_limit_reached:
+                signal_status = f'{trend_label}_BLOCKED_HOURLY_LIMIT'
+            else:
+                signal_status = trend_label
 
-            logger.info(
-                "[ST] symbol=%s price=%.2f trend=%s trend_strength=%.4f divergence=%.4f",
-                symbol,
-                current_price,
-                'BUY' if trend_direction > 0 else 'SELL' if trend_direction < 0 else 'FLAT',
-                trend_strength,
-                divergence_score,
-            )
+            if log_candle:
+                logger.info(
+                    "[STRATEGY] symbol=%s timeframe=%s current_price=%.2f ltp=%.2f conditions=SuperTrend:%s,PSAR:%s,agree:%s,PSAR_value:%.2f,divergence:%.4f(strength_only) signal=%s",
+                    symbol,
+                    self.parameters.get('timeframe', '15m'),
+                    current_price,
+                    ltp,
+                    trend_label,
+                    psar_label,
+                    conditions_met,
+                    psar_value,
+                    divergence_score,
+                    signal_status,
+                )
 
-            if not self._should_generate_signal(trend_direction, divergence_score, trend_strength):
-                logger.info("[ST] symbol=%s rejected: no valid trading setup", symbol)
+            if not conditions_met:
+                continue
+            if cooldown_active or hourly_limit_reached:
                 continue
 
-            signal_type, strength = self._build_signal(trend_direction, divergence_score, trend_strength)
-            if strength < self.parameters.get('min_strength', 0.55):
-                logger.info("[ST] symbol=%s rejected: strength %.4f below threshold %.4f", symbol, strength, self.parameters.get('min_strength', 0.55))
-                continue
+            signal_type = 'buy' if trend_direction > 0 else 'sell'
+            _, strength = self._build_signal(trend_direction, divergence_score, trend_strength)
 
             quantity = float(self.parameters.get('max_position_size', 100000)) / current_price if current_price > 0 else 0.0
             logger.info(
-                "[ST] FINAL signal symbol=%s action=%s price=%.2f strength=%.4f divergence=%.4f",
+                "[ST] FINAL signal symbol=%s timeframe=%s action=%s price=%.2f psar=%.2f strength=%.4f divergence=%.4f",
                 symbol,
+                self.parameters.get('timeframe', '15m'),
                 signal_type.upper(),
                 current_price,
+                psar_value,
                 strength,
                 divergence_score,
             )
@@ -111,11 +152,14 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
                 strength=min(1.0, max(0.0, strength)),
                 price=current_price,
                 quantity=quantity,
-                timeframe='1minute',
+                timeframe=self.parameters.get('timeframe', '15m'),
                 metadata={
                     'strategy': self.name,
+                    'timeframe': self.parameters.get('timeframe', '15m'),
                     'trend_direction': trend_direction,
                     'trend_strength': trend_strength,
+                    'psar_direction': psar_direction,
+                    'psar_value': psar_value,
                     'divergence_score': divergence_score,
                     'atr_period': self.parameters.get('atr_period', 10),
                     'multiplier': self.parameters.get('multiplier', 3.0),
@@ -127,6 +171,31 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             self.increment_signals_generated()
 
         return signals
+
+    def _should_log_candle(self, symbol: str, payload: Any, now: datetime) -> bool:
+        timestamp = payload.get('timestamp') if isinstance(payload, dict) else None
+        if isinstance(timestamp, str):
+            try:
+                timestamp = datetime.fromisoformat(timestamp)
+            except ValueError:
+                timestamp = None
+        if not isinstance(timestamp, datetime):
+            timestamp = now
+
+        timeframe = str(self.parameters.get('timeframe', '15m')).lower()
+        if timeframe.endswith('m') and timeframe[:-1].isdigit():
+            interval_minutes = max(1, int(timeframe[:-1]))
+        elif timeframe.endswith('h') and timeframe[:-1].isdigit():
+            interval_minutes = max(1, int(timeframe[:-1]) * 60)
+        else:
+            interval_minutes = 1
+        minute = timestamp.minute - timestamp.minute % interval_minutes
+        candle_start = timestamp.replace(minute=minute, second=0, microsecond=0)
+
+        if self._last_logged_candle.get(symbol) == candle_start:
+            return False
+        self._last_logged_candle[symbol] = candle_start
+        return True
 
     async def on_order_filled(self, order: Any) -> None:
         logger.info("Order filled for %s: %s %s %s", order.symbol, order.side, order.quantity, order.id)
@@ -204,6 +273,57 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
         trend_strength = float(abs(closes[-1] - closes[-2]) / max(abs(closes[-2]), 1.0))
         return direction, min(1.0, trend_strength)
 
+    def _parabolic_sar_direction(
+        self,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+    ) -> Tuple[int, float]:
+        """Return the current Parabolic SAR direction and stop value."""
+        if len(closes) < 2:
+            return 0, 0.0
+
+        step = float(self.parameters.get('psar_step', 0.02))
+        max_step = float(self.parameters.get('psar_max_step', 0.2))
+        if step <= 0 or max_step < step:
+            raise ValueError('PSAR max step must be >= a positive PSAR step')
+
+        bullish = closes[1] >= closes[0]
+        sar = float(lows[0] if bullish else highs[0])
+        extreme_point = float(highs[0] if bullish else lows[0])
+        acceleration = step
+
+        for index in range(1, len(closes)):
+            candidate = sar + acceleration * (extreme_point - sar)
+            if bullish:
+                prior_lows = lows[max(0, index - 2):index]
+                candidate = min(candidate, float(np.min(prior_lows)))
+                if lows[index] < candidate:
+                    sar = extreme_point
+                    extreme_point = float(lows[index])
+                    acceleration = step
+                    bullish = False
+                else:
+                    sar = candidate
+                    if highs[index] > extreme_point:
+                        extreme_point = float(highs[index])
+                        acceleration = min(acceleration + step, max_step)
+            else:
+                prior_highs = highs[max(0, index - 2):index]
+                candidate = max(candidate, float(np.max(prior_highs)))
+                if highs[index] > candidate:
+                    sar = extreme_point
+                    extreme_point = float(highs[index])
+                    acceleration = step
+                    bullish = True
+                else:
+                    sar = candidate
+                    if lows[index] < extreme_point:
+                        extreme_point = float(lows[index])
+                        acceleration = min(acceleration + step, max_step)
+
+        return (1 if bullish else -1), sar
+
     def _weighted_divergence(self, closes: np.ndarray) -> float:
         rsi_period = int(self.parameters.get('rsi_period', 14))
         rsi_weight = float(self.parameters.get('rsi_weight', 0.6))
@@ -223,20 +343,8 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
         combined = ((rsi_weight * rsi_score) + (macd_weight * macd_score)) / max(rsi_weight + macd_weight, 1e-6)
         return float(np.clip(combined, -1.0, 1.0))
 
-    def _should_generate_signal(self, trend_direction: int, divergence_score: float, trend_strength: float) -> bool:
-        if trend_direction == 0:
-            return False
-
-        if abs(divergence_score) < 0.15 and trend_strength < 0.01:
-            return False
-
-        if trend_direction > 0 and divergence_score <= 0:
-            return False
-
-        if trend_direction < 0 and divergence_score >= 0:
-            return False
-
-        return True
+    def _should_generate_signal(self, trend_direction: int, psar_direction: int) -> bool:
+        return trend_direction != 0 and trend_direction == psar_direction
 
     def _build_signal(self, trend_direction: int, divergence_score: float, trend_strength: float) -> Tuple[str, float]:
         agreement = 1.0 if np.sign(divergence_score) == np.sign(trend_direction) else 0.35

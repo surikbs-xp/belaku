@@ -97,11 +97,24 @@ class TradingEngine:
             logger.info("[ENGINE] Connecting exchange: %s", exchange.name)
             await exchange.connect()
             logger.info("[ENGINE] Exchange connected: %s", exchange.name)
+            add_order_update_handler = getattr(exchange, 'add_order_update_handler', None)
+            if add_order_update_handler:
+                add_order_update_handler(self._handle_order_update)
+            setup_market_data = getattr(exchange, 'setup_strategy_market_data', None)
+            if setup_market_data:
+                timeframe = next(
+                    (strategy.parameters.get('timeframe', '15m') for strategy in self.strategies),
+                    '15m',
+                )
+                await setup_market_data(self.data_handler, timeframe=timeframe)
+                logger.info("[ENGINE] Strategy market data initialized at %s", timeframe)
         
         # Start data handler
         logger.info("[ENGINE] Starting data handler")
         await self.data_handler.start()
         logger.info("[ENGINE] Data handler started")
+        await self._update_positions()
+        logger.info("[ENGINE] Initial broker position sync complete (%d position(s))", len(self.positions))
         
         # Start main trading loop
         logger.info("[ENGINE] Launching trading loop task")
@@ -139,22 +152,56 @@ class TradingEngine:
         """
         logger.info("[ORDER] Attempting to submit order %s for %s %s %s", order.id, order.side, order.quantity, order.symbol)
         try:
+            exchange = self.exchanges.get(order.exchange)
+            if not exchange:
+                logger.error("[ORDER] Exchange %s not found for order %s", order.exchange, order.id)
+                return False
+
+            prepare_order = getattr(exchange, 'prepare_order', None)
+            if prepare_order:
+                await prepare_order(order)
+
+            risk_limit_for_order = getattr(exchange, 'risk_limit_for_order', None)
+            if risk_limit_for_order:
+                required_limit = risk_limit_for_order(order)
+                if required_limit:
+                    limit_name = 'max_position_size'
+                    configured_limit = self.risk_manager.config.get(limit_name, 100000)
+                    previous_limit = self.risk_manager.risk_limits.get(limit_name, configured_limit)
+                    adjusted_limit = max(previous_limit, required_limit)
+                    self.risk_manager.risk_limits[limit_name] = adjusted_limit
+                    if adjusted_limit > previous_limit:
+                        logger.warning(
+                            "[RISK] One-lot futures cap raised from %.2f to %.2f (10%% notional buffer)",
+                            previous_limit,
+                            adjusted_limit,
+                        )
+                    logger.info(
+                        "[RISK] Order notional=%.2f allowed_limit=%.2f",
+                        order.quantity * order.price,
+                        adjusted_limit,
+                    )
+
             # Validate order
             if not await self._validate_order(order):
                 logger.error("[ORDER] Validation failed for %s", order.id)
+                order.status = OrderStatus.REJECTED
                 return False
             
             # Check risk management
             if not await self.risk_manager.check_order(order):
                 logger.error("[ORDER] Risk check failed for order %s", order.id)
+                order.status = OrderStatus.REJECTED
                 return False
+            logger.info(
+                "[RISK] Accepted %s %s quantity=%s reference_price=%.2f",
+                order.side.upper(),
+                order.symbol,
+                order.quantity,
+                order.price or 0.0,
+            )
             
             # Submit to exchange
-            exchange = self.exchanges.get(order.exchange)
-            if not exchange:
-                logger.error("[ORDER] Exchange %s not found for order %s", order.exchange, order.id)
-                return False
-            
             logger.info("[ORDER] Sending to exchange %s", exchange.name)
             exchange_order_id = await exchange.submit_order(order)
             order.order_id = exchange_order_id
@@ -171,6 +218,51 @@ class TradingEngine:
             logger.error("[ORDER] Error submitting order %s: %s", order.id, str(e))
             order.status = OrderStatus.REJECTED
             return False
+
+    async def _handle_order_update(self, order_data: Dict[str, Any]) -> None:
+        broker_order_id = str(order_data.get('order_id') or order_data.get('orderid') or '')
+        order = next(
+            (candidate for candidate in self.orders.values()
+             if candidate.order_id == broker_order_id),
+            None,
+        )
+        if order is None:
+            logger.warning("[ORDER] Received update for untracked broker order %s", broker_order_id)
+            return
+
+        status = str(order_data.get('status', '')).lower()
+        status_map = {
+            'complete': OrderStatus.FILLED,
+            'cancelled': OrderStatus.CANCELED,
+            'rejected': OrderStatus.REJECTED,
+            'expired': OrderStatus.REJECTED,
+            'open': OrderStatus.SUBMITTED,
+            'triggered': OrderStatus.SUBMITTED,
+            'partial': OrderStatus.PARTIALLY_FILLED,
+            'partially filled': OrderStatus.PARTIALLY_FILLED,
+        }
+        filled_quantity = float(order_data.get('filled_quantity') or 0.0)
+        if status == 'open' and filled_quantity > 0:
+            order.status = OrderStatus.PARTIALLY_FILLED
+        if status in status_map:
+            if not (status == 'open' and filled_quantity > 0):
+                order.status = status_map[status]
+        if order_data.get('filled_quantity') is not None:
+            order.filled_quantity = filled_quantity
+        if order_data.get('average_price') is not None:
+            order.avg_fill_price = float(order_data['average_price'])
+
+        logger.info(
+            "[ORDER] tracked=%s broker_id=%s status=%s filled=%s average_price=%s",
+            order.id,
+            broker_order_id,
+            order.status.value,
+            order.filled_quantity,
+            order.avg_fill_price,
+        )
+        if order.status == OrderStatus.FILLED:
+            for strategy in self.strategies:
+                await strategy.on_order_filled(order)
 
     async def cancel_order(self, order_id: str) -> bool:
         """
@@ -251,13 +343,11 @@ class TradingEngine:
             
             success = await self.submit_order(order)
             if success:
-                # Update position
-                position.quantity -= quantity
-                if position.quantity <= 0:
-                    position.side = PositionSide.FLAT
-                    position.quantity = 0
-                
-                logger.info(f"Position closed: {symbol} {quantity}")
+                logger.info(
+                    "[EXIT] Close order submitted for %s quantity=%s; waiting for broker fill",
+                    symbol,
+                    quantity,
+                )
             
             return success
             
@@ -281,16 +371,15 @@ class TradingEngine:
                 logger.info("[MARKET] NSE market active=%s", market_status)
                 logger.info("[LOOP] Snapshot received for %d symbol(s)", len(market_data))
 
+                if not market_status:
+                    logger.info("[MARKET] NFO entry/exit evaluation skipped outside market hours")
+                    await asyncio.sleep(self.config.get('loop_interval', 1.0))
+                    continue
+
                 if not market_data:
-                    if market_status:
-                        logger.warning("[MARKET] No live price data yet; seeding debug candle feed")
-                        await self.data_handler.seed_debug_market_data(symbol='NIFTY', exchange='NSE')
-                        market_data = await self.data_handler.get_latest_snapshot()
-                        logger.info("[LOOP] Snapshot after debug seed: %d symbol(s)", len(market_data))
-                    else:
-                        logger.info("[MARKET] Market is closed; strategy evaluation skipped")
-                        await asyncio.sleep(self.config.get('loop_interval', 1.0))
-                        continue
+                    logger.info("[MARKET] No live market data available; strategy evaluation skipped")
+                    await asyncio.sleep(self.config.get('loop_interval', 1.0))
+                    continue
                 
                 # Execute strategies
                 for strategy in self.strategies:
@@ -329,12 +418,75 @@ class TradingEngine:
         for signal in signals:
             try:
                 logger.info("[SIGNAL] Processing signal: %s %s @ %.2f strength=%.2f", signal.signal_type, signal.symbol, signal.price or 0.0, signal.strength)
+                exchange_name = self._default_exchange_name()
+                exchange = self.exchanges.get(exchange_name) if exchange_name else None
+                symbol_resolver = getattr(exchange, 'order_symbol_for_signal', None)
+                target_symbol = symbol_resolver(signal.symbol) if symbol_resolver else signal.symbol
+                if not target_symbol:
+                    logger.error("[SIGNAL] No futures contract available for %s", signal.symbol)
+                    continue
+
+                active_order = next(
+                    (
+                        order for order in self.orders.values()
+                        if order.symbol == target_symbol
+                        and order.status in {
+                            OrderStatus.PENDING,
+                            OrderStatus.SUBMITTED,
+                            OrderStatus.PARTIALLY_FILLED,
+                        }
+                    ),
+                    None,
+                )
+                if active_order:
+                    logger.info(
+                        "[SIGNAL] Skipping %s: order %s for %s is still %s",
+                        signal.signal_type,
+                        active_order.id,
+                        target_symbol,
+                        active_order.status.value,
+                    )
+                    continue
+
+                position = self.positions.get(target_symbol)
+                if position and position.quantity > 0:
+                    same_direction = (
+                        position.side == PositionSide.LONG and signal.signal_type == 'buy'
+                    ) or (
+                        position.side == PositionSide.SHORT and signal.signal_type == 'sell'
+                    )
+                    if same_direction:
+                        logger.info(
+                            "[SIGNAL] Holding %s %s position; duplicate entry skipped",
+                            position.side.value,
+                            target_symbol,
+                        )
+                    else:
+                        logger.info(
+                            "[SIGNAL] Reverse signal: closing %s before considering %s entry",
+                            target_symbol,
+                            signal.signal_type,
+                        )
+                        await self.close_position(
+                            target_symbol,
+                            position.quantity,
+                            position.side.value,
+                        )
+                    continue
+
                 # Create order from signal
                 order = self._create_order_from_signal(signal)
                 if order:
                     logger.info("[SIGNAL] Created order %s from signal for %s", order.id, signal.symbol)
                     # Submit order
-                    await self.submit_order(order)
+                    submitted = await self.submit_order(order)
+                    logger.info(
+                        "[SIGNAL] order_id=%s symbol=%s status=%s submitted=%s",
+                        order.id,
+                        order.symbol,
+                        order.status.value,
+                        submitted,
+                    )
                 else:
                     logger.warning("[SIGNAL] Could not create order from signal for %s", signal.symbol)
             except Exception as e:
@@ -352,22 +504,27 @@ class TradingEngine:
             
             for position_key, position_data in exchange_positions.items():
                 quantity = float(position_data['quantity'])
-                if not quantity:
-                    continue
-                
                 symbol = position_key.split(':', 1)[-1]
                 average_price = float(position_data.get('average_price') or 0.0)
                 current_price = float(position_data.get('last_price') or average_price)
-                side = PositionSide.LONG if quantity > 0 else PositionSide.SHORT
-                
                 position = self.positions.get(symbol)
+                if not quantity:
+                    if position and position.exchange == exchange.name and position.quantity > 0:
+                        position.quantity = 0
+                        position.side = PositionSide.FLAT
+                        if current_price > 0:
+                            position.update_pnl(current_price)
+                        logger.info("[POSITION] Broker reports %s flat", symbol)
+                    continue
+
+                side = PositionSide.LONG if quantity > 0 else PositionSide.SHORT
                 if position:
-                    # Update existing position
                     position.side = side
                     position.quantity = abs(quantity)
+                    if average_price > 0:
+                        position.entry_price = average_price
                     position.update_pnl(current_price)
                 else:
-                    # Create new position
                     position = Position(
                         symbol=symbol,
                         side=side,
@@ -378,28 +535,92 @@ class TradingEngine:
                     )
                     position.update_pnl(current_price)
                     self.positions[symbol] = position
+                    logger.info(
+                        "[POSITION] Opened %s %s quantity=%s average_price=%.2f",
+                        side.value,
+                        symbol,
+                        abs(quantity),
+                        position.entry_price,
+                    )
+
+                self._set_position_exit_levels(position)
+                logger.info(
+                    "[POSITION] %s quantity=%s entry=%.2f current=%.2f unrealized_pnl=%.2f stop=%.2f target=%.2f",
+                    symbol,
+                    position.quantity,
+                    position.entry_price,
+                    position.current_price or 0.0,
+                    position.unrealized_pnl,
+                    position.stop_loss or 0.0,
+                    position.take_profit or 0.0,
+                )
+
+    def _set_position_exit_levels(self, position: Position) -> None:
+        stop_percent = float(self.risk_manager.config.get('stop_loss_percentage', 0.02))
+        target_percent = float(self.risk_manager.config.get('take_profit_percentage', 0.05))
+        if position.side == PositionSide.LONG:
+            position.stop_loss = position.entry_price * (1 - stop_percent)
+            position.take_profit = position.entry_price * (1 + target_percent)
+        elif position.side == PositionSide.SHORT:
+            position.stop_loss = position.entry_price * (1 + stop_percent)
+            position.take_profit = position.entry_price * (1 - target_percent)
 
     async def _check_exit_conditions(self) -> None:
         """
         Check for stop-loss and take-profit conditions.
         """
-        for symbol, position in self.positions.items():
-            if position.current_price is None:
+        active_statuses = {
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+        }
+        for symbol, position in list(self.positions.items()):
+            if position.quantity <= 0 or position.side == PositionSide.FLAT or position.current_price is None:
                 continue
-            
-            # Check stop-loss
-            if position.stop_loss:
-                if position.side == PositionSide.LONG and position.current_price <= position.stop_loss:
-                    await self.close_position(symbol, position.quantity, position.side.value)
-                elif position.side == PositionSide.SHORT and position.current_price >= position.stop_loss:
-                    await self.close_position(symbol, position.quantity, position.side.value)
-            
-            # Check take-profit
-            if position.take_profit:
-                if position.side == PositionSide.LONG and position.current_price >= position.take_profit:
-                    await self.close_position(symbol, position.quantity, position.side.value)
-                elif position.side == PositionSide.SHORT and position.current_price <= position.take_profit:
-                    await self.close_position(symbol, position.quantity, position.side.value)
+
+            close_order = next(
+                (
+                    order for order in self.orders.values()
+                    if order.symbol == symbol
+                    and order.side == ('sell' if position.side == PositionSide.LONG else 'buy')
+                    and order.status in active_statuses
+                ),
+                None,
+            )
+            if close_order:
+                logger.info("[EXIT] Waiting for close order %s status=%s", close_order.id, close_order.status.value)
+                continue
+
+            exit_reason = None
+            if position.stop_loss is not None:
+                stop_hit = (
+                    position.side == PositionSide.LONG and position.current_price <= position.stop_loss
+                ) or (
+                    position.side == PositionSide.SHORT and position.current_price >= position.stop_loss
+                )
+                if stop_hit:
+                    exit_reason = 'stop_loss'
+
+            if exit_reason is None and position.take_profit is not None:
+                target_hit = (
+                    position.side == PositionSide.LONG and position.current_price >= position.take_profit
+                ) or (
+                    position.side == PositionSide.SHORT and position.current_price <= position.take_profit
+                )
+                if target_hit:
+                    exit_reason = 'take_profit'
+
+            if exit_reason:
+                logger.warning(
+                    "[EXIT] %s triggered for %s side=%s current=%.2f stop=%s target=%s",
+                    exit_reason,
+                    symbol,
+                    position.side.value,
+                    position.current_price,
+                    position.stop_loss,
+                    position.take_profit,
+                )
+                await self.close_position(symbol, position.quantity, position.side.value)
 
     async def _validate_order(self, order: Order) -> bool:
         """
