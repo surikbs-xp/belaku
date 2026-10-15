@@ -72,8 +72,24 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             if not symbol or symbol == 'symbol':
                 continue
 
-            log_candle = self._should_log_candle(symbol, payload, now)
+            log_candle = self._should_log_candle(symbol, now)
             candles = self._extract_candles(payload)
+            last_tick_value = payload.get('last_tick_at') if isinstance(payload, dict) else None
+            if isinstance(last_tick_value, str):
+                try:
+                    last_tick_value = datetime.fromisoformat(last_tick_value)
+                except ValueError:
+                    last_tick_value = None
+            tick_age_seconds = (
+                max(0.0, (now - last_tick_value).total_seconds())
+                if isinstance(last_tick_value, datetime)
+                else None
+            )
+            max_tick_age = float(self.parameters.get('max_tick_age_seconds', 30))
+            feed_stale = tick_age_seconds is None or tick_age_seconds > max_tick_age
+            feed_age_label = (
+                f'{tick_age_seconds:.1f}s' if tick_age_seconds is not None else 'unknown'
+            )
             ltp_value = next(
                 (payload[key] for key in ('ltp', 'last_price', 'price')
                  if isinstance(payload, dict) and payload.get(key) is not None),
@@ -82,10 +98,13 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             if log_candle and ltp_value is not None and len(candles) < max(self.parameters.get('rsi_period', 14), self.parameters.get('atr_period', 10) + 5):
                 strategy_price = float(candles[-1]['close']) if candles else float(ltp_value)
                 logger.info(
-                    "[STRATEGY] symbol=%s current_price=%.2f ltp=%.2f decision=WAITING_FOR_CANDLES",
+                    "[STRATEGY] symbol=%s timeframe=%s current_price=%.2f ltp=%.2f feed=%s feed_age=%s decision=WAITING_FOR_CANDLES",
                     symbol,
+                    self.parameters.get('timeframe', '15m'),
                     strategy_price,
                     float(ltp_value),
+                    'STALE' if feed_stale else 'LIVE',
+                    feed_age_label,
                 )
 
             if len(candles) < max(self.parameters.get('rsi_period', 14), self.parameters.get('atr_period', 10) + 5):
@@ -105,6 +124,8 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             psar_label = 'BUY' if psar_direction > 0 else 'SELL' if psar_direction < 0 else 'FLAT'
             if not conditions_met:
                 signal_status = 'NO_SIGNAL'
+            elif feed_stale:
+                signal_status = f'{trend_label}_BLOCKED_STALE_FEED'
             elif cooldown_active:
                 signal_status = f'{trend_label}_BLOCKED_COOLDOWN'
             elif hourly_limit_reached:
@@ -114,11 +135,13 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
             if log_candle:
                 logger.info(
-                    "[STRATEGY] symbol=%s timeframe=%s current_price=%.2f ltp=%.2f conditions=SuperTrend:%s,PSAR:%s,agree:%s,PSAR_value:%.2f,divergence:%.4f(strength_only) signal=%s",
+                    "[STRATEGY] symbol=%s timeframe=%s current_price=%.2f ltp=%.2f feed=%s feed_age=%s conditions=SuperTrend:%s,PSAR:%s,agree:%s,PSAR_value:%.2f,divergence:%.4f(strength_only) signal=%s",
                     symbol,
                     self.parameters.get('timeframe', '15m'),
                     current_price,
                     ltp,
+                    'STALE' if feed_stale else 'LIVE',
+                    feed_age_label,
                     trend_label,
                     psar_label,
                     conditions_met,
@@ -129,7 +152,7 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
             if not conditions_met:
                 continue
-            if cooldown_active or hourly_limit_reached:
+            if feed_stale or cooldown_active or hourly_limit_reached:
                 continue
 
             signal_type = 'buy' if trend_direction > 0 else 'sell'
@@ -172,25 +195,9 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
         return signals
 
-    def _should_log_candle(self, symbol: str, payload: Any, now: datetime) -> bool:
-        timestamp = payload.get('timestamp') if isinstance(payload, dict) else None
-        if isinstance(timestamp, str):
-            try:
-                timestamp = datetime.fromisoformat(timestamp)
-            except ValueError:
-                timestamp = None
-        if not isinstance(timestamp, datetime):
-            timestamp = now
-
-        timeframe = str(self.parameters.get('timeframe', '15m')).lower()
-        if timeframe.endswith('m') and timeframe[:-1].isdigit():
-            interval_minutes = max(1, int(timeframe[:-1]))
-        elif timeframe.endswith('h') and timeframe[:-1].isdigit():
-            interval_minutes = max(1, int(timeframe[:-1]) * 60)
-        else:
-            interval_minutes = 1
-        minute = timestamp.minute - timestamp.minute % interval_minutes
-        candle_start = timestamp.replace(minute=minute, second=0, microsecond=0)
+    def _should_log_candle(self, symbol: str, now: datetime) -> bool:
+        minute = now.minute
+        candle_start = now.replace(minute=minute, second=0, microsecond=0)
 
         if self._last_logged_candle.get(symbol) == candle_start:
             return False

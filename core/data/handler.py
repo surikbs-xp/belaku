@@ -233,6 +233,7 @@ class DataHandler:
                 'low_price': latest.low_price,
                 'volume': latest.volume,
                 'timestamp': latest.timestamp,
+                'last_tick_at': latest.indicators.get('last_tick_at'),
                 'candles': [
                     {
                         'open': candle.open_price,

@@ -7,6 +7,7 @@ system without requiring external API connections.
 
 import sys
 import asyncio
+from datetime import datetime
 from unittest.mock import Mock, AsyncMock
 
 # Test imports
@@ -189,7 +190,12 @@ async def test_strategy_functionality():
             confirmation_strategy._supertrend_direction = lambda closes, highs, lows: (trend_direction, 0.0)
             confirmation_strategy._weighted_divergence = lambda closes: 0.0
             confirmation_signals = await confirmation_strategy.analyze(
-                {'GIFT NIFTY': {'candles': prices}}
+                {
+                    'GIFT NIFTY': {
+                        'candles': prices,
+                        'last_tick_at': datetime.now(),
+                    }
+                }
             )
             if expected_signal is None:
                 assert confirmation_signals == []
@@ -212,7 +218,12 @@ async def test_strategy_functionality():
             {'open': 104.0, 'high': 104.5, 'low': 103.2, 'close': 104.2},
             {'open': 104.2, 'high': 104.8, 'low': 103.5, 'close': 104.6},
         ]
-        signals = await st_strategy.analyze({'NIFTY': {'candles': sample_series}})
+        signals = await st_strategy.analyze({
+            'NIFTY': {
+                'candles': sample_series,
+                'last_tick_at': datetime.now(),
+            }
+        })
         assert isinstance(signals, list)
         print("✅ SuperTrendWeightedDivergenceStrategy generated valid signal output")
         

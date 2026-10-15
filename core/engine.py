@@ -113,6 +113,11 @@ class TradingEngine:
         logger.info("[ENGINE] Starting data handler")
         await self.data_handler.start()
         logger.info("[ENGINE] Data handler started")
+        market_active = self.data_handler.is_market_active('NSE')
+        logger.info(
+            "[MARKET] Startup NSE/NFO status=%s",
+            'OPEN' if market_active else 'CLOSED',
+        )
         await self._update_positions()
         logger.info("[ENGINE] Initial broker position sync complete (%d position(s))", len(self.positions))
         
@@ -365,39 +370,39 @@ class TradingEngine:
         while self.running:
             try:
                 # Get current market data
-                logger.info("[LOOP] Fetching latest market snapshot")
+                logger.debug("[LOOP] Fetching latest market snapshot")
                 market_data = await self.data_handler.get_latest_snapshot()
                 market_status = self.data_handler.is_market_active('NSE')
-                logger.info("[MARKET] NSE market active=%s", market_status)
-                logger.info("[LOOP] Snapshot received for %d symbol(s)", len(market_data))
+                logger.debug("[MARKET] NSE market active=%s", market_status)
+                logger.debug("[LOOP] Snapshot received for %d symbol(s)", len(market_data))
 
                 if not market_status:
-                    logger.info("[MARKET] NFO entry/exit evaluation skipped outside market hours")
+                    logger.debug("[MARKET] NFO entry/exit evaluation skipped outside market hours")
                     await asyncio.sleep(self.config.get('loop_interval', 1.0))
                     continue
 
                 if not market_data:
-                    logger.info("[MARKET] No live market data available; strategy evaluation skipped")
+                    logger.debug("[MARKET] No live market data available; strategy evaluation skipped")
                     await asyncio.sleep(self.config.get('loop_interval', 1.0))
                     continue
                 
                 # Execute strategies
                 for strategy in self.strategies:
-                    logger.info("[LOOP] Running strategy: %s", strategy.name)
+                    logger.debug("[LOOP] Running strategy: %s", strategy.name)
                     signals = await strategy.analyze(market_data)
-                    logger.info("[LOOP] Strategy %s produced %d signal(s)", strategy.name, len(signals))
+                    logger.debug("[LOOP] Strategy %s produced %d signal(s)", strategy.name, len(signals))
                     await self._process_signals(signals)
                 
                 # Update positions
-                logger.info("[LOOP] Refreshing positions from exchange")
+                logger.debug("[LOOP] Refreshing positions from exchange")
                 await self._update_positions()
                 
                 # Check for stop-loss and take-profit
-                logger.info("[LOOP] Checking exit conditions")
+                logger.debug("[LOOP] Checking exit conditions")
                 await self._check_exit_conditions()
                 
                 # Sleep for next iteration
-                logger.info("[LOOP] Sleeping for %.2f seconds", self.config.get('loop_interval', 1.0))
+                logger.debug("[LOOP] Sleeping for %.2f seconds", self.config.get('loop_interval', 1.0))
                 await asyncio.sleep(self.config.get('loop_interval', 1.0))
                 
             except Exception as e:
@@ -412,11 +417,33 @@ class TradingEngine:
             signals: List of trading signals
         """
         if not signals:
-            logger.info("[SIGNAL] No signals to process")
+            logger.debug("[SIGNAL] No signals to process")
             return
 
         for signal in signals:
             try:
+                if signal.metadata.get('strategy') == 'SuperTrendWeightedDivergence':
+                    supertrend_direction = signal.metadata.get('trend_direction')
+                    psar_direction = signal.metadata.get('psar_direction')
+                    expected_signal = (
+                        'buy' if supertrend_direction == 1
+                        else 'sell' if supertrend_direction == -1
+                        else None
+                    )
+                    if (
+                        supertrend_direction not in (-1, 1)
+                        or supertrend_direction != psar_direction
+                        or signal.signal_type != expected_signal
+                    ):
+                        logger.warning(
+                            "[SIGNAL] Rejected %s: SuperTrend=%s PSAR=%s action=%s",
+                            signal.symbol,
+                            supertrend_direction,
+                            psar_direction,
+                            signal.signal_type,
+                        )
+                        continue
+
                 logger.info("[SIGNAL] Processing signal: %s %s @ %.2f strength=%.2f", signal.signal_type, signal.symbol, signal.price or 0.0, signal.strength)
                 exchange_name = self._default_exchange_name()
                 exchange = self.exchanges.get(exchange_name) if exchange_name else None
@@ -439,7 +466,7 @@ class TradingEngine:
                     None,
                 )
                 if active_order:
-                    logger.info(
+                    logger.debug(
                         "[SIGNAL] Skipping %s: order %s for %s is still %s",
                         signal.signal_type,
                         active_order.id,
@@ -456,7 +483,7 @@ class TradingEngine:
                         position.side == PositionSide.SHORT and signal.signal_type == 'sell'
                     )
                     if same_direction:
-                        logger.info(
+                        logger.debug(
                             "[SIGNAL] Holding %s %s position; duplicate entry skipped",
                             position.side.value,
                             target_symbol,
@@ -544,7 +571,7 @@ class TradingEngine:
                     )
 
                 self._set_position_exit_levels(position)
-                logger.info(
+                logger.debug(
                     "[POSITION] %s quantity=%s entry=%.2f current=%.2f unrealized_pnl=%.2f stop=%.2f target=%.2f",
                     symbol,
                     position.quantity,
