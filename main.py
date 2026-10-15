@@ -63,6 +63,7 @@ def load_config() -> Dict[str, Any]:
             'access_token': 'YOUR_ACCESS_TOKEN_HERE',
         },
         'supertrend': {
+            'timeframe': '15m',
             'atr_period': 10,
             'multiplier': 3.0,
             'rsi_period': 14,
@@ -148,7 +149,7 @@ async def main() -> None:
 
     # Add strategy to engine
     engine.add_strategy(supertrend_strategy)
-    logger.info("[BOOT] Strategy registered: %s", supertrend_strategy.name)
+    logger.info("[BOOT] Strategy registered: %s timeframe=%s", supertrend_strategy.name, supertrend_strategy.parameters.get('timeframe', '15m'))
 
     # Start trading engine
     logger.info("[BOOT] Starting engine and data loop")

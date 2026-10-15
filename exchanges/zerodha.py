@@ -10,7 +10,7 @@ import asyncio
 import csv
 import io
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 import json
@@ -136,6 +136,7 @@ class ZerodhaAPI:
         self.trade_update_handlers: List[Callable] = []
         self.position_update_handlers: List[Callable] = []
         self.market_data_handlers: Dict[str, List[Callable]] = {}
+        self.tick_handlers: List[Callable] = []
         
         # WebSocket connection
         self.ws_connection = None
@@ -427,11 +428,11 @@ class ZerodhaAPI:
             raise
 
     async def _handle_websocket_messages(self) -> None:
-        """Dispatch text updates from Kite's single WebSocket stream."""
+        """Dispatch binary market ticks and text updates from Kite's stream."""
         try:
             async for message in self.ws_connection:
                 if isinstance(message, bytes):
-                    logger.debug("Received %d bytes of market data", len(message))
+                    await self._process_market_data_message(message)
                     continue
 
                 try:
@@ -454,6 +455,77 @@ class ZerodhaAPI:
             raise
         except Exception as e:
             logger.error("Error receiving Kite WebSocket messages: %s", e)
+
+    async def subscribe_market_data(self, instrument_token: int, mode: str = 'full') -> None:
+        """Subscribe to a Kite instrument token for live market data."""
+        if self.ws_connection is None:
+            raise RuntimeError("Kite WebSocket is not connected")
+        await self.ws_connection.send(json.dumps({"a": "subscribe", "v": [instrument_token]}))
+        await self.ws_connection.send(json.dumps({"a": "mode", "v": [mode, [instrument_token]]}))
+
+    def add_tick_handler(self, handler: Callable) -> None:
+        """Register an async callback for decoded Kite market ticks."""
+        self.tick_handlers.append(handler)
+
+    @staticmethod
+    def _decode_market_data_message(message: bytes) -> List[Dict[str, Any]]:
+        """Decode Kite's length-prefixed binary quote packets."""
+        if len(message) < 2:
+            return []
+
+        packet_count = int.from_bytes(message[:2], 'big')
+        offset = 2
+        ticks: List[Dict[str, Any]] = []
+        for _ in range(packet_count):
+            if offset + 2 > len(message):
+                break
+            packet_length = int.from_bytes(message[offset:offset + 2], 'big')
+            offset += 2
+            packet = message[offset:offset + packet_length]
+            offset += packet_length
+            if packet_length < 8 or len(packet) != packet_length:
+                continue
+
+            def read_uint(start: int) -> int:
+                return int.from_bytes(packet[start:start + 4], 'big')
+
+            tick: Dict[str, Any] = {
+                'instrument_token': read_uint(0),
+                'ltp': read_uint(4) / 100.0,
+            }
+            if packet_length in {28, 32}:
+                tick.update({
+                    'open': read_uint(16) / 100.0,
+                    'high': read_uint(8) / 100.0,
+                    'low': read_uint(12) / 100.0,
+                    'close': read_uint(20) / 100.0,
+                })
+                if packet_length == 32:
+                    exchange_timestamp = read_uint(28)
+                    if exchange_timestamp:
+                        tick['timestamp'] = datetime.fromtimestamp(exchange_timestamp)
+            elif packet_length >= 44:
+                tick.update({
+                    'volume': read_uint(16),
+                    'open': read_uint(28) / 100.0,
+                    'high': read_uint(32) / 100.0,
+                    'low': read_uint(36) / 100.0,
+                    'close': read_uint(40) / 100.0,
+                })
+            if packet_length >= 64:
+                exchange_timestamp = read_uint(60)
+                if exchange_timestamp:
+                    tick['timestamp'] = datetime.fromtimestamp(exchange_timestamp)
+            ticks.append(tick)
+        return ticks
+
+    async def _process_market_data_message(self, message: bytes) -> None:
+        for tick in self._decode_market_data_message(message):
+            for handler in self.tick_handlers:
+                try:
+                    await handler(tick)
+                except Exception as e:
+                    logger.error("Error in market tick handler: %s", e)
 
     async def stop_websocket(self) -> None:
         """
@@ -635,7 +707,16 @@ class ZerodhaExchange(BaseExchange):
         super().__init__(name)
         self.api = ZerodhaAPI(api_key, api_secret, access_token)
         self.instruments: Dict[str, ZerodhaToken] = {}
+        self.order_update_handlers: List[Callable] = []
         self.giftnifty_events: List[Dict[str, Any]] = []
+        self._giftnifty_instrument: Optional[ZerodhaToken] = None
+        self._giftnifty_data_handler: Optional[Any] = None
+        self._giftnifty_timeframe = '15m'
+        self._giftnifty_bar: Optional[Dict[str, Any]] = None
+        self._giftnifty_last_volume: Optional[int] = None
+        self._nifty_future_instrument: Optional[ZerodhaToken] = None
+        self._nifty_future_ltp: Optional[float] = None
+        self._nifty_future_lots = 1
 
     async def connect(self) -> None:
         """
@@ -661,13 +742,16 @@ class ZerodhaExchange(BaseExchange):
         await self.api.stop_websocket()
         await self.api.disconnect()
 
+    def add_order_update_handler(self, handler: Callable) -> None:
+        self.order_update_handlers.append(handler)
+
     async def _load_instruments(self) -> None:
         """
         Load available instruments from Zerodha.
         """
         try:
             # Load instruments from major exchanges
-            exchanges = ['NSE', 'NFO', 'BSE', 'MCX']
+            exchanges = ['NSE', 'NFO', 'BSE', 'MCX', 'NSEIX']
             
             for exchange in exchanges:
                 instruments = await self.api.get_instruments(exchange)
@@ -693,24 +777,36 @@ class ZerodhaExchange(BaseExchange):
         try:
             instrument = self.instruments.get(f"{order.exchange}:{order.symbol}")
             if instrument is None:
+                instrument = next(
+                    (candidate for candidate in self.instruments.values()
+                     if candidate.symbol == order.symbol),
+                    None,
+                )
+            if instrument is None:
                 raise ValueError(
                     f"Unknown instrument {order.exchange}:{order.symbol}; "
                     "cannot determine the Kite exchange for this order"
                 )
+            if instrument.lot_size <= 0 or instrument.tick_size <= 0:
+                raise ValueError(
+                    f"{order.exchange}:{order.symbol} is a non-tradable index; "
+                    "Kite can provide market data but cannot accept orders for it"
+                )
             
             # Convert Order to ZerodhaOrderRequest
+            is_market_order = order.order_type.lower() == 'market'
             order_request = ZerodhaOrderRequest(
                 symbol=order.symbol,
                 exchange=instrument.exchange,
                 transaction_type=ZerodhaTransactionType.BUY.value if order.side == 'buy' else ZerodhaTransactionType.SELL.value,
                 quantity=int(order.quantity),
-                price=order.price,
+                price=None if is_market_order else order.price,
                 product=(
                     ZerodhaProductType.NRML.value
                     if instrument.instrument_type in {'FUT', 'CE', 'PE'}
                     else ZerodhaProductType.CNC.value
                 ),
-                order_type=ZerodhaOrderType.MARKET.value if order.price is None else ZerodhaOrderType.LIMIT.value,
+                order_type=ZerodhaOrderType.MARKET.value if is_market_order else ZerodhaOrderType.LIMIT.value,
                 trigger_price=order.stop_price
             )
             
@@ -777,6 +873,236 @@ class ZerodhaExchange(BaseExchange):
         # This method is called by the trading engine to update positions
         pass
 
+    @staticmethod
+    def _kite_interval(timeframe: str) -> str:
+        intervals = {
+            '1m': 'minute', '1minute': 'minute',
+            '3m': '3minute', '5m': '5minute', '10m': '10minute',
+            '15m': '15minute', '30m': '30minute', '1h': '60minute',
+        }
+        try:
+            return intervals[timeframe.lower()]
+        except KeyError as error:
+            raise ValueError(f"Unsupported Kite candle timeframe: {timeframe}") from error
+
+    async def setup_strategy_market_data(self, data_handler: Any, timeframe: str = '15m') -> None:
+        """Load GIFT NIFTY history and subscribe its index to live ticks."""
+        instrument = self._find_giftnifty_instrument()
+        if instrument is None:
+            raise RuntimeError("No GIFT NIFTY index or futures instrument was found in Kite instruments")
+        future = self._find_front_month_nifty_future()
+        if future is None:
+            raise RuntimeError("No unexpired NIFTY futures contract was found in Kite instruments")
+
+        interval = self._kite_interval(timeframe)
+        bar_minutes = 1 if interval == 'minute' else int(interval.removesuffix('minute'))
+        now = datetime.now()
+        self._giftnifty_instrument = instrument
+        self._giftnifty_data_handler = data_handler
+        self._giftnifty_timeframe = timeframe
+        self._nifty_future_instrument = future
+        await data_handler.add_data_stream(instrument.symbol, instrument.exchange, max_size=1000)
+
+        candles = await self.get_historical_data(
+            instrument.symbol,
+            instrument.exchange,
+            now - timedelta(days=30),
+            now,
+            interval,
+        )
+        if not candles:
+            raise RuntimeError(f"No historical candles returned for {instrument.exchange}:{instrument.symbol}")
+
+        for candle in candles:
+            timestamp = candle['timestamp']
+            if isinstance(timestamp, str):
+                timestamp = datetime.fromisoformat(timestamp)
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.astimezone().replace(tzinfo=None)
+            await data_handler._process_new_data({
+                'symbol': instrument.symbol,
+                'exchange': instrument.exchange,
+                'timestamp': timestamp,
+                'open_price': candle['open'],
+                'high_price': candle['high'],
+                'low_price': candle['low'],
+                'close_price': candle['close'],
+                'volume': candle['volume'],
+                'timeframe': timeframe,
+            })
+
+        latest = candles[-1]
+        latest_timestamp = latest['timestamp']
+        if isinstance(latest_timestamp, str):
+            latest_timestamp = datetime.fromisoformat(latest_timestamp)
+        if latest_timestamp.tzinfo is not None:
+            latest_timestamp = latest_timestamp.astimezone().replace(tzinfo=None)
+        bucket_start = self._giftnifty_bucket_start(latest_timestamp, bar_minutes)
+        if bucket_start == self._giftnifty_bucket_start(now, bar_minutes):
+            self._giftnifty_bar = {
+                'timestamp': bucket_start,
+                'open_price': latest['open'],
+                'high_price': latest['high'],
+                'low_price': latest['low'],
+                'close_price': latest['close'],
+                'volume': latest['volume'],
+            }
+
+        self.api.add_tick_handler(self._handle_giftnifty_tick)
+        await self.api.subscribe_market_data(instrument.instrument_token, mode='full')
+        self.api.add_tick_handler(self._handle_nifty_future_tick)
+        await self.api.subscribe_market_data(future.instrument_token, mode='ltp')
+        logger.info(
+            "Subscribed SuperTrend strategy to %s:%s token=%s timeframe=%s with %d historical candle(s); orders route to %s:%s",
+            instrument.exchange,
+            instrument.symbol,
+            instrument.instrument_token,
+            timeframe,
+            len(candles),
+            future.exchange,
+            future.symbol,
+        )
+
+    @staticmethod
+    def _giftnifty_bucket_start(timestamp: datetime, minutes: int) -> datetime:
+        bucket_minute = timestamp.minute - timestamp.minute % minutes
+        return timestamp.replace(minute=bucket_minute, second=0, microsecond=0)
+
+    async def _handle_giftnifty_tick(self, tick: Dict[str, Any]) -> None:
+        instrument = self._giftnifty_instrument
+        data_handler = self._giftnifty_data_handler
+        if instrument is None or data_handler is None:
+            return
+        if tick.get('instrument_token') != instrument.instrument_token:
+            return
+
+        ltp = float(tick['ltp'])
+        timestamp = tick.get('timestamp', datetime.now())
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone().replace(tzinfo=None)
+        interval = self._kite_interval(self._giftnifty_timeframe)
+        bar_minutes = 1 if interval == 'minute' else int(interval.removesuffix('minute'))
+        bucket_start = self._giftnifty_bucket_start(timestamp, bar_minutes)
+
+        if self._giftnifty_bar is None or self._giftnifty_bar['timestamp'] != bucket_start:
+            self._giftnifty_bar = {
+                'timestamp': bucket_start,
+                'open_price': ltp,
+                'high_price': ltp,
+                'low_price': ltp,
+                'close_price': ltp,
+                'volume': 0,
+            }
+        else:
+            self._giftnifty_bar['high_price'] = max(self._giftnifty_bar['high_price'], ltp)
+            self._giftnifty_bar['low_price'] = min(self._giftnifty_bar['low_price'], ltp)
+            self._giftnifty_bar['close_price'] = ltp
+
+        tick_volume = int(tick.get('volume', self._giftnifty_last_volume or 0))
+        volume_delta = (
+            0 if self._giftnifty_last_volume is None
+            else max(0, tick_volume - self._giftnifty_last_volume)
+        )
+        self._giftnifty_bar['volume'] += volume_delta
+        self._giftnifty_last_volume = tick_volume
+        logger.info(
+            "[LIVE] %s:%s timeframe=%s LTP=%.2f candle_OHLC=%.2f/%.2f/%.2f/%.2f",
+            instrument.exchange,
+            instrument.symbol,
+            self._giftnifty_timeframe,
+            ltp,
+            self._giftnifty_bar['open_price'],
+            self._giftnifty_bar['high_price'],
+            self._giftnifty_bar['low_price'],
+            self._giftnifty_bar['close_price'],
+        )
+        await data_handler._process_new_data({
+            'symbol': instrument.symbol,
+            'exchange': instrument.exchange,
+            **self._giftnifty_bar,
+            'timeframe': self._giftnifty_timeframe,
+        })
+
+    async def _handle_nifty_future_tick(self, tick: Dict[str, Any]) -> None:
+        instrument = self._nifty_future_instrument
+        if instrument and tick.get('instrument_token') == instrument.instrument_token:
+            self._nifty_future_ltp = float(tick['ltp'])
+            logger.info(
+                "[LIVE] %s:%s LTP=%.2f lot_size=%s",
+                instrument.exchange,
+                instrument.symbol,
+                self._nifty_future_ltp,
+                instrument.lot_size,
+            )
+
+    def _find_front_month_nifty_future(self) -> Optional[ZerodhaToken]:
+        """Return the nearest unexpired NIFTY index futures contract."""
+        today = datetime.now().date()
+        excluded_prefixes = ('GIFTNIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT')
+        candidates = [
+            instrument for instrument in self.instruments.values()
+            if instrument.exchange.upper() == 'NFO'
+            and instrument.instrument_type == 'FUT'
+            and instrument.symbol.upper().startswith('NIFTY')
+            and not instrument.symbol.upper().startswith(excluded_prefixes)
+            and instrument.expiry_date is not None
+            and instrument.expiry_date.date() >= today
+            and instrument.lot_size > 0
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda instrument: instrument.expiry_date)
+
+    def order_symbol_for_signal(self, signal_symbol: str) -> Optional[str]:
+        normalized = ''.join(character for character in signal_symbol.upper() if character.isalnum())
+        if normalized == 'GIFTNIFTY':
+            instrument = self._nifty_future_instrument or self._find_front_month_nifty_future()
+            return instrument.symbol if instrument else None
+        return signal_symbol
+
+    async def prepare_order(self, order: Order) -> None:
+        """Route GIFT NIFTY signals to one current NIFTY futures lot."""
+        signal_symbol = ''.join(character for character in order.symbol.upper() if character.isalnum())
+        if signal_symbol != 'GIFTNIFTY':
+            return
+
+        instrument = self._nifty_future_instrument or self._find_front_month_nifty_future()
+        if instrument is None:
+            raise RuntimeError("Cannot route GIFT NIFTY signal: no unexpired NIFTY futures contract")
+
+        ltp = self._nifty_future_ltp
+        if ltp is None or ltp <= 0:
+            quote = await self.api.get_quote(instrument.symbol, instrument.exchange)
+            ltp = float(quote.get('last_price') or 0)
+        if ltp <= 0:
+            raise RuntimeError(f"No valid LTP available for {instrument.exchange}:{instrument.symbol}")
+
+        order.symbol = instrument.symbol
+        order.quantity = float(instrument.lot_size * self._nifty_future_lots)
+        order.price = ltp
+        order.order_type = 'market'
+        logger.info(
+            "Mapped GIFT NIFTY %s signal to %s:%s quantity=%s price_reference=%.2f",
+            order.side.upper(),
+            instrument.exchange,
+            instrument.symbol,
+            order.quantity,
+            ltp,
+        )
+
+    def risk_limit_for_order(self, order: Order) -> Optional[float]:
+        """Return a 10% buffer over one mapped futures order's notional."""
+        instrument = self._nifty_future_instrument
+        if (
+            instrument is None
+            or order.symbol != instrument.symbol
+            or order.quantity != instrument.lot_size * self._nifty_future_lots
+            or order.price is None
+            or order.price <= 0
+        ):
+            return None
+        return order.quantity * order.price * 1.1
+
     async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "1minute") -> List[Dict[str, Any]]:
         """
         Get historical data from Zerodha.
@@ -833,23 +1159,20 @@ class ZerodhaExchange(BaseExchange):
         Args:
             order_data: Order update data
         """
-        # Process order update
-        order_id = order_data.get('orderid')
-        status = order_data.get('status')
-        
-        # Convert Zerodha status to standard status
-        status_map = {
-            'complete': OrderStatus.FILLED,
-            'cancelled': OrderStatus.CANCELED,
-            'rejected': OrderStatus.REJECTED,
-            'open': OrderStatus.SUBMITTED,
-            'triggered': OrderStatus.SUBMITTED,
-            'expired': OrderStatus.REJECTED
-        }
-        
-        # Update order in engine (this would be called from the engine)
-        # For now, just log the update
-        logger.info(f"Order update: {order_id} - {status}")
+        order_id = order_data.get('order_id') or order_data.get('orderid')
+        logger.info(
+            "[ORDER UPDATE] id=%s status=%s filled=%s pending=%s average_price=%s",
+            order_id,
+            order_data.get('status'),
+            order_data.get('filled_quantity'),
+            order_data.get('pending_quantity'),
+            order_data.get('average_price'),
+        )
+        for handler in self.order_update_handlers:
+            try:
+                await handler(order_data)
+            except Exception as error:
+                logger.error("Engine order update handler failed: %s", error)
 
     async def _handle_trade_update(self, trade_data: Dict[str, Any]) -> None:
         """
@@ -872,10 +1195,22 @@ class ZerodhaExchange(BaseExchange):
         logger.info(f"Position update: {position_data}")
 
     def _find_giftnifty_instrument(self) -> Optional[ZerodhaToken]:
-        """Return the nearest-expiry GiftNifty futures instrument, if Kite lists one."""
+        """Prefer the GIFT NIFTY index; fall back to a listed futures contract."""
+        index_candidates = [
+            instrument for instrument in self.instruments.values()
+            if instrument.exchange.upper() == 'NSEIX'
+            and instrument.instrument_type == 'EQ'
+            and any(
+                ''.join(character for character in value.upper() if character.isalnum()) == 'GIFTNIFTY'
+                for value in (instrument.symbol, instrument.name)
+            )
+        ]
+        if index_candidates:
+            return index_candidates[0]
+
         candidates = [
             instrument for instrument in self.instruments.values()
-            if instrument.symbol.upper().startswith('GIFTNIFTY')
+            if instrument.symbol.upper().replace(' ', '').startswith('GIFTNIFTY')
             and instrument.instrument_type == 'FUT'
         ]
         if not candidates:
