@@ -48,6 +48,7 @@ class TradingEngine:
         self.running = False
         self.order_history: List[Order] = []
         self.position_history: List[Position] = []
+        self.pending_reversals: Dict[str, Order] = {}
         
         # Performance tracking
         self.stats = {
@@ -95,11 +96,12 @@ class TradingEngine:
         logger.info("[ENGINE] Connecting %d exchange(s)", len(self.exchanges))
         for exchange in self.exchanges.values():
             logger.info("[ENGINE] Connecting exchange: %s", exchange.name)
-            await exchange.connect()
-            logger.info("[ENGINE] Exchange connected: %s", exchange.name)
             add_order_update_handler = getattr(exchange, 'add_order_update_handler', None)
             if add_order_update_handler:
                 add_order_update_handler(self._handle_order_update)
+            await exchange.connect()
+            logger.info("[ENGINE] Exchange connected: %s", exchange.name)
+            await self._reconcile_exchange_orders(exchange)
             setup_market_data = getattr(exchange, 'setup_strategy_market_data', None)
             if setup_market_data:
                 timeframe = next(
@@ -126,6 +128,105 @@ class TradingEngine:
         asyncio.create_task(self._trading_loop())
         
         logger.info("[ENGINE] Trading engine started successfully")
+
+    async def _reconcile_exchange_orders(self, exchange: BaseExchange) -> None:
+        """Load the broker's current-day orders into local order tracking."""
+        get_order_history = getattr(exchange, 'get_order_history', None)
+        if get_order_history is None:
+            return
+
+        broker_orders = await get_order_history()
+        reconciled = 0
+        for order_data in broker_orders:
+            broker_order_id = str(order_data.get('order_id') or order_data.get('orderid') or '')
+            if not broker_order_id:
+                logger.warning("[ORDER] Skipping broker order without an order ID")
+                continue
+
+            order = next(
+                (candidate for candidate in self.orders.values()
+                 if candidate.order_id == broker_order_id),
+                None,
+            )
+            if order is None:
+                symbol = str(order_data.get('tradingsymbol') or order_data.get('symbol') or '')
+                side = str(order_data.get('transaction_type') or order_data.get('side') or '').lower()
+                if not symbol or side not in {'buy', 'sell'}:
+                    logger.warning(
+                        "[ORDER] Skipping broker order %s with missing symbol or side",
+                        broker_order_id,
+                    )
+                    continue
+
+                order = Order(
+                    id=f"broker_{exchange.name}_{broker_order_id}",
+                    symbol=symbol,
+                    side=side,
+                    order_type=str(order_data.get('order_type') or 'market').lower(),
+                    quantity=float(order_data.get('quantity') or 0.0),
+                    price=float(order_data.get('price') or 0.0) or None,
+                    exchange=exchange.name,
+                    order_id=broker_order_id,
+                    client_order_id=order_data.get('tag'),
+                )
+                self.orders[order.id] = order
+                self.order_history.append(order)
+
+            self._apply_broker_order_update(order, order_data)
+            reconciled += 1
+
+        logger.info(
+            "[ORDER] Reconciled %d broker order(s) for %s; %d currently open",
+            reconciled,
+            exchange.name,
+            sum(
+                order.status in {
+                    OrderStatus.PENDING,
+                    OrderStatus.SUBMITTED,
+                    OrderStatus.PARTIALLY_FILLED,
+                }
+                for order in self.orders.values()
+                if order.exchange == exchange.name
+            ),
+        )
+
+    @staticmethod
+    def _map_broker_order_status(status: str, filled_quantity: float) -> Optional[OrderStatus]:
+        normalized_status = status.strip().lower()
+        if normalized_status in {'complete', 'completed', 'filled'}:
+            return OrderStatus.FILLED
+        if normalized_status in {'cancelled', 'canceled'}:
+            return OrderStatus.CANCELED
+        if normalized_status in {'rejected', 'expired'}:
+            return OrderStatus.REJECTED
+        if normalized_status in {
+            'open', 'triggered', 'trigger pending', 'pending', 'open pending',
+            'validation pending', 'modify pending', 'cancel pending',
+        }:
+            return OrderStatus.PARTIALLY_FILLED if filled_quantity > 0 else OrderStatus.SUBMITTED
+        if normalized_status in {'partial', 'partially filled'}:
+            return OrderStatus.PARTIALLY_FILLED
+        return None
+
+    def _apply_broker_order_update(self, order: Order, order_data: Dict[str, Any]) -> None:
+        filled_value = order_data.get('filled_quantity')
+        if filled_value is not None:
+            order.filled_quantity = float(filled_value or 0.0)
+
+        broker_status = str(order_data.get('status') or '')
+        mapped_status = self._map_broker_order_status(broker_status, order.filled_quantity)
+        if mapped_status is not None:
+            order.status = mapped_status
+        elif broker_status:
+            logger.warning(
+                "[ORDER] Unknown broker status %r for order %s; retaining current state",
+                broker_status,
+                order.order_id,
+            )
+
+        average_price = order_data.get('average_price')
+        if average_price is not None:
+            order.avg_fill_price = float(average_price or 0.0) or None
 
     async def stop(self) -> None:
         """
@@ -209,6 +310,8 @@ class TradingEngine:
             # Submit to exchange
             logger.info("[ORDER] Sending to exchange %s", exchange.name)
             exchange_order_id = await exchange.submit_order(order)
+            if not exchange_order_id:
+                raise RuntimeError("Exchange accepted no broker order ID")
             order.order_id = exchange_order_id
             order.status = OrderStatus.SUBMITTED
             
@@ -235,27 +338,8 @@ class TradingEngine:
             logger.warning("[ORDER] Received update for untracked broker order %s", broker_order_id)
             return
 
-        status = str(order_data.get('status', '')).lower()
-        status_map = {
-            'complete': OrderStatus.FILLED,
-            'cancelled': OrderStatus.CANCELED,
-            'rejected': OrderStatus.REJECTED,
-            'expired': OrderStatus.REJECTED,
-            'open': OrderStatus.SUBMITTED,
-            'triggered': OrderStatus.SUBMITTED,
-            'partial': OrderStatus.PARTIALLY_FILLED,
-            'partially filled': OrderStatus.PARTIALLY_FILLED,
-        }
-        filled_quantity = float(order_data.get('filled_quantity') or 0.0)
-        if status == 'open' and filled_quantity > 0:
-            order.status = OrderStatus.PARTIALLY_FILLED
-        if status in status_map:
-            if not (status == 'open' and filled_quantity > 0):
-                order.status = status_map[status]
-        if order_data.get('filled_quantity') is not None:
-            order.filled_quantity = filled_quantity
-        if order_data.get('average_price') is not None:
-            order.avg_fill_price = float(order_data['average_price'])
+        was_filled = order.status == OrderStatus.FILLED
+        self._apply_broker_order_update(order, order_data)
 
         logger.info(
             "[ORDER] tracked=%s broker_id=%s status=%s filled=%s average_price=%s",
@@ -265,19 +349,19 @@ class TradingEngine:
             order.filled_quantity,
             order.avg_fill_price,
         )
-        if order.status == OrderStatus.FILLED:
+        if order.status == OrderStatus.FILLED and not was_filled:
             for strategy in self.strategies:
                 await strategy.on_order_filled(order)
 
     async def cancel_order(self, order_id: str) -> bool:
         """
-        Cancel an existing order.
+        Request cancellation of an existing order.
         
         Args:
             order_id: ID of the order to cancel
             
         Returns:
-            True if order was canceled successfully, False otherwise
+            True if the broker accepted the cancellation request, False otherwise
         """
         order = self.orders.get(order_id)
         if not order:
@@ -290,11 +374,19 @@ class TradingEngine:
         
         try:
             exchange = self.exchanges.get(order.exchange)
-            if exchange:
-                await exchange.cancel_order(order.order_id)
-            
-            order.status = OrderStatus.CANCELED
-            logger.info(f"Order canceled: {order_id}")
+            if not exchange or not order.order_id:
+                logger.error("Order %s has no exchange or broker order ID", order_id)
+                return False
+
+            canceled = await exchange.cancel_order(order.order_id)
+            if not canceled:
+                logger.warning("Broker did not confirm cancellation for order %s", order_id)
+                return False
+
+            logger.info(
+                "[ORDER] Cancellation requested for %s; waiting for broker confirmation",
+                order_id,
+            )
             return True
             
         except Exception as e:
@@ -396,6 +488,9 @@ class TradingEngine:
                 # Update positions
                 logger.debug("[LOOP] Refreshing positions from exchange")
                 await self._update_positions()
+
+                # Finish reversals only after broker state confirms the old side is flat.
+                await self._process_pending_reversals()
                 
                 # Check for stop-loss and take-profit
                 logger.debug("[LOOP] Checking exit conditions")
@@ -447,14 +542,40 @@ class TradingEngine:
                 logger.info("[SIGNAL] Processing signal: %s %s @ %.2f strength=%.2f", signal.signal_type, signal.symbol, signal.price or 0.0, signal.strength)
                 exchange_name = self._default_exchange_name()
                 exchange = self.exchanges.get(exchange_name) if exchange_name else None
-                symbol_resolver = getattr(exchange, 'order_symbol_for_signal', None)
-                target_symbol = symbol_resolver(signal.symbol) if symbol_resolver else signal.symbol
-                if not target_symbol:
-                    logger.error("[SIGNAL] No futures contract available for %s", signal.symbol)
+                if exchange is None:
+                    logger.error("[SIGNAL] No single exchange is available for %s", signal.symbol)
                     continue
 
-                active_order = next(
-                    (
+                order = self._create_order_from_signal(signal)
+                if order is None:
+                    logger.warning("[SIGNAL] Could not create order from signal for %s", signal.symbol)
+                    continue
+
+                prepare_order = getattr(exchange, 'prepare_order', None)
+                if prepare_order:
+                    await prepare_order(order)
+                target_symbol = order.symbol
+
+                try:
+                    await self._reconcile_exchange_orders(exchange)
+                    await self._update_positions()
+                except Exception as error:
+                    logger.error(
+                        "[SIGNAL] Cannot verify broker orders/positions for %s; refusing new order: %s",
+                        target_symbol,
+                        error,
+                    )
+                    continue
+
+                symbol_resolver = getattr(exchange, 'order_symbol_for_signal', None)
+                if symbol_resolver and signal.symbol != target_symbol:
+                    logger.info(
+                        "[SIGNAL] Resolved %s to active contract %s",
+                        signal.symbol,
+                        target_symbol,
+                    )
+
+                active_orders = [
                         order for order in self.orders.values()
                         if order.symbol == target_symbol
                         and order.status in {
@@ -462,18 +583,7 @@ class TradingEngine:
                             OrderStatus.SUBMITTED,
                             OrderStatus.PARTIALLY_FILLED,
                         }
-                    ),
-                    None,
-                )
-                if active_order:
-                    logger.debug(
-                        "[SIGNAL] Skipping %s: order %s for %s is still %s",
-                        signal.signal_type,
-                        active_order.id,
-                        target_symbol,
-                        active_order.status.value,
-                    )
-                    continue
+                    ]
 
                 position = self.positions.get(target_symbol)
                 if position and position.quantity > 0:
@@ -483,6 +593,7 @@ class TradingEngine:
                         position.side == PositionSide.SHORT and signal.signal_type == 'sell'
                     )
                     if same_direction:
+                        self.pending_reversals.pop(target_symbol, None)
                         logger.debug(
                             "[SIGNAL] Holding %s %s position; duplicate entry skipped",
                             position.side.value,
@@ -490,34 +601,138 @@ class TradingEngine:
                         )
                     else:
                         logger.info(
-                            "[SIGNAL] Reverse signal: closing %s before considering %s entry",
+                            "[SIGNAL] Reverse signal: closing %s before entering %s",
                             target_symbol,
                             signal.signal_type,
                         )
-                        await self.close_position(
+                        self.pending_reversals[target_symbol] = order
+                        position_order_side = (
+                            'buy' if position.side == PositionSide.LONG else 'sell'
+                        )
+                        conflicting_orders = [
+                            active for active in active_orders
+                            if active.side == position_order_side
+                        ]
+                        for active in conflicting_orders:
+                            await self.cancel_order(active.id)
+                        try:
+                            await self._reconcile_exchange_orders(exchange)
+                            await self._update_positions()
+                        except Exception as error:
+                            logger.error(
+                                "[SIGNAL] Could not confirm conflicting-order cancellation for %s: %s",
+                                target_symbol,
+                                error,
+                            )
+                    continue
+
+                if active_orders:
+                    same_side_order = any(
+                        active.side == signal.signal_type for active in active_orders
+                    )
+                    if same_side_order:
+                        self.pending_reversals.pop(target_symbol, None)
+                        logger.info(
+                            "[SIGNAL] Matching %s order already active for %s; not duplicating",
+                            signal.signal_type,
                             target_symbol,
-                            position.quantity,
-                            position.side.value,
+                        )
+                        continue
+
+                    self.pending_reversals[target_symbol] = order
+                    for active in active_orders:
+                        await self.cancel_order(active.id)
+                    logger.info(
+                        "[SIGNAL] Canceling conflicting order(s) for %s before %s entry",
+                        target_symbol,
+                        signal.signal_type,
+                    )
+                    try:
+                        await self._reconcile_exchange_orders(exchange)
+                        await self._update_positions()
+                    except Exception as error:
+                        logger.error(
+                            "[SIGNAL] Could not confirm conflicting-order cancellation for %s: %s",
+                            target_symbol,
+                            error,
                         )
                     continue
 
-                # Create order from signal
-                order = self._create_order_from_signal(signal)
-                if order:
-                    logger.info("[SIGNAL] Created order %s from signal for %s", order.id, signal.symbol)
-                    # Submit order
-                    submitted = await self.submit_order(order)
-                    logger.info(
-                        "[SIGNAL] order_id=%s symbol=%s status=%s submitted=%s",
-                        order.id,
-                        order.symbol,
-                        order.status.value,
-                        submitted,
-                    )
-                else:
-                    logger.warning("[SIGNAL] Could not create order from signal for %s", signal.symbol)
+                self.pending_reversals.pop(target_symbol, None)
+                logger.info("[SIGNAL] Created order %s from signal for %s", order.id, signal.symbol)
+                submitted = await self.submit_order(order)
+                logger.info(
+                    "[SIGNAL] order_id=%s symbol=%s status=%s submitted=%s",
+                    order.id,
+                    order.symbol,
+                    order.status.value,
+                    submitted,
+                )
             except Exception as e:
                 logger.error("[SIGNAL] Error processing signal for %s: %s", signal.symbol if signal else 'unknown', str(e))
+
+    async def _process_pending_reversals(self) -> None:
+        """Close opposing exposure and enter the requested side after it is flat."""
+        active_statuses = {
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+        }
+        for symbol, entry_order in list(self.pending_reversals.items()):
+            position = self.positions.get(symbol)
+            active_orders = [
+                order for order in self.orders.values()
+                if order.symbol == symbol and order.status in active_statuses
+            ]
+
+            if position and position.quantity > 0 and position.side != PositionSide.FLAT:
+                position_side = 'buy' if position.side == PositionSide.LONG else 'sell'
+                if position_side == entry_order.side:
+                    self.pending_reversals.pop(symbol, None)
+                    continue
+
+                close_side = 'sell' if position.side == PositionSide.LONG else 'buy'
+                if any(order.side == close_side for order in active_orders):
+                    continue
+                if active_orders:
+                    for active in active_orders:
+                        await self.cancel_order(active.id)
+                    exchange = self.exchanges.get(entry_order.exchange)
+                    if exchange:
+                        try:
+                            await self._reconcile_exchange_orders(exchange)
+                            await self._update_positions()
+                        except Exception as error:
+                            logger.error(
+                                "[SIGNAL] Could not confirm conflicting-order cancellation for %s: %s",
+                                symbol,
+                                error,
+                            )
+                    continue
+
+                logger.info(
+                    "[SIGNAL] Closing opposing %s position for %s before %s entry",
+                    position.side.value,
+                    symbol,
+                    entry_order.side,
+                )
+                await self.close_position(symbol, position.quantity, position.side.value)
+                continue
+
+            if active_orders:
+                if any(order.side == entry_order.side for order in active_orders):
+                    self.pending_reversals.pop(symbol, None)
+                continue
+
+            self.pending_reversals.pop(symbol, None)
+            submitted = await self.submit_order(entry_order)
+            logger.info(
+                "[SIGNAL] Reversal entry %s symbol=%s status=%s submitted=%s",
+                entry_order.side.upper(),
+                symbol,
+                entry_order.status.value,
+                submitted,
+            )
 
     async def _update_positions(self) -> None:
         """

@@ -75,7 +75,9 @@ def acquire_access_token(api_key: str, api_secret: str, timeout: int = 300) -> s
     )
     print(f"Kite callback listener ready at {callback_url}")
     print("Approve the Kite login in the browser to continue; no token copying is needed.")
-    webbrowser.open(login_url)
+    if not webbrowser.open(login_url):
+        print("Could not open a browser automatically.")
+    print(f"Kite login URL (open manually if needed):\n{login_url}")
     try:
         server.handle_request()
     finally:

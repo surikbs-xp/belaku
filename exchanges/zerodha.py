@@ -727,13 +727,13 @@ class ZerodhaExchange(BaseExchange):
         # Load instruments
         await self._load_instruments()
         
-        # Start WebSocket for real-time data
-        await self.api.start_websocket()
-        
         # Set up event handlers
         self.api.add_order_update_handler(self._handle_order_update)
         self.api.add_trade_update_handler(self._handle_trade_update)
         self.api.add_position_update_handler(self._handle_position_update)
+
+        # Start WebSocket only after handlers are ready to receive updates.
+        await self.api.start_websocket()
 
     async def disconnect(self) -> None:
         """
@@ -818,6 +818,10 @@ class ZerodhaExchange(BaseExchange):
         except Exception as e:
             logger.error(f"Failed to submit order: {str(e)}")
             raise
+
+    async def get_order_history(self) -> List[Dict[str, Any]]:
+        """Return Zerodha's current-day order book for engine reconciliation."""
+        return await self.api.get_order_history()
 
     async def cancel_order(self, order_id: str) -> bool:
         """
