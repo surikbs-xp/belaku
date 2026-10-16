@@ -308,6 +308,30 @@ class ZerodhaAPI:
             logger.info(f"Order placed: {order_id or 'unknown'}")
             return {'order_id': order_id}
             
+        except requests.HTTPError as e:
+            response = e.response
+            try:
+                payload = response.json() if response is not None else {}
+            except ValueError:
+                payload = {}
+            error_type = payload.get('error_type', 'HTTPError')
+            message = payload.get('message') or payload.get('error')
+            if not message and response is not None:
+                message = response.text[:500]
+            logger.error(
+                "Failed to place order: HTTP %s %s: %s",
+                response.status_code if response is not None else 'unknown',
+                error_type,
+                message or str(e),
+            )
+            raise RuntimeError(
+                "Kite order rejected (HTTP %s %s): %s"
+                % (
+                    response.status_code if response is not None else 'unknown',
+                    error_type,
+                    message or str(e),
+                )
+            ) from e
         except Exception as e:
             logger.error(f"Failed to place order: {str(e)}")
             raise
@@ -807,7 +831,8 @@ class ZerodhaExchange(BaseExchange):
                     else ZerodhaProductType.CNC.value
                 ),
                 order_type=ZerodhaOrderType.MARKET.value if is_market_order else ZerodhaOrderType.LIMIT.value,
-                trigger_price=order.stop_price
+                trigger_price=order.stop_price,
+                tag=order.timeframe,
             )
             
             # Place order
@@ -889,7 +914,7 @@ class ZerodhaExchange(BaseExchange):
         except KeyError as error:
             raise ValueError(f"Unsupported Kite candle timeframe: {timeframe}") from error
 
-    async def setup_strategy_market_data(self, data_handler: Any, timeframe: str = '15m') -> None:
+    async def setup_strategy_market_data(self, data_handler: Any, timeframe: str = '3m') -> None:
         """Load GIFT NIFTY history and subscribe its index to live ticks."""
         instrument = self._find_giftnifty_instrument()
         if instrument is None:

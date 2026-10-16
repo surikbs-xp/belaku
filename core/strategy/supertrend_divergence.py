@@ -24,9 +24,11 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
     def __init__(self, parameters: Optional[Dict[str, Any]] = None):
         default_parameters = {
-            'timeframe': '15m',
-            'atr_period': 10,
+            'timeframe': '3m',
+            'atr_period': 14,
             'multiplier': 3.0,
+            'pivot_length': 3,
+            'divergence_sensitivity': 0.3,
             'psar_step': 0.02,
             'psar_max_step': 0.2,
             'rsi_period': 14,

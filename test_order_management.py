@@ -1,10 +1,14 @@
 """Tests for broker order reconciliation and lifecycle updates."""
 
 import unittest
+from unittest.mock import Mock, patch
+
+import requests
 
 from core.engine import TradingEngine
 from core.strategy.base import Signal
 from core.types import Order, OrderStatus
+from exchanges.zerodha import ZerodhaAPI, ZerodhaOrderRequest
 
 
 class FakeExchange:
@@ -197,15 +201,22 @@ class OrderManagementTests(unittest.IsolatedAsyncioTestCase):
         await engine._update_positions()
 
         await engine._process_signals([
-            Signal(symbol='RELIANCE', signal_type='sell', strength=0.8, price=99, quantity=1)
+            Signal(
+                symbol='RELIANCE',
+                signal_type='sell',
+                strength=0.8,
+                price=99,
+                quantity=1,
+                timeframe='3m',
+            )
         ])
         await engine._update_positions()
         await engine._process_pending_reversals()
 
         self.assertEqual(len(exchange.submitted_orders), 1)
         self.assertEqual(exchange.submitted_orders[0].side, 'sell')
+        self.assertEqual(exchange.submitted_orders[0].timeframe, '3m')
         self.assertTrue(hasattr(engine, '_process_pending_reversals'))
-
         exchange.positions['ZERODHA:RELIANCE']['quantity'] = 0
         exchange.broker_orders[0].update(status='COMPLETE', filled_quantity=1, average_price=99)
         await engine._reconcile_exchange_orders(exchange)
@@ -215,6 +226,35 @@ class OrderManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(exchange.submitted_orders), 2)
         self.assertEqual(exchange.submitted_orders[1].side, 'sell')
         self.assertEqual(exchange.submitted_orders[1].symbol, 'RELIANCE')
+        self.assertEqual(exchange.submitted_orders[1].timeframe, '3m')
+
+class ZerodhaOrderErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_error_logs_kite_message_without_credentials(self):
+        response = Mock()
+        response.status_code = 403
+        response.json.return_value = {
+            'status': 'error',
+            'error_type': 'PermissionException',
+            'message': 'Order placement is not permitted',
+        }
+        response.raise_for_status.side_effect = requests.HTTPError(
+            '403 Client Error',
+            response=response,
+        )
+        api = ZerodhaAPI('test-api-key', 'test-api-secret', 'test-access-token')
+
+        with patch.object(api.session, 'post', return_value=response):
+            with self.assertLogs('exchanges.zerodha', level='ERROR') as logs:
+                with self.assertRaisesRegex(RuntimeError, 'PermissionException'):
+                    await api.place_order(ZerodhaOrderRequest(
+                        symbol='NIFTY26OCTFUT',
+                        transaction_type='BUY',
+                        quantity=65,
+                    ))
+
+        self.assertIn('PermissionException', logs.output[0])
+        self.assertIn('Order placement is not permitted', logs.output[0])
+        self.assertNotIn('test-access-token', logs.output[0])
 
     async def test_opposite_signal_cancels_working_order_before_entry(self):
         exchange = FakeExchange([{

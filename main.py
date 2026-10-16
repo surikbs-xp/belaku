@@ -28,11 +28,15 @@ class StrategyPhaseLogFilter(logging.Filter):
         self.strategy_only = False
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return (
-            not self.strategy_only
-            or record.name == 'core.strategy'
+        is_strategy_log = (
+            record.name == 'core.strategy'
             or record.name.startswith('core.strategy.')
         )
+        is_order_lifecycle_log = (
+            record.name == 'core.engine'
+            and record.getMessage().startswith(('[SIGNAL]', '[ORDER]', '[RISK]', '[EXIT]'))
+        )
+        return not self.strategy_only or is_strategy_log or is_order_lifecycle_log
 
 
 strategy_log_filter = StrategyPhaseLogFilter()
@@ -85,9 +89,11 @@ def load_config() -> Dict[str, Any]:
             'access_token': 'YOUR_ACCESS_TOKEN_HERE',
         },
         'supertrend': {
-            'timeframe': '15m',
-            'atr_period': 10,
+            'timeframe': '3m',
+            'atr_period': 14,
             'multiplier': 3.0,
+            'pivot_length': 3,
+            'divergence_sensitivity': 0.3,
             'rsi_period': 14,
             'rsi_weight': 0.6,
             'macd_weight': 0.4,

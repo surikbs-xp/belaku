@@ -45,6 +45,7 @@ class Order:
     exchange: Optional[str] = None
     order_id: Optional[str] = None
     client_order_id: Optional[str] = None
+    timeframe: Optional[str] = None
 
     @property
     def remaining_quantity(self) -> float:
