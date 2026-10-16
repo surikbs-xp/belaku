@@ -93,6 +93,24 @@ The bot uses a hierarchical configuration system:
 
 Configuration can be overridden via environment variables or command-line arguments.
 
+## Interpreting Strategy Logs
+
+The SuperTrend strategy emits a `[STRATEGY]` status once per symbol per minute. Its `conditions` field reports the SuperTrend and Parabolic SAR (PSAR) directions and whether they agree. A BUY or SELL direction is eligible only when those two indicators agree and the market-data feed is fresh.
+
+For example, `signal=BUY_BLOCKED_COOLDOWN` means the indicators agree on BUY, but the strategy recently emitted a signal and its cooldown has not expired. The default cooldown is 60 seconds. No new signal is returned for that evaluation. Other blocked states include `*_BLOCKED_STALE_FEED` and `*_BLOCKED_HOURLY_LIMIT`; `NO_SIGNAL` means the indicators do not agree.
+
+`divergence` is a normalized RSI/MACD composite from -1 to 1. The `(strength_only)` label means it contributes to signal strength; it does not choose the BUY/SELL direction. Direction comes from the agreeing SuperTrend and PSAR values. `strength` in `[ST] FINAL signal` is a composite score, not a probability: it combines divergence magnitude and SuperTrend strength, with a lower multiplier when divergence points against the trend.
+
+`[ST] FINAL signal` means the strategy created a signal object. It does not mean an order was submitted or filled. The logged `price` is the latest candle close, while the earlier `[STRATEGY]` line reports the live `ltp` separately. For example, `psar` is the current Parabolic SAR value, not the execution price.
+
+## Live Order Management
+
+Accepted strategy signals are submitted as live orders through the configured exchange. Zerodha orders use its regular order endpoint; the current signal path uses market orders. On startup, the engine imports Zerodha's current-day order book so working orders remain visible to duplicate-order checks after a restart. Broker updates maintain local order status and fills, and cancellations are only marked complete when the broker confirms them.
+
+Stop-loss and take-profit levels are monitored by the running engine and trigger market close orders; they are not resting protective orders held at Zerodha. Keep the broker order book and positions as the source of truth, especially after a disconnect or restart.
+
+When an opposite signal arrives for a futures contract, the engine checks that contract's broker orders and position. It requests cancellation of conflicting working orders, closes any filled position, and waits for broker updates to confirm the old exposure is flat before submitting the new-side market entry. A partially filled order is handled by canceling its remainder and closing the filled quantity first.
+
 ## Development
 
 ### Testing
