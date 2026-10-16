@@ -168,6 +168,11 @@ class TradingEngine:
                     exchange=exchange.name,
                     order_id=broker_order_id,
                     client_order_id=order_data.get('tag'),
+                    timeframe=(
+                        order_data.get('tag')
+                        if order_data.get('tag') in {'1m', '3m', '5m', '10m', '15m', '30m', '1h'}
+                        else None
+                    ),
                 )
                 self.orders[order.id] = order
                 self.order_history.append(order)
@@ -319,7 +324,15 @@ class TradingEngine:
             self.orders[order.id] = order
             self.order_history.append(order)
             
-            logger.info("[ORDER] Submitted successfully: %s - %s %s %s", order.id, order.symbol, order.side, order.quantity)
+            logger.info(
+                "[ORDER] Submitted successfully: %s timeframe=%s - %s %s %s broker_id=%s",
+                order.id,
+                order.timeframe or 'unknown',
+                order.symbol,
+                order.side,
+                order.quantity,
+                order.order_id,
+            )
             return True
             
         except Exception as e:
@@ -342,8 +355,9 @@ class TradingEngine:
         self._apply_broker_order_update(order, order_data)
 
         logger.info(
-            "[ORDER] tracked=%s broker_id=%s status=%s filled=%s average_price=%s",
+            "[ORDER] tracked=%s timeframe=%s broker_id=%s status=%s filled=%s average_price=%s",
             order.id,
+            order.timeframe or 'unknown',
             broker_order_id,
             order.status.value,
             order.filled_quantity,
@@ -384,8 +398,9 @@ class TradingEngine:
                 return False
 
             logger.info(
-                "[ORDER] Cancellation requested for %s; waiting for broker confirmation",
+                "[ORDER] Cancellation requested for %s timeframe=%s; waiting for broker confirmation",
                 order_id,
+                order.timeframe or 'unknown',
             )
             return True
             
@@ -406,7 +421,13 @@ class TradingEngine:
         
         return self.positions
 
-    async def close_position(self, symbol: str, quantity: float, side: str) -> bool:
+    async def close_position(
+        self,
+        symbol: str,
+        quantity: float,
+        side: str,
+        timeframe: Optional[str] = None,
+    ) -> bool:
         """
         Close an existing position.
         
@@ -435,7 +456,8 @@ class TradingEngine:
                 side=close_side,
                 order_type="market",
                 quantity=quantity,
-                exchange=position.exchange
+                exchange=position.exchange,
+                timeframe=timeframe,
             )
             
             success = await self.submit_order(order)
@@ -539,7 +561,14 @@ class TradingEngine:
                         )
                         continue
 
-                logger.info("[SIGNAL] Processing signal: %s %s @ %.2f strength=%.2f", signal.signal_type, signal.symbol, signal.price or 0.0, signal.strength)
+                logger.info(
+                    "[SIGNAL] Processing signal: %s %s timeframe=%s @ %.2f strength=%.2f",
+                    signal.signal_type,
+                    signal.symbol,
+                    signal.timeframe,
+                    signal.price or 0.0,
+                    signal.strength,
+                )
                 exchange_name = self._default_exchange_name()
                 exchange = self.exchanges.get(exchange_name) if exchange_name else None
                 if exchange is None:
@@ -601,8 +630,9 @@ class TradingEngine:
                         )
                     else:
                         logger.info(
-                            "[SIGNAL] Reverse signal: closing %s before entering %s",
+                            "[SIGNAL] Reverse signal: closing %s timeframe=%s before entering %s",
                             target_symbol,
+                            signal.timeframe,
                             signal.signal_type,
                         )
                         self.pending_reversals[target_symbol] = order
@@ -643,8 +673,9 @@ class TradingEngine:
                     for active in active_orders:
                         await self.cancel_order(active.id)
                     logger.info(
-                        "[SIGNAL] Canceling conflicting order(s) for %s before %s entry",
+                        "[SIGNAL] Canceling conflicting order(s) for %s timeframe=%s before %s entry",
                         target_symbol,
+                        signal.timeframe,
                         signal.signal_type,
                     )
                     try:
@@ -659,12 +690,18 @@ class TradingEngine:
                     continue
 
                 self.pending_reversals.pop(target_symbol, None)
-                logger.info("[SIGNAL] Created order %s from signal for %s", order.id, signal.symbol)
+                logger.info(
+                    "[SIGNAL] Created order %s for %s timeframe=%s",
+                    order.id,
+                    signal.symbol,
+                    signal.timeframe,
+                )
                 submitted = await self.submit_order(order)
                 logger.info(
-                    "[SIGNAL] order_id=%s symbol=%s status=%s submitted=%s",
+                    "[SIGNAL] order_id=%s symbol=%s timeframe=%s status=%s submitted=%s",
                     order.id,
                     order.symbol,
+                    order.timeframe or 'unknown',
                     order.status.value,
                     submitted,
                 )
@@ -711,12 +748,18 @@ class TradingEngine:
                     continue
 
                 logger.info(
-                    "[SIGNAL] Closing opposing %s position for %s before %s entry",
+                    "[SIGNAL] Closing opposing %s position for %s timeframe=%s before %s entry",
                     position.side.value,
                     symbol,
+                    entry_order.timeframe or 'unknown',
                     entry_order.side,
                 )
-                await self.close_position(symbol, position.quantity, position.side.value)
+                await self.close_position(
+                    symbol,
+                    position.quantity,
+                    position.side.value,
+                    timeframe=entry_order.timeframe,
+                )
                 continue
 
             if active_orders:
@@ -727,9 +770,10 @@ class TradingEngine:
             self.pending_reversals.pop(symbol, None)
             submitted = await self.submit_order(entry_order)
             logger.info(
-                "[SIGNAL] Reversal entry %s symbol=%s status=%s submitted=%s",
+                "[SIGNAL] Reversal entry %s symbol=%s timeframe=%s status=%s submitted=%s",
                 entry_order.side.upper(),
                 symbol,
+                entry_order.timeframe or 'unknown',
                 entry_order.status.value,
                 submitted,
             )
@@ -919,7 +963,8 @@ class TradingEngine:
             order_type='market',
             quantity=signal.quantity,
             price=signal.price,
-            exchange=exchange
+            exchange=exchange,
+            timeframe=signal.timeframe,
         )
 
     def _default_exchange_name(self) -> Optional[str]:
