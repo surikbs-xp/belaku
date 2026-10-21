@@ -3,13 +3,14 @@ Pure SuperTrend + weighted divergence strategy.
 
 This strategy uses:
 - SuperTrend direction as the primary trend filter
-- weighted RSI + MACD divergence to confirm trend quality
+- PSAR direction agreement as confirmation
+- MACD histogram as a divergence-strength input
 - a single final signal which is either buy or sell
 """
 
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -20,20 +21,17 @@ logger = logging.getLogger(__name__)
 
 
 class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
-    """Trend-following strategy with SuperTrend, PSAR, and weighted divergence."""
+    """Trend-following strategy with SuperTrend, PSAR, and MACD divergence."""
 
     def __init__(self, parameters: Optional[Dict[str, Any]] = None):
         default_parameters = {
-            'timeframe': '3m',
-            'atr_period': 14,
+            'timeframe': '15m',
+            'atr_period': 10,
             'multiplier': 3.0,
-            'pivot_length': 3,
+            'pivot_length': 2,
             'divergence_sensitivity': 0.3,
             'psar_step': 0.02,
             'psar_max_step': 0.2,
-            'rsi_period': 14,
-            'rsi_weight': 0.6,
-            'macd_weight': 0.4,
             'min_strength': 0.55,
             'cooldown_period': 60,
             'max_position_size': 100000,
@@ -42,12 +40,15 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
         if parameters:
             default_parameters.update(parameters)
+        for removed_parameter in ('rsi_period', 'rsi_weight', 'macd_weight'):
+            default_parameters.pop(removed_parameter, None)
 
         super().__init__('SuperTrendWeightedDivergence', default_parameters)
         self.last_signal_time: Optional[datetime] = None
         self.signals_this_hour = 0
         self.last_hour = datetime.now().hour
         self._last_logged_candle: Dict[str, datetime] = {}
+        self._last_signal_candle: Dict[str, datetime] = {}
 
     async def analyze(self, market_data: Dict[str, Any]) -> List[Signal]:
         """Generate Trading signals based on SuperTrend with weighted divergence."""
@@ -76,12 +77,28 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
             log_candle = self._should_log_candle(symbol, now)
             candles = self._extract_candles(payload)
+            timeframe = str(self.parameters.get('timeframe', '15m'))
+            candle_duration = self._timeframe_duration(timeframe)
+            candle_timestamps = [self._parse_candle_timestamp(candle.get('timestamp')) for candle in candles]
+            if (
+                candle_duration is None
+                or len(candles) < 2
+                or any(timestamp is None for timestamp in candle_timestamps)
+            ):
+                continue
+
+            trigger_candle_timestamp = candle_timestamps[-1]
+            if trigger_candle_timestamp is None:
+                continue
+
             last_tick_value = payload.get('last_tick_at') if isinstance(payload, dict) else None
             if isinstance(last_tick_value, str):
                 try:
                     last_tick_value = datetime.fromisoformat(last_tick_value)
                 except ValueError:
                     last_tick_value = None
+            if isinstance(last_tick_value, datetime) and last_tick_value.tzinfo is not None:
+                last_tick_value = last_tick_value.astimezone().replace(tzinfo=None)
             tick_age_seconds = (
                 max(0.0, (now - last_tick_value).total_seconds())
                 if isinstance(last_tick_value, datetime)
@@ -97,7 +114,8 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
                  if isinstance(payload, dict) and payload.get(key) is not None),
                 float(candles[-1]['close']) if candles else None,
             )
-            if log_candle and ltp_value is not None and len(candles) < max(self.parameters.get('rsi_period', 14), self.parameters.get('atr_period', 10) + 5):
+            minimum_candles = int(self.parameters.get('atr_period', 10)) + 5
+            if log_candle and ltp_value is not None and len(candles) < minimum_candles:
                 strategy_price = float(candles[-1]['close']) if candles else float(ltp_value)
                 logger.info(
                     "[STRATEGY] symbol=%s timeframe=%s current_price=%.2f ltp=%.2f feed=%s feed_age=%s decision=WAITING_FOR_CANDLES",
@@ -109,7 +127,24 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
                     feed_age_label,
                 )
 
-            if len(candles) < max(self.parameters.get('rsi_period', 14), self.parameters.get('atr_period', 10) + 5):
+            if (
+                feed_stale
+                or trigger_candle_timestamp > now
+                or now >= trigger_candle_timestamp + candle_duration
+                or candle_timestamps[-2] + candle_duration != trigger_candle_timestamp
+                or last_tick_value is None
+                or self._candle_bucket(last_tick_value, candle_duration) != trigger_candle_timestamp
+                or self._last_signal_candle.get(symbol) == trigger_candle_timestamp
+            ):
+                continue
+
+            closed_candles = [
+                candle
+                for candle, timestamp in zip(candles, candle_timestamps)
+                if timestamp is not None and timestamp + candle_duration <= trigger_candle_timestamp
+            ]
+            candles = closed_candles
+            if len(candles) < minimum_candles:
                 continue
 
             closes = np.asarray([float(c['close']) for c in candles], dtype=float)
@@ -118,7 +153,7 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
             trend_direction, trend_strength = self._supertrend_direction(closes, highs, lows)
             psar_direction, psar_value = self._parabolic_sar_direction(highs, lows, closes)
-            divergence_score = self._weighted_divergence(closes)
+            divergence_score = self._macd_divergence_score(closes)
             current_price = float(closes[-1])
             ltp = float(ltp_value) if ltp_value is not None else current_price
             conditions_met = self._should_generate_signal(trend_direction, psar_direction)
@@ -160,39 +195,61 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
             signal_type = 'buy' if trend_direction > 0 else 'sell'
             _, strength = self._build_signal(trend_direction, divergence_score, trend_strength)
 
-            quantity = float(self.parameters.get('max_position_size', 100000)) / current_price if current_price > 0 else 0.0
+            entry_price = float(ltp_value) if ltp_value is not None else current_price
+            quantity = float(self.parameters.get('max_position_size', 100000)) / entry_price if entry_price > 0 else 0.0
+            condition_summary = (
+                f"SuperTrend={trend_label};PSAR={psar_label};agree={str(conditions_met).lower()};"
+                f"feed_fresh={str(not feed_stale).lower()};"
+                f"cooldown_clear={str(not cooldown_active).lower()};"
+                f"hourly_limit_clear={str(not hourly_limit_reached).lower()}"
+            )
             logger.info(
-                "[ST] FINAL signal symbol=%s timeframe=%s action=%s price=%.2f psar=%.2f strength=%.4f divergence=%.4f",
+                "[STRATEGY] SIGNAL strategy=%s symbol=%s timeframe=%s action=%s indicator_close=%.2f entry_reference=%.2f conditions=%s psar_value=%.2f strength=%.4f divergence=%.4f atr_period=%s multiplier=%.2f pivot_length=%s divergence_sensitivity=%.2f",
+                self.name,
                 symbol,
                 self.parameters.get('timeframe', '15m'),
                 signal_type.upper(),
                 current_price,
+                entry_price,
+                condition_summary,
                 psar_value,
                 strength,
                 divergence_score,
+                self.parameters.get('atr_period', 10),
+                self.parameters.get('multiplier', 3.0),
+                self.parameters.get('pivot_length', 2),
+                self.parameters.get('divergence_sensitivity', 0.3),
             )
             signal = Signal(
                 symbol=symbol,
                 signal_type=signal_type,
                 strength=min(1.0, max(0.0, strength)),
-                price=current_price,
+                price=entry_price,
                 quantity=quantity,
                 timeframe=self.parameters.get('timeframe', '15m'),
                 metadata={
                     'strategy': self.name,
+                    'signal_id': f"{self.name}:{symbol}:{self.parameters.get('timeframe', '15m')}:{signal_type}:{trigger_candle_timestamp.isoformat()}",
+                    'strategy_conditions': condition_summary,
+                    'indicator_close': current_price,
                     'timeframe': self.parameters.get('timeframe', '15m'),
                     'trend_direction': trend_direction,
                     'trend_strength': trend_strength,
                     'psar_direction': psar_direction,
                     'psar_value': psar_value,
                     'divergence_score': divergence_score,
+                    'signal_candle_timestamp': candle_timestamps[-2].isoformat(),
+                    'trigger_candle_timestamp': trigger_candle_timestamp.isoformat(),
                     'atr_period': self.parameters.get('atr_period', 10),
                     'multiplier': self.parameters.get('multiplier', 3.0),
+                    'pivot_length': self.parameters.get('pivot_length', 2),
+                    'divergence_sensitivity': self.parameters.get('divergence_sensitivity', 0.3),
                 }
             )
             signals.append(signal)
             self.signals_this_hour += 1
             self.last_signal_time = now
+            self._last_signal_candle[symbol] = trigger_candle_timestamp
             self.increment_signals_generated()
 
         return signals
@@ -212,7 +269,7 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
     async def on_position_updated(self, symbol: str, position: Dict[str, Any]) -> None:
         logger.info("Position updated for %s: %s", symbol, position)
 
-    def _extract_candles(self, payload: Any) -> List[Dict[str, float]]:
+    def _extract_candles(self, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
             for key in ('candles', 'history', 'ohlc', 'bars', 'data'):
                 if key in payload:
@@ -226,8 +283,8 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
         return []
 
-    def _normalize_candles(self, raw_candles: Sequence[Any]) -> List[Dict[str, float]]:
-        candles: List[Dict[str, float]] = []
+    def _normalize_candles(self, raw_candles: Sequence[Any]) -> List[Dict[str, Any]]:
+        candles: List[Dict[str, Any]] = []
         for candle in raw_candles:
             if isinstance(candle, dict):
                 candles.append(self._normalize_candle(candle))
@@ -240,13 +297,50 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
                 })
         return candles
 
-    def _normalize_candle(self, candle: Dict[str, Any]) -> Dict[str, float]:
-        return {
+    def _normalize_candle(self, candle: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = {
             'open': float(candle.get('open', candle.get('o', 0.0))),
             'high': float(candle.get('high', candle.get('h', 0.0))),
             'low': float(candle.get('low', candle.get('l', 0.0))),
             'close': float(candle.get('close', candle.get('c', 0.0))),
         }
+        timestamp = candle.get('timestamp', candle.get('date'))
+        if timestamp is not None:
+            normalized['timestamp'] = timestamp
+        return normalized
+
+    @staticmethod
+    def _timeframe_duration(timeframe: str) -> Optional[timedelta]:
+        durations = {
+            '1m': timedelta(minutes=1), '1minute': timedelta(minutes=1),
+            '3m': timedelta(minutes=3), '3minute': timedelta(minutes=3),
+            '5m': timedelta(minutes=5), '5minute': timedelta(minutes=5),
+            '10m': timedelta(minutes=10), '10minute': timedelta(minutes=10),
+            '15m': timedelta(minutes=15), '15minute': timedelta(minutes=15),
+            '30m': timedelta(minutes=30), '30minute': timedelta(minutes=30),
+            '1h': timedelta(hours=1), '60minute': timedelta(hours=1),
+        }
+        return durations.get(timeframe.lower())
+
+    @staticmethod
+    def _parse_candle_timestamp(value: Any) -> Optional[datetime]:
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone().replace(tzinfo=None)
+        return value
+
+    @staticmethod
+    def _candle_bucket(timestamp: datetime, duration: timedelta) -> datetime:
+        seconds = int(duration.total_seconds())
+        epoch = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+        elapsed = int((timestamp - epoch).total_seconds())
+        return epoch + timedelta(seconds=elapsed - elapsed % seconds)
 
     def _supertrend_direction(self, closes: np.ndarray, highs: np.ndarray, lows: np.ndarray) -> Tuple[int, float]:
         atr_period = int(self.parameters.get('atr_period', 10))
@@ -333,24 +427,16 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
 
         return (1 if bullish else -1), sar
 
-    def _weighted_divergence(self, closes: np.ndarray) -> float:
-        rsi_period = int(self.parameters.get('rsi_period', 14))
-        rsi_weight = float(self.parameters.get('rsi_weight', 0.6))
-        macd_weight = float(self.parameters.get('macd_weight', 0.4))
-
-        if len(closes) < rsi_period + 10:
-            return 0.0
-
-        rsi = self._calculate_rsi(closes, rsi_period)
+    def _macd_divergence_score(self, closes: np.ndarray) -> float:
         macd_line, signal_line = self._calculate_macd(closes)
-
-        if len(rsi) == 0 or len(macd_line) == 0 or len(signal_line) == 0:
+        if len(macd_line) == 0 or len(signal_line) == 0:
             return 0.0
 
-        rsi_score = float((rsi[-1] - 50.0) / 50.0)
-        macd_score = float((macd_line[-1] - signal_line[-1]) / max(abs(macd_line[-1]), abs(signal_line[-1]), 1.0))
-        combined = ((rsi_weight * rsi_score) + (macd_weight * macd_score)) / max(rsi_weight + macd_weight, 1e-6)
-        return float(np.clip(combined, -1.0, 1.0))
+        macd_histogram = float(
+            (macd_line[-1] - signal_line[-1])
+            / max(abs(macd_line[-1]), abs(signal_line[-1]), 1.0)
+        )
+        return float(np.clip(macd_histogram, -1.0, 1.0))
 
     def _should_generate_signal(self, trend_direction: int, psar_direction: int) -> bool:
         return trend_direction != 0 and trend_direction == psar_direction
@@ -373,33 +459,6 @@ class SuperTrendWeightedDivergenceStrategy(BaseStrategy):
         for idx in range(period, len(closes)):
             atr[idx] = ((atr[idx - 1] * (period - 1)) + true_ranges[idx]) / period
         return atr
-
-    def _calculate_rsi(self, closes: np.ndarray, period: int) -> np.ndarray:
-        if len(closes) < period + 1:
-            return np.asarray([], dtype=float)
-
-        deltas = np.diff(closes)
-        gains = np.where(deltas > 0, deltas, 0.0)
-        losses = np.where(deltas < 0, -deltas, 0.0)
-
-        avg_gain = np.full(len(closes), np.nan, dtype=float)
-        avg_loss = np.full(len(closes), np.nan, dtype=float)
-        avg_gain[period] = np.mean(gains[:period])
-        avg_loss[period] = np.mean(losses[:period])
-
-        for idx in range(period + 1, len(closes)):
-            avg_gain[idx] = ((avg_gain[idx - 1] * (period - 1)) + gains[idx - 1]) / period
-            avg_loss[idx] = ((avg_loss[idx - 1] * (period - 1)) + losses[idx - 1]) / period
-
-        rsi = np.full(len(closes), 50.0, dtype=float)
-        for idx in range(period, len(closes)):
-            if avg_loss[idx] == 0:
-                rsi[idx] = 100.0
-            else:
-                rs = avg_gain[idx] / avg_loss[idx]
-                rsi[idx] = 100.0 - (100.0 / (1.0 + rs))
-
-        return rsi
 
     def _calculate_macd(self, closes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         fast_ema = self._ema(closes, 12)

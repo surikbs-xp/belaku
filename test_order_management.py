@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-import requests
+from kiteconnect.exceptions import KiteException
 
 from core.engine import TradingEngine
 from core.strategy.base import Signal
@@ -228,31 +228,181 @@ class OrderManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exchange.submitted_orders[1].symbol, 'RELIANCE')
         self.assertEqual(exchange.submitted_orders[1].timeframe, '3m')
 
+    async def test_restart_keeps_same_side_position_and_reverses_on_opposite_signal(self):
+        exchange = FakeExchange(
+            [{
+                'order_id': 'restored-buy-1',
+                'tradingsymbol': 'RELIANCE',
+                'transaction_type': 'BUY',
+                'order_type': 'MARKET',
+                'quantity': 1,
+                'filled_quantity': 1,
+                'average_price': 100,
+                'status': 'COMPLETE',
+            }],
+            positions={
+                'ZERODHA:RELIANCE': {
+                    'quantity': 1,
+                    'average_price': 100,
+                    'last_price': 101,
+                },
+            },
+        )
+        engine = TradingEngine({})
+        engine.exchanges[exchange.name] = exchange
+
+        await engine._reconcile_exchange_orders(exchange)
+        await engine._update_positions()
+        with self.assertLogs('core.engine', level='INFO') as same_side_logs:
+            await engine._process_signals([Signal(
+                symbol='RELIANCE',
+                signal_type='buy',
+                strength=0.8,
+                price=101,
+                quantity=2,
+            )])
+
+        self.assertEqual(exchange.submitted_orders, [])
+        self.assertIn('NO_CHANGE symbol=RELIANCE', '\n'.join(same_side_logs.output))
+
+        with self.assertLogs('core.engine', level='INFO') as reversal_logs:
+            await engine._process_signals([Signal(
+                symbol='RELIANCE',
+                signal_type='sell',
+                strength=0.8,
+                price=99,
+                quantity=2,
+                metadata={
+                    'strategy': 'SuperTrendWeightedDivergence',
+                    'strategy_conditions': 'SuperTrend=SELL;PSAR=SELL;agree=true',
+                    'indicator_close': 98.5,
+                    'trend_direction': -1,
+                    'psar_direction': -1,
+                    'signal_candle_timestamp': '2026-10-19T13:42:00',
+                    'trigger_candle_timestamp': '2026-10-19T13:45:00',
+                },
+            )])
+            await engine._process_pending_reversals()
+
+        self.assertEqual(len(exchange.submitted_orders), 1)
+        self.assertEqual(exchange.submitted_orders[0].side, 'sell')
+        self.assertEqual(exchange.submitted_orders[0].quantity, 1)
+        reversal_output = '\n'.join(reversal_logs.output)
+        self.assertIn('Processing strategy=SuperTrendWeightedDivergence', reversal_output)
+        self.assertIn('conditions=SuperTrend=SELL;PSAR=SELL;agree=true', reversal_output)
+        self.assertIn('[REVERSAL] QUEUED', reversal_output)
+        self.assertIn('[REVERSAL] CLOSE_REQUEST', reversal_output)
+        self.assertIn('[ORDER] REQUEST', reversal_output)
+        self.assertIn('[REVERSAL] CLOSE_SUBMITTED', reversal_output)
+
+        exchange.positions['ZERODHA:RELIANCE']['quantity'] = 0
+        exchange.broker_orders[-1].update(
+            status='COMPLETE',
+            filled_quantity=1,
+            average_price=99,
+        )
+        await engine._reconcile_exchange_orders(exchange)
+        await engine._update_positions()
+        with self.assertLogs('core.engine', level='INFO') as entry_logs:
+            await engine._process_pending_reversals()
+
+        self.assertEqual(len(exchange.submitted_orders), 2)
+        self.assertEqual(exchange.submitted_orders[1].side, 'sell')
+        self.assertEqual(exchange.submitted_orders[1].quantity, 2)
+        self.assertIn('[REVERSAL] ENTRY', '\n'.join(entry_logs.output))
+
+    async def test_signal_is_submitted_once_and_retried_once_after_rejection(self):
+        exchange = FakeExchange([])
+        engine = TradingEngine({})
+        engine.exchanges[exchange.name] = exchange
+        signal = Signal(
+            symbol='RELIANCE',
+            signal_type='buy',
+            strength=0.8,
+            price=100,
+            quantity=1,
+            metadata={'signal_id': 'strategy:RELIANCE:3m:candle-1'},
+        )
+
+        await engine._process_signals([signal])
+        order = next(iter(engine.orders.values()))
+        first_broker_id = order.order_id
+        await engine._handle_order_update({
+            'order_id': first_broker_id,
+            'status': 'REJECTED',
+            'filled_quantity': 0,
+        })
+
+        self.assertEqual(len(exchange.submitted_orders), 2)
+        retry_order = next(
+            candidate for candidate in engine.orders.values()
+            if candidate.retry_count == 1
+        )
+        self.assertEqual(retry_order.retry_count, 1)
+        second_broker_id = retry_order.order_id
+        self.assertNotEqual(first_broker_id, second_broker_id)
+
+        exchange.broker_orders[0]['status'] = 'REJECTED'
+        exchange.broker_orders[1]['status'] = 'REJECTED'
+        await engine._handle_order_update({
+            'order_id': second_broker_id,
+            'status': 'REJECTED',
+            'filled_quantity': 0,
+        })
+        with self.assertLogs('core.engine', level='INFO') as duplicate_logs:
+            await engine._process_signals([signal])
+
+        self.assertEqual(len(exchange.submitted_orders), 2)
+        self.assertEqual(retry_order.retry_count, 1)
+        self.assertIn('Duplicate signal ignored', '\n'.join(duplicate_logs.output))
+
+    async def test_immediate_kite_rejection_retries_once(self):
+        class RejectOnceExchange(FakeExchange):
+            def __init__(self):
+                super().__init__([])
+                self.submission_attempts = 0
+
+            async def submit_order(self, order):
+                self.submission_attempts += 1
+                if self.submission_attempts == 1:
+                    raise RuntimeError('Kite order rejected (KiteException)')
+                return await super().submit_order(order)
+
+        exchange = RejectOnceExchange()
+        engine = TradingEngine({})
+        engine.exchanges[exchange.name] = exchange
+        signal = Signal(
+            symbol='RELIANCE',
+            signal_type='buy',
+            strength=0.8,
+            price=100,
+            quantity=1,
+            metadata={'signal_id': 'strategy:RELIANCE:3m:candle-2'},
+        )
+
+        await engine._process_signals([signal])
+
+        order = next(iter(engine.orders.values()))
+        self.assertEqual(exchange.submission_attempts, 2)
+        self.assertEqual(len(exchange.submitted_orders), 1)
+        self.assertEqual(order.status, OrderStatus.SUBMITTED)
+        self.assertEqual(order.retry_count, 1)
+
 class ZerodhaOrderErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_error_logs_kite_message_without_credentials(self):
-        response = Mock()
-        response.status_code = 403
-        response.json.return_value = {
-            'status': 'error',
-            'error_type': 'PermissionException',
-            'message': 'Order placement is not permitted',
-        }
-        response.raise_for_status.side_effect = requests.HTTPError(
-            '403 Client Error',
-            response=response,
-        )
+        kite_error = KiteException('Order placement is not permitted', code=403)
         api = ZerodhaAPI('test-api-key', 'test-api-secret', 'test-access-token')
 
-        with patch.object(api.session, 'post', return_value=response):
+        with patch.object(api.kite, 'place_order', side_effect=kite_error):
             with self.assertLogs('exchanges.zerodha', level='ERROR') as logs:
-                with self.assertRaisesRegex(RuntimeError, 'PermissionException'):
+                with self.assertRaisesRegex(RuntimeError, 'KiteException'):
                     await api.place_order(ZerodhaOrderRequest(
                         symbol='NIFTY26OCTFUT',
                         transaction_type='BUY',
                         quantity=65,
                     ))
 
-        self.assertIn('PermissionException', logs.output[0])
+        self.assertIn('KiteException', logs.output[0])
         self.assertIn('Order placement is not permitted', logs.output[0])
         self.assertNotIn('test-access-token', logs.output[0])
 

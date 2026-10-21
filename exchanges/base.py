@@ -101,7 +101,7 @@ class BaseExchange(ABC):
         """
         pass
 
-    async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "1minute") -> List[Dict[str, Any]]:
+    async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "15m") -> List[Dict[str, Any]]:
         """
         Get historical data from the exchange.
         
@@ -110,7 +110,7 @@ class BaseExchange(ABC):
             exchange: Exchange name
             start_time: Start time
             end_time: End time
-            timeframe: Timeframe (1minute, 5minute, 15minute, 1hour, 1day)
+            timeframe: Timeframe (1m, 5m, 15m, 1h, 1d)
             
         Returns:
             List of historical data candles
