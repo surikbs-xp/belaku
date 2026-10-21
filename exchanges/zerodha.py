@@ -7,17 +7,15 @@ commodities, and currencies.
 """
 
 import asyncio
-import csv
-import io
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
-import json
-from urllib.parse import urlencode
-import requests
-import websockets
 from enum import Enum
+
+from kiteconnect import KiteConnect, KiteTicker
+from kiteconnect.exceptions import KiteException
+from twisted.internet import reactor
 
 from core.types import Order, OrderStatus, PositionSide
 from exchanges.base import BaseExchange
@@ -126,10 +124,11 @@ class ZerodhaAPI:
         self.api_key = api_key
         self.api_secret = api_secret
         self.access_token = access_token
-        self.base_url = "https://api.kite.trade"
-        self.websocket_url = "wss://ws.kite.trade"
-        self.session = requests.Session()
-        self.session.headers.update({'X-Kite-ApiKey': api_key})
+        self.kite = KiteConnect(
+            api_key=api_key,
+            access_token=access_token,
+            timeout=REQUEST_TIMEOUT,
+        )
         
         # Event handlers
         self.order_update_handlers: List[Callable] = []
@@ -139,21 +138,11 @@ class ZerodhaAPI:
         self.tick_handlers: List[Callable] = []
         
         # WebSocket connection
-        self.ws_connection = None
-        self.websocket_tasks = []
-
-    def _get_headers(self) -> Dict[str, str]:
-        """
-        Get request headers with authentication.
-        
-        Returns:
-            Dictionary of request headers
-        """
-        headers = self.session.headers.copy()
-        if self.access_token:
-            headers['Authorization'] = f'token {self.api_key}:{self.access_token}'
-            headers['X-Kite-Version'] = '3'
-        return headers
+        self.ticker: Optional[KiteTicker] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._websocket_ready: Optional[asyncio.Event] = None
+        self._ticker_connected = False
+        self._subscription_modes: Dict[int, str] = {}
 
     async def connect(self) -> None:
         """
@@ -164,12 +153,7 @@ class ZerodhaAPI:
                 raise ValueError("Kite access token is required; start main.py to authorize")
             
             # Test connection
-            response = self.session.get(
-                f"{self.base_url}/user/profile",
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
+            await asyncio.to_thread(self.kite.profile)
             
             logger.info("Connected to Zerodha API")
             
@@ -181,12 +165,7 @@ class ZerodhaAPI:
         """
         Disconnect from Zerodha API.
         """
-        # Cancel all WebSocket connections
-        if self.websocket_tasks:
-            for task in self.websocket_tasks:
-                task.cancel()
-            self.websocket_tasks.clear()
-        
+        await self.stop_websocket()
         logger.info("Disconnected from Zerodha API")
 
     async def get_instruments(self, exchange: str = "NSE") -> List[ZerodhaToken]:
@@ -200,22 +179,22 @@ class ZerodhaAPI:
             List of ZerodhaToken objects
         """
         try:
-            response = self.session.get(
-                f"{self.base_url}/instruments/{exchange}",
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            
+            instrument_rows = await asyncio.to_thread(self.kite.instruments, exchange)
             instruments = []
-            for instrument_data in csv.DictReader(io.StringIO(response.text)):
+            for instrument_data in instrument_rows:
                 tick_size = float(instrument_data['tick_size'])
                 tick_text = f"{tick_size:.10f}".rstrip('0').rstrip('.')
                 price_precision = len(tick_text.partition('.')[2])
-                expiry = instrument_data['expiry']
-                strike = instrument_data['strike']
+                expiry = instrument_data.get('expiry')
+                if not expiry:
+                    expiry = None
+                elif isinstance(expiry, date) and not isinstance(expiry, datetime):
+                    expiry = datetime.combine(expiry, datetime.min.time())
+                elif isinstance(expiry, str) and expiry:
+                    expiry = datetime.fromisoformat(expiry)
                 instrument_type = instrument_data['instrument_type']
-                token = ZerodhaToken(
+                strike = instrument_data['strike']
+                instruments.append(ZerodhaToken(
                     symbol=instrument_data['tradingsymbol'],
                     name=instrument_data['name'],
                     exchange=instrument_data['exchange'],
@@ -224,17 +203,15 @@ class ZerodhaAPI:
                     lot_size=int(instrument_data['lot_size']),
                     tick_size=tick_size,
                     price_precision=price_precision,
-                    expiry_date=datetime.fromisoformat(expiry) if expiry else None,
+                    expiry_date=expiry,
                     strike_price=float(strike) if strike else None,
-                    option_type=instrument_type if instrument_type in {'CE', 'PE'} else None
-                )
-                instruments.append(token)
-            
-            logger.info(f"Retrieved {len(instruments)} instruments from {exchange}")
+                    option_type=instrument_type if instrument_type in {'CE', 'PE'} else None,
+                ))
+
+            logger.info("Retrieved %d instruments from %s", len(instruments), exchange)
             return instruments
-            
-        except Exception as e:
-            logger.error(f"Failed to get instruments: {str(e)}")
+        except Exception as error:
+            logger.error("Failed to get instruments: %s", error)
             raise
 
     async def get_quote(self, symbol: str, exchange: str = "NSE") -> Dict[str, Any]:
@@ -250,16 +227,8 @@ class ZerodhaAPI:
         """
         try:
             instrument_key = f"{exchange}:{symbol}"
-            response = self.session.get(
-                f"{self.base_url}/quote",
-                params={'i': instrument_key},
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-
-            payload = response.json()
-            return payload.get('data', {}).get(instrument_key, {})
+            quotes = await asyncio.to_thread(self.kite.quote, instrument_key)
+            return quotes.get(instrument_key, {})
             
         except Exception as e:
             logger.error(f"Failed to get quote for {symbol}: {str(e)}")
@@ -276,64 +245,33 @@ class ZerodhaAPI:
             Dictionary containing order response
         """
         try:
-            order_data = {
-                'tradingsymbol': order_request.symbol,
-                'exchange': order_request.exchange,
-                'transaction_type': order_request.transaction_type,
-                'quantity': int(order_request.quantity),
-                'product': order_request.product,
-                'order_type': order_request.order_type,
-                'validity': order_request.validity,
-                'disclosed_quantity': order_request.disclosed_quantity,
-            }
-            
-            if order_request.price:
-                order_data['price'] = order_request.price
-            
-            if order_request.trigger_price:
-                order_data['trigger_price'] = order_request.trigger_price
-            
-            if order_request.tag:
-                order_data['tag'] = order_request.tag
-            
-            response = self.session.post(
-                f"{self.base_url}/orders/regular",
-                data=order_data,
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
+            order_id = await asyncio.to_thread(
+                self.kite.place_order,
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=order_request.exchange,
+                tradingsymbol=order_request.symbol,
+                transaction_type=order_request.transaction_type,
+                quantity=int(order_request.quantity),
+                product=order_request.product,
+                order_type=order_request.order_type,
+                price=order_request.price,
+                validity=order_request.validity,
+                disclosed_quantity=order_request.disclosed_quantity,
+                trigger_price=order_request.trigger_price,
+                tag=order_request.tag,
+                market_protection=(
+                    -1 if order_request.order_type.upper() == 'MARKET' else None
+                ),
             )
-            response.raise_for_status()
-            
-            order_id = response.json().get('data', {}).get('order_id', '')
             logger.info(f"Order placed: {order_id or 'unknown'}")
             return {'order_id': order_id}
-            
-        except requests.HTTPError as e:
-            response = e.response
-            try:
-                payload = response.json() if response is not None else {}
-            except ValueError:
-                payload = {}
-            error_type = payload.get('error_type', 'HTTPError')
-            message = payload.get('message') or payload.get('error')
-            if not message and response is not None:
-                message = response.text[:500]
-            logger.error(
-                "Failed to place order: HTTP %s %s: %s",
-                response.status_code if response is not None else 'unknown',
-                error_type,
-                message or str(e),
-            )
+        except KiteException as error:
+            logger.error("Failed to place order with Kite: %s: %s", type(error).__name__, error)
             raise RuntimeError(
-                "Kite order rejected (HTTP %s %s): %s"
-                % (
-                    response.status_code if response is not None else 'unknown',
-                    error_type,
-                    message or str(e),
-                )
-            ) from e
-        except Exception as e:
-            logger.error(f"Failed to place order: {str(e)}")
+                f"Kite order rejected ({type(error).__name__}): {error}"
+            ) from error
+        except Exception as error:
+            logger.error("Failed to place order: %s", error)
             raise
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
@@ -347,15 +285,13 @@ class ZerodhaAPI:
             Dictionary containing cancellation response
         """
         try:
-            response = self.session.delete(
-                f"{self.base_url}/orders/regular/{order_id}",
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
+            canceled_order_id = await asyncio.to_thread(
+                self.kite.cancel_order,
+                variety=self.kite.VARIETY_REGULAR,
+                order_id=order_id,
             )
-            response.raise_for_status()
-            
             logger.info(f"Order canceled: {order_id}")
-            return response.json().get('data', {})
+            return {'order_id': canceled_order_id}
             
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {str(e)}")
@@ -369,15 +305,9 @@ class ZerodhaAPI:
             List of ZerodhaPosition objects
         """
         try:
-            response = self.session.get(
-                f"{self.base_url}/portfolio/positions",
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            
+            response = await asyncio.to_thread(self.kite.positions)
             positions = []
-            for position_data in response.json().get('data', {}).get('net', []):
+            for position_data in response.get('net', []):
                 average_price = float(position_data.get('average_price') or 0)
                 last_price = float(position_data.get('last_price') or 0)
                 pnl_percent = (
@@ -412,14 +342,7 @@ class ZerodhaAPI:
             List of order history entries
         """
         try:
-            response = self.session.get(
-                f"{self.base_url}/orders",
-                headers=self._get_headers(),
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            
-            orders = response.json().get('data', [])
+            orders = await asyncio.to_thread(self.kite.orders)
             logger.info(f"Retrieved {len(orders)} orders from history")
             return orders
             
@@ -427,191 +350,150 @@ class ZerodhaAPI:
             logger.error(f"Failed to get order history: {str(e)}")
             raise
 
+    async def get_historical_data(
+        self,
+        instrument_token: int,
+        start_time: datetime,
+        end_time: datetime,
+        timeframe: str,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve and normalize candles using KiteConnect's historical API."""
+        interval_aliases = {
+            '1m': 'minute', '1minute': 'minute',
+            '3m': '3minute', '5m': '5minute', '10m': '10minute',
+            '15m': '15minute', '30m': '30minute', '1h': '60minute',
+            '1d': 'day', '1day': 'day',
+        }
+        return await asyncio.to_thread(
+            self.kite.historical_data,
+            instrument_token,
+            start_time,
+            end_time,
+            interval_aliases.get(timeframe.lower(), timeframe),
+        )
+
     async def start_websocket(self) -> None:
-        """
-        Start WebSocket connection for real-time data.
-        """
+        if not self.access_token:
+            raise ValueError("Kite access token is required for the WebSocket")
+
+        self._loop = asyncio.get_running_loop()
+        self._websocket_ready = asyncio.Event()
+        self.ticker = KiteTicker(self.api_key, self.access_token)
+        self.ticker.on_connect = self._on_ticker_connect
+        self.ticker.on_close = self._on_ticker_close
+        self.ticker.on_error = self._on_ticker_error
+        self.ticker.on_reconnect = self._on_ticker_reconnect
+        self.ticker.on_noreconnect = self._on_ticker_no_reconnect
+        self.ticker.on_ticks = self._on_ticker_ticks
+        self.ticker.on_order_update = self._on_ticker_order_update
+        self.ticker.connect(threaded=True)
+
         try:
-            if not self.access_token:
-                raise ValueError("Kite access token is required for the WebSocket")
+            await asyncio.wait_for(self._websocket_ready.wait(), timeout=REQUEST_TIMEOUT)
+        except asyncio.TimeoutError as error:
+            await self.stop_websocket()
+            raise TimeoutError("Timed out connecting to KiteTicker") from error
 
-            ws_params = urlencode({
-                'api_key': self.api_key,
-                'access_token': self.access_token,
-            })
-            ws_url = f"{self.websocket_url}/?{ws_params}"
-            self.ws_connection = await websockets.connect(ws_url)
-            self.websocket_tasks = [
-                asyncio.create_task(self._handle_websocket_messages())
-            ]
-            
-            logger.info("WebSocket connection started")
-            
-        except Exception as e:
-            logger.error(f"Failed to start WebSocket: {str(e)}")
-            raise
+        logger.info("KiteTicker WebSocket connected")
 
-    async def _handle_websocket_messages(self) -> None:
-        """Dispatch binary market ticks and text updates from Kite's stream."""
-        try:
-            async for message in self.ws_connection:
-                if isinstance(message, bytes):
-                    await self._process_market_data_message(message)
-                    continue
+    def _schedule_callback(self, coroutine: Any) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            coroutine.close()
+            return
 
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning("Ignoring malformed Kite WebSocket message")
-                    continue
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
 
-                message_type = data.get('type')
-                payload = data.get('data', {})
-                if message_type == 'order':
-                    await self._process_order_update(payload)
-                elif message_type == 'trade':
-                    await self._process_trade_update(payload)
-                elif message_type == 'position':
-                    await self._process_position_update(payload)
-                elif message_type == 'error':
-                    logger.error("Kite WebSocket error: %s", payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error("Error receiving Kite WebSocket messages: %s", e)
+        def log_callback_error(completed: Any) -> None:
+            try:
+                completed.result()
+            except Exception as error:
+                logger.error("KiteTicker callback failed: %s", error)
+
+        future.add_done_callback(log_callback_error)
+
+    def _on_ticker_connect(self, ticker: KiteTicker, response: Any) -> None:
+        self._ticker_connected = True
+        for token, mode in self._subscription_modes.items():
+            self._subscribe_ticker(ticker, token, mode)
+        if self._loop and self._websocket_ready:
+            self._loop.call_soon_threadsafe(self._websocket_ready.set)
+
+    def _on_ticker_close(self, ticker: KiteTicker, code: Any, reason: Any) -> None:
+        self._ticker_connected = False
+        logger.warning("KiteTicker closed: code=%s reason=%s", code, reason)
+
+    def _on_ticker_error(self, ticker: KiteTicker, code: Any, reason: Any) -> None:
+        logger.error("KiteTicker error: code=%s reason=%s", code, reason)
+
+    def _on_ticker_reconnect(self, ticker: KiteTicker, attempts: int) -> None:
+        self._ticker_connected = False
+        logger.warning("KiteTicker reconnect attempt %s", attempts)
+
+    def _on_ticker_no_reconnect(self, ticker: KiteTicker) -> None:
+        self._ticker_connected = False
+        logger.error("KiteTicker exhausted its reconnect attempts")
+
+    def _on_ticker_ticks(self, ticker: KiteTicker, ticks: List[Dict[str, Any]]) -> None:
+        for source_tick in ticks:
+            ohlc = source_tick.get('ohlc') or {}
+            tick = {
+                'instrument_token': source_tick['instrument_token'],
+                'ltp': source_tick.get('last_price'),
+                'volume': source_tick.get('volume_traded', 0),
+                'timestamp': source_tick.get('exchange_timestamp') or source_tick.get('last_trade_time'),
+            }
+            tick.update({key: ohlc[key] for key in ('open', 'high', 'low', 'close') if key in ohlc})
+            self._schedule_callback(self._process_market_data_tick(tick))
+
+    def _on_ticker_order_update(self, ticker: KiteTicker, order_data: Dict[str, Any]) -> None:
+        self._schedule_callback(self._process_order_update(order_data))
+
+    def _subscribe_ticker(self, ticker: KiteTicker, instrument_token: int, mode: str) -> None:
+        if instrument_token not in ticker.subscribed_tokens:
+            ticker.subscribe([instrument_token])
+        ticker.set_mode(mode, [instrument_token])
 
     async def subscribe_market_data(self, instrument_token: int, mode: str = 'full') -> None:
-        """Subscribe to a Kite instrument token for live market data."""
-        if self.ws_connection is None:
-            raise RuntimeError("Kite WebSocket is not connected")
-        await self.ws_connection.send(json.dumps({"a": "subscribe", "v": [instrument_token]}))
-        await self.ws_connection.send(json.dumps({"a": "mode", "v": [mode, [instrument_token]]}))
+        """Subscribe using KiteTicker's supported streaming modes."""
+        if self.ticker is None:
+            raise RuntimeError("KiteTicker is not initialized")
+        modes = {
+            'full': self.ticker.MODE_FULL,
+            'quote': self.ticker.MODE_QUOTE,
+            'ltp': self.ticker.MODE_LTP,
+        }
+        normalized_mode = modes.get(mode.lower())
+        if normalized_mode is None:
+            raise ValueError(f"Unsupported KiteTicker mode: {mode}")
+
+        self._subscription_modes[instrument_token] = normalized_mode
+        if self._ticker_connected:
+            reactor.callFromThread(
+                self._subscribe_ticker,
+                self.ticker,
+                instrument_token,
+                normalized_mode,
+            )
 
     def add_tick_handler(self, handler: Callable) -> None:
-        """Register an async callback for decoded Kite market ticks."""
+        """Register an async callback for normalized KiteTicker ticks."""
         self.tick_handlers.append(handler)
 
-    @staticmethod
-    def _decode_market_data_message(message: bytes) -> List[Dict[str, Any]]:
-        """Decode Kite's length-prefixed binary quote packets."""
-        if len(message) < 2:
-            return []
-
-        packet_count = int.from_bytes(message[:2], 'big')
-        offset = 2
-        ticks: List[Dict[str, Any]] = []
-        for _ in range(packet_count):
-            if offset + 2 > len(message):
-                break
-            packet_length = int.from_bytes(message[offset:offset + 2], 'big')
-            offset += 2
-            packet = message[offset:offset + packet_length]
-            offset += packet_length
-            if packet_length < 8 or len(packet) != packet_length:
-                continue
-
-            def read_uint(start: int) -> int:
-                return int.from_bytes(packet[start:start + 4], 'big')
-
-            tick: Dict[str, Any] = {
-                'instrument_token': read_uint(0),
-                'ltp': read_uint(4) / 100.0,
-            }
-            if packet_length in {28, 32}:
-                tick.update({
-                    'open': read_uint(16) / 100.0,
-                    'high': read_uint(8) / 100.0,
-                    'low': read_uint(12) / 100.0,
-                    'close': read_uint(20) / 100.0,
-                })
-                if packet_length == 32:
-                    exchange_timestamp = read_uint(28)
-                    if exchange_timestamp:
-                        tick['timestamp'] = datetime.fromtimestamp(exchange_timestamp)
-            elif packet_length >= 44:
-                tick.update({
-                    'volume': read_uint(16),
-                    'open': read_uint(28) / 100.0,
-                    'high': read_uint(32) / 100.0,
-                    'low': read_uint(36) / 100.0,
-                    'close': read_uint(40) / 100.0,
-                })
-            if packet_length >= 64:
-                exchange_timestamp = read_uint(60)
-                if exchange_timestamp:
-                    tick['timestamp'] = datetime.fromtimestamp(exchange_timestamp)
-            ticks.append(tick)
-        return ticks
-
-    async def _process_market_data_message(self, message: bytes) -> None:
-        for tick in self._decode_market_data_message(message):
-            for handler in self.tick_handlers:
-                try:
-                    await handler(tick)
-                except Exception as e:
-                    logger.error("Error in market tick handler: %s", e)
+    async def _process_market_data_tick(self, tick: Dict[str, Any]) -> None:
+        for handler in self.tick_handlers:
+            try:
+                await handler(tick)
+            except Exception as error:
+                logger.error("Error in market tick handler: %s", error)
 
     async def stop_websocket(self) -> None:
-        """
-        Stop WebSocket connection.
-        """
-        if self.ws_connection:
-            await self.ws_connection.close()
-            self.ws_connection = None
-        
-        for task in self.websocket_tasks:
-            task.cancel()
-        
-        self.websocket_tasks.clear()
-        logger.info("WebSocket connection stopped")
-
-    async def _handle_order_updates(self) -> None:
-        """
-        Handle order update WebSocket messages.
-        """
-        try:
-            async for message in self.ws_connection:
-                data = json.loads(message)
-                if data.get('type') == 'order':
-                    order_data = data['data']
-                    await self._process_order_update(order_data)
-                    
-        except asyncio.CancelledError:
-            logger.info("Order update handler cancelled")
-        except Exception as e:
-            logger.error(f"Error in order update handler: {str(e)}")
-
-    async def _handle_trade_updates(self) -> None:
-        """
-        Handle trade update WebSocket messages.
-        """
-        try:
-            async for message in self.ws_connection:
-                data = json.loads(message)
-                if data.get('type') == 'trade':
-                    trade_data = data['data']
-                    await self._process_trade_update(trade_data)
-                    
-        except asyncio.CancelledError:
-            logger.info("Trade update handler cancelled")
-        except Exception as e:
-            logger.error(f"Error in trade update handler: {str(e)}")
-
-    async def _handle_position_updates(self) -> None:
-        """
-        Handle position update WebSocket messages.
-        """
-        try:
-            async for message in self.ws_connection:
-                data = json.loads(message)
-                if data.get('type') == 'position':
-                    position_data = data['data']
-                    await self._process_position_update(position_data)
-                    
-        except asyncio.CancelledError:
-            logger.info("Position update handler cancelled")
-        except Exception as e:
-            logger.error(f"Error in position update handler: {str(e)}")
+        ticker = self.ticker
+        self._ticker_connected = False
+        if ticker is not None:
+            reactor.callFromThread(ticker.close)
+            self.ticker = None
+        logger.info("KiteTicker WebSocket stopped")
 
     async def _process_order_update(self, order_data: Dict[str, Any]) -> None:
         """
@@ -914,7 +796,7 @@ class ZerodhaExchange(BaseExchange):
         except KeyError as error:
             raise ValueError(f"Unsupported Kite candle timeframe: {timeframe}") from error
 
-    async def setup_strategy_market_data(self, data_handler: Any, timeframe: str = '3m') -> None:
+    async def setup_strategy_market_data(self, data_handler: Any, timeframe: str = '15m') -> None:
         """Load GIFT NIFTY history and subscribe its index to live ticks."""
         instrument = self._find_giftnifty_instrument()
         if instrument is None:
@@ -1133,7 +1015,7 @@ class ZerodhaExchange(BaseExchange):
             return None
         return order.quantity * order.price * 1.1
 
-    async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "1minute") -> List[Dict[str, Any]]:
+    async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "15m") -> List[Dict[str, Any]]:
         """
         Get historical data from Zerodha.
         
@@ -1142,7 +1024,7 @@ class ZerodhaExchange(BaseExchange):
             exchange: Exchange name
             start_time: Start time
             end_time: End time
-            timeframe: Timeframe (1minute, 5minute, 15minute, 1hour, 1day)
+            timeframe: Timeframe (1m, 5m, 15m, 1h, 1d)
             
         Returns:
             List of historical data candles
@@ -1153,27 +1035,20 @@ class ZerodhaExchange(BaseExchange):
                 logger.error(f"Unknown instrument for historical data: {exchange}:{symbol}")
                 return []
             
-            response = self.api.session.get(
-                f"{self.api.base_url}/instruments/historical/"
-                f"{instrument.instrument_token}/{timeframe}",
-                params={
-                    'from': start_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'to': end_time.strftime('%Y-%m-%d %H:%M:%S')
-                },
-                headers=self.api._get_headers(),
-                timeout=REQUEST_TIMEOUT
+            candles = await self.api.get_historical_data(
+                instrument.instrument_token,
+                start_time,
+                end_time,
+                timeframe,
             )
-            response.raise_for_status()
-            
-            candles = response.json().get('data', {}).get('candles', [])
             return [
                 {
-                    'timestamp': candle[0],
-                    'open': candle[1],
-                    'high': candle[2],
-                    'low': candle[3],
-                    'close': candle[4],
-                    'volume': candle[5]
+                    'timestamp': candle['date'],
+                    'open': candle['open'],
+                    'high': candle['high'],
+                    'low': candle['low'],
+                    'close': candle['close'],
+                    'volume': candle['volume'],
                 }
                 for candle in candles
             ]

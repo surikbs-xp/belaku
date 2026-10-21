@@ -7,7 +7,7 @@ system without requiring external API connections.
 
 import sys
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import Mock, AsyncMock
 
 # Test imports
@@ -148,9 +148,6 @@ async def test_strategy_functionality():
         st_strategy = SuperTrendWeightedDivergenceStrategy({
             'atr_period': 10,
             'multiplier': 3.0,
-            'rsi_period': 14,
-            'rsi_weight': 0.6,
-            'macd_weight': 0.4,
             'min_strength': 0.55,
         })
 
@@ -184,16 +181,32 @@ async def test_strategy_functionality():
             (-1, rising_candles, None),
         ):
             confirmation_strategy = SuperTrendWeightedDivergenceStrategy({
+                'timeframe': '15m',
                 'min_strength': 1.0,
                 'cooldown_period': 0,
             })
             confirmation_strategy._supertrend_direction = lambda closes, highs, lows: (trend_direction, 0.0)
-            confirmation_strategy._weighted_divergence = lambda closes: 0.0
+            confirmation_strategy._macd_divergence_score = lambda closes: 0.0
+            evaluation_time = datetime.now()
+            trigger_candle_timestamp = evaluation_time.replace(
+                minute=evaluation_time.minute - evaluation_time.minute % 15,
+                second=0,
+                microsecond=0,
+            )
+            timestamped_prices = [
+                {
+                    **candle,
+                    'timestamp': trigger_candle_timestamp - timedelta(
+                        minutes=15 * (len(prices) - index - 1)
+                    ),
+                }
+                for index, candle in enumerate(prices)
+            ]
             confirmation_signals = await confirmation_strategy.analyze(
                 {
                     'GIFT NIFTY': {
-                        'candles': prices,
-                        'last_tick_at': datetime.now(),
+                        'candles': timestamped_prices,
+                        'last_tick_at': evaluation_time,
                     }
                 }
             )

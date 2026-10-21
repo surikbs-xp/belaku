@@ -1,16 +1,13 @@
 """Kite Connect OAuth callback and request-token exchange."""
 
-from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
 from typing import Optional
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 import webbrowser
 
-import requests
+from kiteconnect import KiteConnect
 
 
-KITE_API_URL = "https://api.kite.trade"
 CALLBACK_HOST = "127.0.0.1"
 CALLBACK_PORT = 9000
 CALLBACK_PATH = "/zerodha/callback"
@@ -18,17 +15,10 @@ CALLBACK_PATH = "/zerodha/callback"
 
 def exchange_request_token(api_key: str, api_secret: str, request_token: str) -> str:
     """Exchange Kite's one-time request token for a session access token."""
-    checksum = sha256(f"{api_key}{request_token}{api_secret}".encode()).hexdigest()
-    response = requests.post(
-        f"{KITE_API_URL}/session/token",
-        data={"api_key": api_key, "request_token": request_token, "checksum": checksum},
-        headers={"X-Kite-Version": "3"},
-        timeout=15,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    access_token = payload.get("data", {}).get("access_token")
-    if payload.get("status") != "success" or not access_token:
+    kite = KiteConnect(api_key=api_key, timeout=15)
+    session = kite.generate_session(request_token, api_secret=api_secret)
+    access_token = session.get("access_token")
+    if not access_token:
         raise RuntimeError("Kite did not return an access token")
     return access_token
 
@@ -70,9 +60,7 @@ def acquire_access_token(api_key: str, api_secret: str, timeout: int = 300) -> s
         ) from exc
 
     server.timeout = timeout
-    login_url = "https://kite.zerodha.com/connect/login?" + urlencode(
-        {"v": "3", "api_key": api_key}
-    )
+    login_url = KiteConnect(api_key=api_key).login_url()
     print(f"Kite callback listener ready at {callback_url}")
     print("Approve the Kite login in the browser to continue; no token copying is needed.")
     if not webbrowser.open(login_url):

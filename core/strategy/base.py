@@ -25,7 +25,7 @@ class Signal:
     strength: float  # Signal strength (0.0 to 1.0)
     price: Optional[float] = None
     quantity: Optional[float] = None
-    timeframe: str = "1minute"
+    timeframe: str = "15m"
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 

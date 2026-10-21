@@ -286,7 +286,7 @@ class GiftNiftyStrategy(BaseStrategy):
                 strength=event.strength * event.confidence,
                 price=current_price,
                 quantity=quantity,
-                timeframe='1minute',
+                timeframe='15m',
                 metadata={
                     'event_type': event.event_type,
                     'event_data': event.data,

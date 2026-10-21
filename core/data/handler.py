@@ -28,7 +28,7 @@ class MarketData:
     low_price: float
     close_price: float
     volume: float
-    timeframe: str = "1minute"
+    timeframe: str = "15m"
     indicators: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -236,6 +236,7 @@ class DataHandler:
                 'last_tick_at': latest.indicators.get('last_tick_at'),
                 'candles': [
                     {
+                        'timestamp': candle.timestamp,
                         'open': candle.open_price,
                         'high': candle.high_price,
                         'low': candle.low_price,
@@ -272,7 +273,7 @@ class DataHandler:
             await self.add_data_stream(symbol, exchange, max_size=200)
 
         candles = [
-            {'symbol': symbol, 'exchange': exchange, 'timestamp': (datetime.now() - timedelta(minutes=30 - i)).isoformat(), 'open_price': 100 + i, 'high_price': 101 + i, 'low_price': 99 + i, 'close_price': 100.5 + i, 'volume': 1000 + i * 10, 'timeframe': '1minute'}
+            {'symbol': symbol, 'exchange': exchange, 'timestamp': (datetime.now() - timedelta(minutes=15 * (30 - i))).isoformat(), 'open_price': 100 + i, 'high_price': 101 + i, 'low_price': 99 + i, 'close_price': 100.5 + i, 'volume': 1000 + i * 10, 'timeframe': '15m'}
             for i in range(30)
         ]
 
@@ -281,7 +282,7 @@ class DataHandler:
 
         logger.info("[DEBUG] Seeded %d synthetic candles for %s/%s", len(candles), exchange, symbol)
 
-    async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "1minute") -> List[MarketData]:
+    async def get_historical_data(self, symbol: str, exchange: str, start_time: datetime, end_time: datetime, timeframe: str = "15m") -> List[MarketData]:
         """
         Get historical data for a symbol.
         
@@ -421,7 +422,7 @@ class DataHandler:
                     low_price=data.get('low_price', 0),
                     close_price=data.get('close_price', 0),
                     volume=data.get('volume', 0),
-                    timeframe=data.get('timeframe', '1minute'),
+                    timeframe=data.get('timeframe', '15m'),
                     indicators=data.get('indicators', {})
                 )
             else:

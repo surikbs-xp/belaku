@@ -49,6 +49,9 @@ class TradingEngine:
         self.order_history: List[Order] = []
         self.position_history: List[Position] = []
         self.pending_reversals: Dict[str, Order] = {}
+        self._processed_signal_ids: set[str] = set()
+        self._retry_counts: Dict[str, int] = {}
+        self._failed_retry_groups: set[str] = set()
         
         # Performance tracking
         self.stats = {
@@ -261,7 +264,17 @@ class TradingEngine:
         Returns:
             True if order was submitted successfully, False otherwise
         """
-        logger.info("[ORDER] Attempting to submit order %s for %s %s %s", order.id, order.side, order.quantity, order.symbol)
+        logger.info(
+            "[ORDER] REQUEST id=%s exchange=%s symbol=%s side=%s type=%s quantity=%s reference_price=%s timeframe=%s",
+            order.id,
+            order.exchange,
+            order.symbol,
+            order.side.upper(),
+            order.order_type.upper(),
+            order.quantity,
+            f"{order.price:.2f}" if order.price is not None else "market",
+            order.timeframe or 'unknown',
+        )
         try:
             exchange = self.exchanges.get(order.exchange)
             if not exchange:
@@ -338,6 +351,31 @@ class TradingEngine:
         except Exception as e:
             logger.error("[ORDER] Error submitting order %s: %s", order.id, str(e))
             order.status = OrderStatus.REJECTED
+            if 'kite order rejected' in str(e).lower():
+                retry_group_id = order.retry_group_id or order.id
+                retry_count = self._retry_counts.get(retry_group_id, order.retry_count)
+                if retry_count < 1 and order.remaining_quantity > 0:
+                    retry_count += 1
+                    self._retry_counts[retry_group_id] = retry_count
+                    order.retry_count = retry_count
+                    order.status = OrderStatus.PENDING
+                    order.order_id = None
+                    logger.warning(
+                        "[ORDER] RETRY attempt=%s/1 after immediate broker rejection id=%s",
+                        retry_count,
+                        order.id,
+                    )
+                    submitted = await self.submit_order(order)
+                    if not submitted:
+                        self._failed_retry_groups.add(retry_group_id)
+                    logger.info(
+                        "[ORDER] RETRY_RESULT id=%s broker_id=%s submitted=%s",
+                        order.id,
+                        order.order_id or 'none',
+                        submitted,
+                    )
+                    return submitted
+                self._failed_retry_groups.add(retry_group_id)
             return False
 
     async def _handle_order_update(self, order_data: Dict[str, Any]) -> None:
@@ -352,6 +390,7 @@ class TradingEngine:
             return
 
         was_filled = order.status == OrderStatus.FILLED
+        was_rejected = order.status == OrderStatus.REJECTED
         self._apply_broker_order_update(order, order_data)
 
         logger.info(
@@ -366,6 +405,57 @@ class TradingEngine:
         if order.status == OrderStatus.FILLED and not was_filled:
             for strategy in self.strategies:
                 await strategy.on_order_filled(order)
+        elif order.status == OrderStatus.REJECTED and not was_rejected:
+            await self._retry_rejected_order(order)
+
+    async def _retry_rejected_order(self, order: Order) -> None:
+        retry_group_id = order.retry_group_id or order.id
+        retry_count = self._retry_counts.get(retry_group_id, order.retry_count)
+        remaining_quantity = max(0.0, order.remaining_quantity)
+        if retry_count >= 1 or remaining_quantity <= 0:
+            self._failed_retry_groups.add(retry_group_id)
+            logger.error(
+                "[ORDER] RETRY_STOPPED id=%s broker_id=%s retry_count=%s remaining_quantity=%s",
+                order.id,
+                order.order_id,
+                retry_count,
+                remaining_quantity,
+            )
+            return
+
+        retry_count += 1
+        self._retry_counts[retry_group_id] = retry_count
+        retry_order = Order(
+            id=f"{order.id}_retry_{retry_count}",
+            symbol=order.symbol,
+            side=order.side,
+            order_type=order.order_type,
+            quantity=remaining_quantity,
+            price=order.price,
+            stop_price=order.stop_price,
+            exchange=order.exchange,
+            timeframe=order.timeframe,
+            signal_id=order.signal_id,
+            retry_group_id=retry_group_id,
+            retry_count=retry_count,
+        )
+        logger.warning(
+            "[ORDER] RETRY attempt=%s/1 rejected_id=%s symbol=%s side=%s quantity=%s",
+            retry_count,
+            order.order_id,
+            order.symbol,
+            order.side.upper(),
+            remaining_quantity,
+        )
+        submitted = await self.submit_order(retry_order)
+        if not submitted:
+            self._failed_retry_groups.add(retry_group_id)
+        logger.info(
+            "[ORDER] RETRY_RESULT id=%s broker_id=%s submitted=%s",
+            retry_order.id,
+            retry_order.order_id or 'none',
+            submitted,
+        )
 
     async def cancel_order(self, order_id: str) -> bool:
         """
@@ -427,6 +517,8 @@ class TradingEngine:
         quantity: float,
         side: str,
         timeframe: Optional[str] = None,
+        signal_id: Optional[str] = None,
+        retry_group_id: Optional[str] = None,
     ) -> bool:
         """
         Close an existing position.
@@ -458,6 +550,8 @@ class TradingEngine:
                 quantity=quantity,
                 exchange=position.exchange,
                 timeframe=timeframe,
+                signal_id=signal_id,
+                retry_group_id=retry_group_id or f"close:{symbol}:{position.timestamp.isoformat()}",
             )
             
             success = await self.submit_order(order)
@@ -561,13 +655,29 @@ class TradingEngine:
                         )
                         continue
 
+                signal_id = self._signal_identifier(signal)
+                if signal_id in self._processed_signal_ids:
+                    logger.info(
+                        "[SIGNAL] Duplicate signal ignored signal_id=%s symbol=%s action=%s",
+                        signal_id,
+                        signal.symbol,
+                        signal.signal_type.upper(),
+                    )
+                    continue
+
                 logger.info(
-                    "[SIGNAL] Processing signal: %s %s timeframe=%s @ %.2f strength=%.2f",
+                    "[SIGNAL] Processing strategy=%s action=%s symbol=%s timeframe=%s indicator_close=%.2f entry_reference=%.2f quantity=%s strength=%.2f conditions=%s signal_candle=%s trigger_candle=%s",
+                    signal.metadata.get('strategy', 'unknown'),
                     signal.signal_type,
                     signal.symbol,
                     signal.timeframe,
+                    signal.metadata.get('indicator_close', signal.price) or 0.0,
                     signal.price or 0.0,
+                    signal.quantity,
                     signal.strength,
+                    signal.metadata.get('strategy_conditions', 'not provided'),
+                    signal.metadata.get('signal_candle_timestamp', 'unknown'),
+                    signal.metadata.get('trigger_candle_timestamp', 'unknown'),
                 )
                 exchange_name = self._default_exchange_name()
                 exchange = self.exchanges.get(exchange_name) if exchange_name else None
@@ -579,6 +689,8 @@ class TradingEngine:
                 if order is None:
                     logger.warning("[SIGNAL] Could not create order from signal for %s", signal.symbol)
                     continue
+                order.signal_id = signal_id
+                order.retry_group_id = f"{signal_id}:entry"
 
                 prepare_order = getattr(exchange, 'prepare_order', None)
                 if prepare_order:
@@ -595,6 +707,7 @@ class TradingEngine:
                         error,
                     )
                     continue
+                self._processed_signal_ids.add(signal_id)
 
                 symbol_resolver = getattr(exchange, 'order_symbol_for_signal', None)
                 if symbol_resolver and signal.symbol != target_symbol:
@@ -623,17 +736,26 @@ class TradingEngine:
                     )
                     if same_direction:
                         self.pending_reversals.pop(target_symbol, None)
-                        logger.debug(
-                            "[SIGNAL] Holding %s %s position; duplicate entry skipped",
-                            position.side.value,
+                        logger.info(
+                            "[POSITION] NO_CHANGE symbol=%s position_side=%s quantity=%s average_price=%.2f current_price=%.2f signal_side=%s reason=same_direction",
                             target_symbol,
+                            position.side.value,
+                            position.quantity,
+                            position.entry_price,
+                            position.current_price or 0.0,
+                            signal.signal_type.upper(),
                         )
                     else:
                         logger.info(
-                            "[SIGNAL] Reverse signal: closing %s timeframe=%s before entering %s",
+                            "[REVERSAL] QUEUED symbol=%s close_side=%s quantity=%s position_side=%s entry_side=%s entry_quantity=%s reference_price=%.2f timeframe=%s",
                             target_symbol,
+                            'sell' if position.side == PositionSide.LONG else 'buy',
+                            position.quantity,
+                            position.side.value,
+                            signal.signal_type.upper(),
+                            order.quantity,
+                            order.price or 0.0,
                             signal.timeframe,
-                            signal.signal_type,
                         )
                         self.pending_reversals[target_symbol] = order
                         position_order_side = (
@@ -657,15 +779,20 @@ class TradingEngine:
                     continue
 
                 if active_orders:
-                    same_side_order = any(
-                        active.side == signal.signal_type for active in active_orders
+                    matching_order = next(
+                        (active for active in active_orders if active.side == signal.signal_type),
+                        None,
                     )
-                    if same_side_order:
+                    if matching_order:
                         self.pending_reversals.pop(target_symbol, None)
                         logger.info(
-                            "[SIGNAL] Matching %s order already active for %s; not duplicating",
-                            signal.signal_type,
+                            "[ORDER] NO_CHANGE symbol=%s active_order_id=%s side=%s quantity=%s filled=%s status=%s reason=same_side_order",
                             target_symbol,
+                            matching_order.order_id,
+                            signal.signal_type,
+                            matching_order.quantity,
+                            matching_order.filled_quantity,
+                            matching_order.status.value,
                         )
                         continue
 
@@ -716,6 +843,14 @@ class TradingEngine:
             OrderStatus.PARTIALLY_FILLED,
         }
         for symbol, entry_order in list(self.pending_reversals.items()):
+            if entry_order.retry_group_id in self._failed_retry_groups:
+                self.pending_reversals.pop(symbol, None)
+                logger.error(
+                    "[REVERSAL] STOPPED symbol=%s reason=entry_retries_exhausted",
+                    symbol,
+                )
+                continue
+
             position = self.positions.get(symbol)
             active_orders = [
                 order for order in self.orders.values()
@@ -729,6 +864,14 @@ class TradingEngine:
                     continue
 
                 close_side = 'sell' if position.side == PositionSide.LONG else 'buy'
+                close_retry_group = f"{entry_order.signal_id}:close" if entry_order.signal_id else None
+                if close_retry_group and close_retry_group in self._failed_retry_groups:
+                    self.pending_reversals.pop(symbol, None)
+                    logger.error(
+                        "[REVERSAL] STOPPED symbol=%s reason=close_retries_exhausted",
+                        symbol,
+                    )
+                    continue
                 if any(order.side == close_side for order in active_orders):
                     continue
                 if active_orders:
@@ -748,17 +891,28 @@ class TradingEngine:
                     continue
 
                 logger.info(
-                    "[SIGNAL] Closing opposing %s position for %s timeframe=%s before %s entry",
-                    position.side.value,
+                    "[REVERSAL] CLOSE_REQUEST symbol=%s position_side=%s close_side=%s quantity=%s entry_side=%s entry_quantity=%s reference_price=%.2f timeframe=%s",
                     symbol,
-                    entry_order.timeframe or 'unknown',
+                    position.side.value,
+                    'sell' if position.side == PositionSide.LONG else 'buy',
+                    position.quantity,
                     entry_order.side,
+                    entry_order.quantity,
+                    entry_order.price or 0.0,
+                    entry_order.timeframe or 'unknown',
                 )
-                await self.close_position(
+                close_submitted = await self.close_position(
                     symbol,
                     position.quantity,
                     position.side.value,
                     timeframe=entry_order.timeframe,
+                    signal_id=entry_order.signal_id,
+                    retry_group_id=close_retry_group,
+                )
+                logger.info(
+                    "[REVERSAL] CLOSE_SUBMITTED symbol=%s submitted=%s",
+                    symbol,
+                    close_submitted,
                 )
                 continue
 
@@ -770,11 +924,14 @@ class TradingEngine:
             self.pending_reversals.pop(symbol, None)
             submitted = await self.submit_order(entry_order)
             logger.info(
-                "[SIGNAL] Reversal entry %s symbol=%s timeframe=%s status=%s submitted=%s",
+                "[REVERSAL] ENTRY side=%s symbol=%s quantity=%s reference_price=%.2f timeframe=%s status=%s broker_order_id=%s submitted=%s",
                 entry_order.side.upper(),
                 symbol,
+                entry_order.quantity,
+                entry_order.price or 0.0,
                 entry_order.timeframe or 'unknown',
                 entry_order.status.value,
+                entry_order.order_id or 'pending',
                 submitted,
             )
 
@@ -966,6 +1123,16 @@ class TradingEngine:
             exchange=exchange,
             timeframe=signal.timeframe,
         )
+
+    @staticmethod
+    def _signal_identifier(signal: Signal) -> str:
+        signal_id = signal.metadata.get('signal_id')
+        if signal_id:
+            return str(signal_id)
+        trigger_candle = signal.metadata.get('trigger_candle_timestamp')
+        timestamp = trigger_candle or signal.timestamp.isoformat()
+        strategy = signal.metadata.get('strategy', 'unknown')
+        return f"{strategy}:{signal.symbol}:{signal.timeframe}:{signal.signal_type}:{timestamp}"
 
     def _default_exchange_name(self) -> Optional[str]:
         """Return the only registered exchange name, if there is exactly one."""

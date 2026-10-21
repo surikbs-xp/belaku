@@ -46,6 +46,9 @@ class Order:
     order_id: Optional[str] = None
     client_order_id: Optional[str] = None
     timeframe: Optional[str] = None
+    signal_id: Optional[str] = None
+    retry_group_id: Optional[str] = None
+    retry_count: int = 0
 
     @property
     def remaining_quantity(self) -> float:
