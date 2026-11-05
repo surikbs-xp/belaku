@@ -3,7 +3,7 @@
 // © Uncle_the_shooter
 
 //@version=6
-indicator("SuperTrend Weighted by Divergence + Triple ST Strategy", overlay=true, max_lines_count=500, max_labels_count=500)
+strategy("Surikbs", overlay=true, max_lines_count=500, max_labels_count=500, pyramiding=0)
 
 // =====================================================
 // 1. ORIGINAL INPUT SETTINGS
@@ -32,6 +32,7 @@ downColor = input.color(color.rgb(207, 23, 23), "Downtrend Color (Bearish)")
 // =====================================================
 
 showStrategyST = input.bool(true, "Show Triple SuperTrend Lines", group="Strategy Settings")
+showPSAR       = input.bool(true, "Show Parabolic SAR", group="Strategy Settings")
 showEMA        = input.bool(true, "Show EMA 200", group="Strategy Settings")
 showSignals    = input.bool(true, "Show Strategy BUY/SELL Labels", group="Strategy Settings")
 showDiagnostics = input.bool(false, "Show Individual Condition Markers", group="Strategy Settings")
@@ -39,6 +40,9 @@ showDiagnostics = input.bool(false, "Show Individual Condition Markers", group="
 rsiLength = input.int(14, "RSI Length", minval=1, group="Strategy Settings")
 tsvLength = input.int(13, "TSV Length", minval=1, group="Strategy Settings")
 emaLength = input.int(200, "EMA Length", minval=1, group="Strategy Settings")
+psarStart = input.float(0.02, "PSAR Start", minval=0.001, step=0.001, group="Strategy Settings")
+psarIncrement = input.float(0.02, "PSAR Increment", minval=0.001, step=0.001, group="Strategy Settings")
+psarMaximum = input.float(0.2, "PSAR Maximum", minval=0.01, step=0.01, group="Strategy Settings")
 
 // =====================================================
 // 3. ORIGINAL FIXED PARAMETERS
@@ -264,6 +268,7 @@ strategyBearCount = (st1Bear ? 1 : 0) + (st2Bear ? 1 : 0) + (st3Bear ? 1 : 0)
 
 ema200 = ta.ema(close, emaLength)
 rsiValue = ta.rsi(close, rsiLength)
+psarValue = ta.sar(psarStart, psarIncrement, psarMaximum)
 
 // TSV approximation:
 // Rolling sum of price change multiplied by volume.
@@ -279,8 +284,9 @@ buyEMA = close > ema200
 buyST  = strategyBullCount >= 2
 buyRSI = rsiValue < 20
 buyTSV = tsvValue > 0
+buyPSAR = close > psarValue
 
-longCondition = buyEMA and buyST and buyRSI and buyTSV
+longCondition = buyEMA and buyST and buyRSI and buyTSV and buyPSAR
 
 // =====================================================
 // 13. SELL CONDITIONS
@@ -290,8 +296,9 @@ sellEMA = close < ema200
 sellST  = strategyBearCount >= 2
 sellRSI = rsiValue > 80
 sellTSV = tsvValue < 0
+sellPSAR = close < psarValue
 
-shortCondition = sellEMA and sellST and sellRSI and sellTSV
+shortCondition = sellEMA and sellST and sellRSI and sellTSV and sellPSAR
 
 // =====================================================
 // 14. STRATEGY SIGNALS
@@ -303,6 +310,12 @@ shortCondition = sellEMA and sellST and sellRSI and sellTSV
 buySignal = barstate.isconfirmed and longCondition and not longCondition[1]
 sellSignal = barstate.isconfirmed and shortCondition and not shortCondition[1]
 
+if buySignal
+    strategy.entry("Long", strategy.long, comment="BUY")
+
+if sellSignal
+    strategy.entry("Short", strategy.short, comment="SELL")
+
 // =====================================================
 // 15. PLOT TRIPLE SUPERTREND AND EMA
 // =====================================================
@@ -312,6 +325,8 @@ plot(showStrategyST ? st1 : na, title="Strategy ST1 (10,1)", color=color.new(st1
 plot(showStrategyST ? st2 : na, title="Strategy ST2 (11,2)", color=color.new(st2Bull ? color.green : color.maroon, 65), linewidth=1, style=plot.style_linebr)
 
 plot(showStrategyST ? st3 : na, title="Strategy ST3 (12,3)", color=color.new(st3Bull ? color.aqua : color.orange, 65), linewidth=1, style=plot.style_linebr)
+
+plot(showPSAR ? psarValue : na, title="Parabolic SAR", color=color.new(close > psarValue ? color.lime : color.red, 55), style=plot.style_circles, linewidth=2)
 
 plot(showEMA ? ema200 : na, title="EMA 200", color=color.new(color.yellow, 35), linewidth=2)
 
@@ -350,6 +365,7 @@ plotshape(
 // Green = 2 or more bullish SuperTrends
 // Yellow = RSI below 20
 // Purple = TSV positive
+// Teal = PSAR bullish
 
 plotshape(showDiagnostics and buyEMA, title="BUY EMA OK", style=shape.circle, location=location.bottom, color=color.blue, size=size.tiny)
 
@@ -359,11 +375,14 @@ plotshape(showDiagnostics and buyRSI, title="BUY RSI OK", style=shape.circle, lo
 
 plotshape(showDiagnostics and buyTSV, title="BUY TSV OK", style=shape.circle, location=location.bottom, color=color.purple, size=size.tiny)
 
+plotshape(showDiagnostics and buyPSAR, title="BUY PSAR OK", style=shape.circle, location=location.bottom, color=color.teal, size=size.tiny)
+
 // SELL conditions:
 // Orange = Price below EMA
 // Red = 2 or more bearish SuperTrends
 // Yellow = RSI above 80
 // Purple = TSV negative
+// Teal = PSAR bearish
 
 plotshape(showDiagnostics and sellEMA, title="SELL EMA OK", style=shape.diamond, location=location.top, color=color.orange, size=size.tiny)
 
@@ -372,6 +391,8 @@ plotshape(showDiagnostics and sellST, title="SELL ST OK", style=shape.diamond, l
 plotshape(showDiagnostics and sellRSI, title="SELL RSI OK", style=shape.diamond, location=location.top, color=color.yellow, size=size.tiny)
 
 plotshape(showDiagnostics and sellTSV, title="SELL TSV OK", style=shape.diamond, location=location.top, color=color.purple, size=size.tiny)
+
+plotshape(showDiagnostics and sellPSAR, title="SELL PSAR OK", style=shape.diamond, location=location.top, color=color.teal, size=size.tiny)
 
 // =====================================================
 // 18. ALERTS
@@ -389,6 +410,6 @@ alertcondition(bearDiv, title="Bearish Divergence", message="Bearish Divergence 
 
 // New strategy alerts
 
-alertcondition(buySignal, title="Strategy BUY Alert", message="Triple SuperTrend Strategy BUY Signal")
+alertcondition(buySignal, title="Strategy BUY Alert", message="Triple SuperTrend + PSAR Strategy BUY Signal")
 
-alertcondition(sellSignal, title="Strategy SELL Alert", message="Triple SuperTrend Strategy SELL Signal")
+alertcondition(sellSignal, title="Strategy SELL Alert", message="Triple SuperTrend + PSAR Strategy SELL Signal")
