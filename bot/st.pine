@@ -33,13 +33,11 @@ downColor = input.color(color.rgb(207, 23, 23), "Downtrend Color (Bearish)")
 
 showStrategyST = input.bool(true, "Show Triple SuperTrend Lines", group="Strategy Settings")
 showPSAR       = input.bool(true, "Show Parabolic SAR", group="Strategy Settings")
-showEMA        = input.bool(true, "Show EMA 200", group="Strategy Settings")
 showSignals    = input.bool(true, "Show Strategy BUY/SELL Labels", group="Strategy Settings")
 showDiagnostics = input.bool(false, "Show Individual Condition Markers", group="Strategy Settings")
 
 rsiLength = input.int(14, "RSI Length", minval=1, group="Strategy Settings")
 tsvLength = input.int(13, "TSV Length", minval=1, group="Strategy Settings")
-emaLength = input.int(200, "EMA Length", minval=1, group="Strategy Settings")
 psarStart = input.float(0.02, "PSAR Start", minval=0.001, step=0.001, group="Strategy Settings")
 psarIncrement = input.float(0.02, "PSAR Increment", minval=0.001, step=0.001, group="Strategy Settings")
 psarMaximum = input.float(0.2, "PSAR Maximum", minval=0.01, step=0.01, group="Strategy Settings")
@@ -263,10 +261,9 @@ strategyBullCount = (st1Bull ? 1 : 0) + (st2Bull ? 1 : 0) + (st3Bull ? 1 : 0)
 strategyBearCount = (st1Bear ? 1 : 0) + (st2Bear ? 1 : 0) + (st3Bear ? 1 : 0)
 
 // =====================================================
-// 11. EMA, RSI AND TSV
+// 11. RSI AND TSV
 // =====================================================
 
-ema200 = ta.ema(close, emaLength)
 rsiValue = ta.rsi(close, rsiLength)
 psarValue = ta.sar(psarStart, psarIncrement, psarMaximum)
 
@@ -280,25 +277,23 @@ tsvValue = math.sum((close - close[1]) * volume, tsvLength)
 // 12. BUY CONDITIONS
 // =====================================================
 
-buyEMA = close > ema200
 buyST  = strategyBullCount >= 2
 buyRSI = rsiValue < 20
 buyTSV = tsvValue > 0
 buyPSAR = close > psarValue
 
-longCondition = buyEMA and buyST and buyRSI and buyTSV and buyPSAR
+longCondition = buyST and buyRSI and buyTSV and buyPSAR
 
 // =====================================================
 // 13. SELL CONDITIONS
 // =====================================================
 
-sellEMA = close < ema200
 sellST  = strategyBearCount >= 2
 sellRSI = rsiValue > 80
 sellTSV = tsvValue < 0
 sellPSAR = close < psarValue
 
-shortCondition = sellEMA and sellST and sellRSI and sellTSV and sellPSAR
+shortCondition = sellST and sellRSI and sellTSV and sellPSAR
 
 // =====================================================
 // 14. STRATEGY SIGNALS
@@ -317,7 +312,7 @@ if sellSignal
     strategy.entry("Short", strategy.short, comment="SELL")
 
 // =====================================================
-// 15. PLOT TRIPLE SUPERTREND AND EMA
+// 15. PLOT TRIPLE SUPERTREND
 // =====================================================
 
 plot(showStrategyST ? st1 : na, title="Strategy ST1 (10,1)", color=color.new(st1Bull ? color.lime : color.red, 65), linewidth=1, style=plot.style_linebr)
@@ -327,8 +322,6 @@ plot(showStrategyST ? st2 : na, title="Strategy ST2 (11,2)", color=color.new(st2
 plot(showStrategyST ? st3 : na, title="Strategy ST3 (12,3)", color=color.new(st3Bull ? color.aqua : color.orange, 65), linewidth=1, style=plot.style_linebr)
 
 plot(showPSAR ? psarValue : na, title="Parabolic SAR", color=color.new(close > psarValue ? color.lime : color.red, 55), style=plot.style_circles, linewidth=2)
-
-plot(showEMA ? ema200 : na, title="EMA 200", color=color.new(color.yellow, 35), linewidth=2)
 
 // =====================================================
 // 16. STRATEGY BUY / SELL LABELS
@@ -361,13 +354,10 @@ plotshape(
 // =====================================================
 
 // BUY conditions:
-// Blue = Price above EMA
 // Green = 2 or more bullish SuperTrends
 // Yellow = RSI below 20
 // Purple = TSV positive
 // Teal = PSAR bullish
-
-plotshape(showDiagnostics and buyEMA, title="BUY EMA OK", style=shape.circle, location=location.bottom, color=color.blue, size=size.tiny)
 
 plotshape(showDiagnostics and buyST, title="BUY ST OK", style=shape.circle, location=location.bottom, color=color.green, size=size.tiny)
 
@@ -378,13 +368,10 @@ plotshape(showDiagnostics and buyTSV, title="BUY TSV OK", style=shape.circle, lo
 plotshape(showDiagnostics and buyPSAR, title="BUY PSAR OK", style=shape.circle, location=location.bottom, color=color.teal, size=size.tiny)
 
 // SELL conditions:
-// Orange = Price below EMA
 // Red = 2 or more bearish SuperTrends
 // Yellow = RSI above 80
 // Purple = TSV negative
 // Teal = PSAR bearish
-
-plotshape(showDiagnostics and sellEMA, title="SELL EMA OK", style=shape.diamond, location=location.top, color=color.orange, size=size.tiny)
 
 plotshape(showDiagnostics and sellST, title="SELL ST OK", style=shape.diamond, location=location.top, color=color.red, size=size.tiny)
 

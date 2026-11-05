@@ -1,0 +1,34 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      WEBHOOK_HOST: 0.0.0.0
+      WEBHOOK_PORT: "9000"
+      DB_PATH: /data/paper_trading.db
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - bot-data:/data
+      - ./bot/.env:/app/bot/.env
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/api/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  bot-data:
