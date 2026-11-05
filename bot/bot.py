@@ -159,9 +159,10 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             engine["last_tick_at"] = db.iso()
             engine["interval_seconds"] = period
         try:
-            positions = db.get_open_positions()
+            positions = db.get_open_positions(mode=get_execution_mode())
             if positions:
-                manager._mark_equity()
+                if get_execution_mode() == PAPER:
+                    manager._mark_equity()
                 with STATUS_LOCK:
                     engine = STATUS["engine"]
                     engine["marks"] = int(engine["marks"]) + 1
@@ -433,14 +434,15 @@ def api_positions(
     limit: int = Query(200, ge=1, le=2000),
 ) -> dict[str, Any]:
     """Open and/or closed Nifty futures positions, newest first."""
+    mode = get_execution_mode()
     if status == "open":
-        rows = db.get_open_positions()
+        rows = db.get_open_positions(mode=mode)
         rows = sorted(rows, key=lambda r: r["entry_time"], reverse=True)
     else:
-        query = "SELECT * FROM positions"
-        params: list[Any] = []
+        query = "SELECT * FROM positions WHERE mode = ?"
+        params: list[Any] = [mode]
         if status == "closed":
-            query += " WHERE status = 'CLOSED'"
+            query += " AND status = 'CLOSED'"
         query += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
         rows = db._fetch_all(query, params, None)
@@ -461,8 +463,8 @@ def api_orders(
 ) -> dict[str, Any]:
     """Order book straight from SQLite, newest first."""
     rows = db.get_orders(limit=limit)
-    if mode:
-        rows = [r for r in rows if (r.get("mode") or "").upper() == mode]
+    selected_mode = mode or get_execution_mode()
+    rows = [r for r in rows if (r.get("mode") or "").upper() == selected_mode]
     if search:
         needle = search.strip().lower()
         rows = [r for r in rows if needle in " ".join(str(v) for v in r.values()).lower()]
@@ -518,8 +520,8 @@ def api_trades(
 ) -> dict[str, Any]:
     """Settled round trips from the trade ledger (fees and net PnL included)."""
     rows = db.get_trades(limit=limit)
-    if mode:
-        rows = [r for r in rows if (r.get("mode") or "").upper() == mode]
+    selected_mode = mode or get_execution_mode()
+    rows = [r for r in rows if (r.get("mode") or "").upper() == selected_mode]
     return {"trades": rows, "count": len(rows)}
 
 
