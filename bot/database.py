@@ -553,7 +553,7 @@ def get_performance_metrics(
         unrealized += (mark - pos["entry_price"]) * pos["quantity"] * pos["position_key"]
 
     start_equity = float(equity[0]) if equity else account["initial_balance"]
-    current_equity = float(equity[-1]) if equity else account["balance"]
+    current_equity = float(account["balance"]) + unrealized
     total_return = (
         (current_equity / account["initial_balance"] - 1.0) * 100.0
         if account["initial_balance"]

@@ -12,7 +12,7 @@ the loop.
 | `bot/bot.py` | **The bot.** Entrypoint: tick feed, engine, mark loop, API, dashboard |
 | `bot/gift_nifty.py` | GIFT Nifty instrument resolution, KiteTicker subscription, tick→candle aggregation |
 | `bot/engine.py` | Evaluates `bot/st.pine` on GIFT Nifty bars; routes orders to the Nifty future |
-| `bot/strategy.py` | The `bot/st.pine` entry filters in Python (RSI / TSV / PSAR / triple SuperTrend) |
+| `bot/strategy.py` | The `bot/st.pine` entry filters in Python (PSAR / triple SuperTrend) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
 | `bot/kite_client.py` | KiteConnect wrapper; quotes, instrument lookup, mocked orders in PAPER |
 | `bot/kite_auth.py` | Kite login callback, request-token exchange, and access-token persistence |
@@ -53,23 +53,27 @@ This is deliberate, not an oversight:
 | Window | Behaviour |
 |---|---|
 | GIFT Nifty session (~20h) | evaluate `st.pine` on every closed bar |
-| NSE F&O session (09:15–15:30 IST) | orders may be placed |
+| NSE F&O session (09:15–15:30 IST) | LIVE orders may be placed; PAPER uses available market prices |
+| Outside NSE F&O hours | PAPER engine signals may simulate at the completed GIFT candle close; LIVE signals are deferred |
 
-A signal that fires outside the NSE window is recorded as **deferred** and shown
-on the dashboard. It is deliberately *not* auto-executed at 09:15 — a direction
-from a 03:00 move is not a trade.
+A signal fires only on a fresh BUY/SELL transition after a completed candle.
+After-hours PAPER simulation does not force an order when the signal is neutral.
+Open PAPER engine positions are marked against the live GIFT Nifty price after
+hours; portfolio equity includes current unrealised P/L.
+LIVE signals outside the NSE window are recorded as **deferred** and are not
+auto-executed at 09:15.
 
 ### Warmup, stated plainly
 
 Kite serves **no historical data for NSEIX**, so the bot must build its own
-candles from live ticks. The strategy does not use EMA 200; it needs 20 closed
-bars for the RSI, TSV, and SuperTrend indicators to warm up. At `5minute` this is
-about 100 minutes of candles. Until then, the engine reports `warming up N/20`
-and refuses to signal rather than trading on cold indicators. Bars are persisted
-to the `gift_candles` table, so a restart **resumes** the warmup instead of
-restarting it.
+candles from live ticks. RSI and TSV are not entry filters. The remaining longest
+indicator is SuperTrend with ATR length 12, so the engine needs 12 closed candles
+before its first valid signal (about 60 minutes at `5minute`). After that, it
+evaluates each completed candle. Bars are persisted to the `gift_candles` table,
+so a restart **resumes** the warmup instead of restarting it.
 
-The first ~100 minutes after install will not trade. That is the design.
+The first ~60 minutes after a fresh install will not trade because GIFT Nifty
+history is unavailable; persisted bars can reduce that wait after a restart.
 
 ## Setup
 
@@ -182,7 +186,7 @@ requires `confirm=true`. Both are rejected with a `4xx` otherwise.
 * **Dashboard** — portfolio value, margin available (with utilisation
   bar), active mode pill (green LIVE / amber PAPER), real-time PnL coloured by
   sign, the GIFT Nifty signal engine (verdict, indicator values, which of the
-  four entry filters are live, warmup progress), open positions, a Paper/Live
+  two entry filters are live, warmup progress), open positions, a Paper/Live
   toggle, pause, and the panic button. Live mode still requires an explicit
   confirmation.
 * **Order Logs** — searchable, mode-filtered order book plus the engine signal
@@ -208,7 +212,7 @@ visible without tailing logs.
 |---|---|
 | `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
-| `STRATEGY_*` | the five condition parameters, mirroring `st.pine` inputs |
+| `STRATEGY_*` | the SuperTrend agreement threshold and PSAR parameters |
 
 If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 — the indicators are only meaningful on the timeframe they were tuned for.
@@ -222,30 +226,28 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 | Duplicate/replayed signals rejected | `order_manager._already_processed` |
 | Stale signals rejected (default 300 s) | `order_manager._signal_age_seconds` |
 | `MAX_OPEN_LOTS` and `LOT_MARGIN` enforced before every entry | `order_manager._execute_directional` |
-| Orders only placed inside the NSE F&O session | `engine.StrategyEngine.execute` |
+| LIVE orders only placed inside the NSE F&O session; after-hours PAPER uses the GIFT close | `engine.StrategyEngine.execute` |
 | Unresolved orders and broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
 | Panic reports partial or failed square-offs instead of claiming success | `order_manager.OrderManager.square_off` |
 | Panic pauses new entries | `order_manager.pause` / `OrderManager.paused` |
 
 ### Strategy evaluation
 
-`bot/strategy.py` implements the four entry filters from `bot/st.pine` §12–14
-(2-of-3 SuperTrends, RSI<20 / >80, TSV sign, PSAR). `bot/engine.py` runs them on every
-closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
+`bot/strategy.py` implements the two entry filters from `bot/st.pine` §12–14
+(2-of-3 SuperTrends and PSAR). RSI and TSV are removed. `bot/engine.py` evaluates
+each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
 — mirroring the Pine `not longCondition[1]` guard, so a run of bullish bars
 produces exactly one entry.
 
-Until the series is warm the engine reports `warming up N/20` and takes no
-action. This is fail-closed by construction, not by a flag: there is no
-"evaluate anyway" path.
+The engine reports warm-up progress until 12 closed bars are available, then
+evaluates every completed candle. The 12-bar minimum is required by the longest
+remaining SuperTrend ATR length.
 
-The conditions are selective, so long stretches of `NEUTRAL` are expected.
-The dashboard's condition checklist shows exactly which of the four are live,
+The dashboard's condition checklist shows exactly which of the two are live,
 so a quiet bot is explainable rather than mysterious.
 
-Kite's GIFT Nifty LTP feed does not carry traded volume. TSV therefore uses
-ticks per candle as an explicitly approximate activity proxy; it is not the
-traded-volume TSV in Pine and should be backtested before live use.
+Removing RSI and TSV makes signals less selective; evaluate the changed strategy
+in paper mode before enabling live orders.
 
 The Pine strategy defines entries but no stop-loss, profit target, or timed
 exit. Positions remain open until an opposite entry or manual square-off; the
@@ -259,7 +261,7 @@ bot does not automatically close them at the end of the NSE session.
 ```
 
 The strategy port is exercised with synthetic candle series; `strategy.evaluate`
-returns a `StrategyVerdict` whose `.conditions` dict shows exactly which of the
-five Pine conditions held on the final bar.
+returns a `StrategyVerdict` whose `.conditions` dict shows which SuperTrend and
+PSAR conditions held on the final bar.
 
 Start the bot separately with `.venv/bin/python bot/bot.py`.

@@ -38,7 +38,26 @@ def test_atr_matches_pine_seeding() -> None:
     ) == [None, 2.5, 2.75]
 
 
-def test_strategy_warmup_no_longer_waits_for_ema_200() -> None:
+def test_psar_initializes_direction_from_first_close_change() -> None:
+    highs = [10.0, 9.0, 8.0]
+    lows = [8.0, 7.0, 6.0]
+    closes = [9.0, 8.0, 7.0]
+
+    assert strategy.psar(highs, lows, closes)[1] == 10.0
+
+
+def test_supertrend_starts_bearish_when_first_atr_becomes_available() -> None:
+    highs = [10.0, 20.0]
+    lows = [9.0, 10.0]
+    closes = [9.5, 20.0]
+
+    line, direction = strategy.supertrend(highs, lows, closes, factor=0.1, length=2)
+
+    assert direction == [0, 1]
+    assert line[1] == 15.575
+
+
+def test_strategy_signals_after_supertrend_history_without_rsi_or_tsv() -> None:
     candles = [
         {
             "open": 100.0 + index,
@@ -50,11 +69,20 @@ def test_strategy_warmup_no_longer_waits_for_ema_200() -> None:
         for index in range(20)
     ]
 
-    assert engine.required_bars() == 20
-    verdict = strategy.evaluate(candles)
-    assert "ema" not in verdict.values
-    assert "buy_ema" not in verdict.conditions
-    assert "sell_ema" not in verdict.conditions
+    assert engine.required_bars() == 12
+    with pytest.raises(strategy.InsufficientData, match="need 12 closed candles"):
+        strategy.evaluate(candles[:11])
+
+    verdict = strategy.evaluate(candles[:12])
+    assert set(verdict.conditions) == {"buy_supertrend", "buy_psar", "sell_supertrend", "sell_psar"}
+    assert set(verdict.values) == {
+        "psar",
+        "supertrend_bull",
+        "supertrend_bear",
+        "st_10_1",
+        "st_11_2",
+        "st_12_3",
+    }
 
 
 def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
@@ -69,6 +97,244 @@ def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
 
     assert feed.in_progress["volume"] == 2.0
     assert feed.status()["volume_basis"] == "tick_count_proxy"
+
+
+def test_candle_snapshot_includes_forming_candle() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed._handle_ticks(None, [{"last_price": 100.0}])
+
+    candles, in_progress = feed.candle_snapshot()
+
+    assert in_progress
+    assert len(candles) == 1
+    assert candles[0]["close"] == 100.0
+    assert candles[0]["ticks"] == 1
+
+
+def test_feed_status_exposes_last_candle_as_source_fallback() -> None:
+    feed = GiftNiftyFeed("5minute")
+    feed._history = [{
+        "time": "2026-11-05T21:40:00+05:30",
+        "open": 100.0,
+        "high": 105.0,
+        "low": 99.0,
+        "close": 104.0,
+        "volume": 5.0,
+    }]
+
+    status = feed.status()
+
+    assert status["last_price"] is None
+    assert status["last_candle_close"] == 104.0
+    assert status["last_candle_at"] == "2026-11-05T21:40:00+05:30"
+
+
+def test_engine_status_reports_forming_bar_indicators_without_signaling(monkeypatch) -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed._history = [
+        {
+            "time": f"2026-11-05T09:{index:02d}:00+05:30",
+            "open": 100.0 + index,
+            "high": 101.0 + index,
+            "low": 99.0 + index,
+            "close": 100.0 + index,
+            "volume": 1.0,
+        }
+        for index in range(11)
+    ]
+    feed._handle_ticks(None, [{"last_price": 112.0}])
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": True})
+    monkeypatch.setattr(
+        engine,
+        "get_order_manager",
+        lambda: SimpleNamespace(current_symbol=lambda: "NIFTY", paused=False),
+    )
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+
+    status = engine.StrategyEngine().status()
+
+    assert status["current_bar_in_progress"]
+    assert status["current_values"] is not None
+    assert status["last_signal"] == strategy.NEUTRAL
+
+
+def test_engine_after_hours_paper_order_uses_closed_candle_price(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResult:
+        ok = True
+        reason = "simulated"
+
+        def to_dict(self):
+            return {"ok": True, "action": "BUY"}
+
+    class FakeManager:
+        paused = False
+
+        def current_symbol(self):
+            return "NIFTY26NOVFUT"
+
+        def process_signal(self, payload, source):
+            captured.update(payload=payload, source=source)
+            return FakeResult()
+
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False, "reason": "Post-market"})
+    monkeypatch.setattr(engine, "get_order_manager", lambda: FakeManager())
+    signal_time = datetime.now(IST)
+
+    result = engine.StrategyEngine().execute(
+        "BUY",
+        "closed-candle signal",
+        paper_reference_price=24_418.5,
+        signal_timestamp=signal_time,
+    )
+
+    assert result["ok"]
+    assert captured["source"] == "ENGINE"
+    assert captured["payload"]["paper_after_hours"] is True
+    assert captured["payload"]["price"] == 24_418.5
+    assert captured["payload"]["timestamp"] == signal_time.isoformat()
+
+
+def test_engine_waits_for_a_transition_after_startup(monkeypatch) -> None:
+    class FakeFeed:
+        seconds = 300
+
+        def __init__(self):
+            self.rows = [{"time": "2026-11-05T22:10:00+05:30"}]
+
+        def candles(self):
+            return self.rows
+
+    feed = FakeFeed()
+    verdicts = iter([
+        strategy.StrategyVerdict(strategy.BULL, 100.0),
+        strategy.StrategyVerdict(strategy.BULL, 101.0),
+        strategy.StrategyVerdict(strategy.BEAR, 99.0),
+    ])
+    actions = []
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(engine.strategy, "evaluate", lambda *_args: next(verdicts))
+    runner = engine.StrategyEngine()
+    monkeypatch.setattr(
+        runner,
+        "execute",
+        lambda action, detail, **kwargs: actions.append(action) or {"ok": True},
+    )
+
+    assert runner.evaluate_now()["reason"] == "existing signal primed; waiting for the next transition"
+    feed.rows.append({"time": "2026-11-05T22:15:00+05:30"})
+    assert runner.evaluate_now()["reason"] == "no signal change"
+    feed.rows.append({"time": "2026-11-05T22:20:00+05:30"})
+    assert runner.evaluate_now()["action"] == "SELL"
+    assert actions == ["SELL"]
+
+
+def test_after_hours_paper_engine_pnl_uses_gift_mark(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position(
+        "NIFTY26NOVFUT", 65, 100.0, mode=PAPER, source="ENGINE"
+    )
+
+    class FakeClient:
+        mode = PAPER
+
+        def get_ltp(self, _symbol):
+            return 110.0
+
+        def instrument_for_symbol(self, _symbol):
+            return {"lot_size": 65}
+
+        def data_source(self):
+            return "CACHE"
+
+        def auth_status(self):
+            return {"authenticated": True}
+
+    class FakeFeed:
+        def status(self):
+            return {"last_price": 95.0, "last_candle_close": 96.0}
+
+    client = FakeClient()
+    manager = OrderManager(client)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(gift_nifty, "get_feed", lambda: FakeFeed())
+    monkeypatch.setattr(bot_app, "get_order_manager", lambda: manager)
+    monkeypatch.setattr(bot_app, "get_client", lambda: client)
+
+    portfolio = bot_app.api_portfolio()
+    position = bot_app._enrich_positions(db.get_open_positions())[0]
+
+    assert portfolio["unrealized_pnl"] == -325.0
+    assert portfolio["total_pnl"] == -325.0
+    assert portfolio["equity"] == 999_675.0
+    assert position["mark_price"] == 95.0
+    assert position["unrealized_pnl"] == -325.0
+
+
+def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
+    monkeypatch.setattr(
+        order_manager,
+        "market_status",
+        lambda: {"reason": "Post-market"},
+    )
+
+    class FakeClient:
+        mode = PAPER
+
+        def get_ltp(self, _symbol):
+            return 25_000.0
+
+        def place_order(self, **kwargs):
+            return {
+                "order_id": "PAPER-TEST",
+                "status": "COMPLETE",
+                "filled_quantity": kwargs["quantity"],
+                "average_price": kwargs["price"],
+            }
+
+        def data_source(self):
+            return "CACHE"
+
+    manager = OrderManager(FakeClient())
+    payload = {
+        "action": "BUY",
+        "symbol": "NIFTY26NOVFUT",
+        "qty_lots": 1,
+        "price": 24_418.5,
+        "paper_after_hours": True,
+        "timestamp": db.iso(),
+        "signal_id": "after-hours-paper-test",
+    }
+
+    result = manager.process_signal(payload, source="ENGINE")
+    sell_payload = {
+        **payload,
+        "action": "SELL",
+        "price": 24_500.0,
+        "signal_id": "after-hours-paper-sell-test",
+    }
+    flipped = manager.process_signal(sell_payload, source="ENGINE")
+    rejected = manager.process_signal({**payload, "signal_id": "webhook-after-hours-test"}, source="WEBHOOK")
+    open_positions = db.get_open_positions(mode=PAPER)
+
+    assert result.ok
+    assert result.quantity == 65
+    assert result.price == 24_418.55
+    assert flipped.ok
+    assert flipped.quantity == 65
+    assert len(open_positions) == 1
+    assert open_positions[0]["position_key"] == -1
+    assert open_positions[0]["quantity"] == 65
+    assert not rejected.ok
+    assert "outside market hours" in rejected.reason.lower()
 
 
 def test_feed_connect_is_only_true_after_subscription_succeeds() -> None:
@@ -291,7 +557,7 @@ def test_open_ack_does_not_create_position(monkeypatch, tmp_path) -> None:
 def test_existing_target_lot_is_not_reopened(monkeypatch, tmp_path) -> None:
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    db.open_position("TEST", 75, 100.0, mode=PAPER)
+    db.open_position("TEST", 65, 100.0, mode=PAPER)
 
     class FakeClient:
         mode = PAPER
@@ -308,7 +574,7 @@ def test_existing_target_lot_is_not_reopened(monkeypatch, tmp_path) -> None:
 def test_rejected_square_off_reports_failure_and_keeps_position(monkeypatch, tmp_path) -> None:
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    db.open_position("TEST", 75, 100.0, mode=PAPER)
+    db.open_position("TEST", 65, 100.0, mode=PAPER)
 
     class FakeClient:
         mode = PAPER
