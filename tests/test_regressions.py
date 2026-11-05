@@ -238,6 +238,9 @@ def test_after_hours_paper_engine_pnl_uses_gift_mark(monkeypatch, tmp_path) -> N
     db.open_position(
         "NIFTY26NOVFUT", 65, 100.0, mode=PAPER, source="ENGINE"
     )
+    db.open_position(
+        "NIFTY26NOVFUT", 65, 200.0, mode=LIVE, source="ENGINE"
+    )
 
     class FakeClient:
         mode = PAPER
@@ -267,13 +270,18 @@ def test_after_hours_paper_engine_pnl_uses_gift_mark(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(bot_app, "get_client", lambda: client)
 
     portfolio = bot_app.api_portfolio()
+    metrics = manager.portfolio()
     position = bot_app._enrich_positions(db.get_open_positions())[0]
+    active_positions = bot_app.api_positions(status="open")
 
     assert portfolio["unrealized_pnl"] == -325.0
     assert portfolio["total_pnl"] == -325.0
     assert portfolio["equity"] == 999_675.0
+    assert len(metrics["open_positions"]) == 1
     assert position["mark_price"] == 95.0
     assert position["unrealized_pnl"] == -325.0
+    assert active_positions["count"] == 1
+    assert active_positions["positions"][0]["mode"] == PAPER
 
 
 def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_path) -> None:

@@ -586,7 +586,8 @@ class OrderManager:
     # -- valuation -------------------------------------------------------
     def price_map(self) -> dict[str, float]:
         prices: dict[str, float] = {}
-        positions = db.get_open_positions()
+        mode = get_execution_mode()
+        positions = db.get_open_positions(mode=mode)
         market_open = is_market_open()
         gift_price: Optional[float] = None
         if not market_open and any(
@@ -621,20 +622,26 @@ class OrderManager:
 
     def _mark_equity(self) -> None:
         prices = self.price_map()
-        metrics = db.get_performance_metrics(prices=prices)
+        positions = db.get_open_positions(mode=PAPER)
+        metrics = db.get_performance_metrics(
+            open_positions=positions, prices=prices, mode=PAPER
+        )
         db.record_equity(metrics["equity"], metrics["balance"], metrics["unrealized_pnl"])
 
     def portfolio(self) -> dict[str, Any]:
-        """Aggregate liquidation value across both ledgers."""
+        """Aggregate liquidation value for the active execution mode."""
+        mode = get_execution_mode()
         prices = self.price_map()
-        positions = db.get_open_positions()
-        metrics = db.get_performance_metrics(open_positions=positions, prices=prices)
-        live_cash = self.client.available_cash() if get_execution_mode() == LIVE else None
+        positions = db.get_open_positions(mode=mode)
+        metrics = db.get_performance_metrics(
+            open_positions=positions, prices=prices, mode=mode
+        )
+        live_cash = self.client.available_cash() if mode == LIVE else None
         if live_cash is not None:
             metrics["equity"] = live_cash + metrics["unrealized_pnl"]
         metrics["open_positions"] = positions
         metrics["prices"] = prices
-        metrics["mode"] = get_execution_mode()
+        metrics["mode"] = mode
         metrics["market"] = market_status()
         metrics["data_source"] = self.client.data_source()
         metrics["kite_auth"] = self.client.auth_status()

@@ -60,6 +60,8 @@ A signal fires only on a fresh BUY/SELL transition after a completed candle.
 After-hours PAPER simulation does not force an order when the signal is neutral.
 Open PAPER engine positions are marked against the live GIFT Nifty price after
 hours; portfolio equity includes current unrealised P/L.
+PAPER orders are simulated and their positions/P&L are isolated by mode; only
+LIVE mode submits orders to Zerodha, and switching to LIVE requires confirmation.
 LIVE signals outside the NSE window are recorded as **deferred** and are not
 auto-executed at 09:15.
 

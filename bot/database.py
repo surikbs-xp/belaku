@@ -526,13 +526,22 @@ def get_performance_metrics(
     path: Optional[str] = None,
     open_positions: Optional[list[dict[str, Any]]] = None,
     prices: Optional[dict[str, float]] = None,
+    mode: Optional[str] = None,
 ) -> dict[str, Any]:
     """Aggregate realised stats from the trade ledger plus live unrealised PnL."""
     account = get_account(path)
-    trades = _fetch_all(
-        "SELECT * FROM trades ORDER BY exit_time", [], path
+    trade_query = "SELECT * FROM trades"
+    trade_params: list[Any] = []
+    if mode:
+        trade_query += " WHERE mode = ?"
+        trade_params.append(mode)
+    trade_query += " ORDER BY exit_time"
+    trades = _fetch_all(trade_query, trade_params, path)
+    equity = (
+        [float(r["equity"]) for r in get_equity_curve(path=path)]
+        if mode in (None, "PAPER")
+        else []
     )
-    equity = [float(r["equity"]) for r in get_equity_curve(path=path)]
 
     wins = [t for t in trades if t["net_pnl"] > 0]
     losses = [t for t in trades if t["net_pnl"] < 0]
@@ -548,7 +557,12 @@ def get_performance_metrics(
             realized_today += float(t["net_pnl"])
 
     unrealized = 0.0
-    for pos in open_positions if open_positions is not None else get_open_positions(path):
+    positions = (
+        open_positions
+        if open_positions is not None
+        else get_open_positions(path, mode=mode)
+    )
+    for pos in positions:
         mark = (prices or {}).get(pos["symbol"]) or pos["last_price"] or pos["entry_price"]
         unrealized += (mark - pos["entry_price"]) * pos["quantity"] * pos["position_key"]
 
