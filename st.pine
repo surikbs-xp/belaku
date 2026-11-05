@@ -190,7 +190,7 @@ plotLine = flipHappens ? na : (regime == 1 ? trailLong : trailShort)
 
 pLine = plot(
      plotLine,
-     color=showLine ? color.new(regime == 1 ? upColor : downColor, 40) : na,
+     color=showLine ? color.new(regime == 1 ? upColor : downColor, 60) : na,
      linewidth=1,
      style=plot.style_linebr
 )
@@ -202,7 +202,7 @@ fill(
      pCenter,
      plotLine,
      hl2,
-     fillShade ? color.new(regime == 1 ? upColor : downColor, 75) : na,
+     fillShade ? color.new(regime == 1 ? upColor : downColor, 85) : na,
      fillShade ? color.new(regime == 1 ? upColor : downColor, 95) : na
 )
 
@@ -307,13 +307,13 @@ sellSignal = barstate.isconfirmed and shortCondition and not shortCondition[1]
 // 15. PLOT TRIPLE SUPERTREND AND EMA
 // =====================================================
 
-plot(showStrategyST ? st1 : na, title="Strategy ST1 (10,1)", color=st1Bull ? color.lime : color.red, linewidth=1, style=plot.style_linebr)
+plot(showStrategyST ? st1 : na, title="Strategy ST1 (10,1)", color=color.new(st1Bull ? color.lime : color.red, 65), linewidth=1, style=plot.style_linebr)
 
-plot(showStrategyST ? st2 : na, title="Strategy ST2 (11,2)", color=st2Bull ? color.green : color.maroon, linewidth=1, style=plot.style_linebr)
+plot(showStrategyST ? st2 : na, title="Strategy ST2 (11,2)", color=color.new(st2Bull ? color.green : color.maroon, 65), linewidth=1, style=plot.style_linebr)
 
-plot(showStrategyST ? st3 : na, title="Strategy ST3 (12,3)", color=st3Bull ? color.aqua : color.orange, linewidth=1, style=plot.style_linebr)
+plot(showStrategyST ? st3 : na, title="Strategy ST3 (12,3)", color=color.new(st3Bull ? color.aqua : color.orange, 65), linewidth=1, style=plot.style_linebr)
 
-plot(showEMA ? ema200 : na, title="EMA 200", color=color.yellow, linewidth=2)
+plot(showEMA ? ema200 : na, title="EMA 200", color=color.new(color.yellow, 35), linewidth=2)
 
 // =====================================================
 // 16. STRATEGY BUY / SELL LABELS
