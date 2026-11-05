@@ -8,7 +8,7 @@ GIFT Nifty (NSEIX, NSE IFSC) is the pre-market proxy for Nifty 50 and trades
   warm the indicators from.
 
 Consequence, stated plainly: this module must build its own candles forward from
-live ticks. Until ``strategy`` has enough bars (20 for indicator warmup), it
+live ticks. Until ``strategy`` has enough bars (12 for SuperTrend warmup), it
 refuses to emit signals rather than trading on cold indicators. Bars are
 persisted to SQLite so a restart resumes the warmup instead of starting over.
 
@@ -248,6 +248,15 @@ class GiftNiftyFeed:
         with self._lock:
             return list(self._history)
 
+    def candle_snapshot(self) -> tuple[list[dict[str, Any]], bool]:
+        """Return closed candles plus the current candle, if one is forming."""
+        with self._lock:
+            candles = list(self._history)
+            current = self._builder.current
+            if current is not None:
+                candles.append(current.to_strategy_candle())
+            return candles, current is not None
+
     def bar_count(self) -> int:
         with self._lock:
             return len(self._history)
@@ -433,6 +442,11 @@ class GiftNiftyFeed:
                 if self.last_tick_at
                 else None
             )
+            latest_candle = None
+            if self._builder.current is not None:
+                latest_candle = self._builder.current.to_strategy_candle()
+            elif self._history:
+                latest_candle = self._history[-1]
             return {
                 "symbol": GIFT_KEY,
                 "token": self.token,
@@ -448,6 +462,8 @@ class GiftNiftyFeed:
                 "last_tick_at": self.last_tick_at.isoformat(timespec="seconds")
                 if self.last_tick_at
                 else None,
+                "last_candle_close": latest_candle["close"] if latest_candle else None,
+                "last_candle_at": latest_candle["time"] if latest_candle else None,
                 "tick_age_seconds": round(age, 1) if age is not None else None,
                 "ticks": self.tick_count,
                 "error": self.error,

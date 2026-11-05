@@ -344,12 +344,13 @@ def api_status() -> dict[str, Any]:
 def _enrich_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach mark price and per-position PnL to raw ledger rows."""
     client = get_client()
+    prices = get_order_manager().price_map()
     out: list[dict[str, Any]] = []
     for pos in positions:
         row = dict(pos)
         key = int(row["position_key"])
         if row["status"] == "OPEN":
-            mark = client.get_ltp(row["symbol"]) or row.get("last_price") or row["entry_price"]
+            mark = prices.get(row["symbol"]) or row.get("last_price") or row["entry_price"]
             row["mark_price"] = round(float(mark), 2)
             row["unrealized_pnl"] = round(
                 (float(mark) - row["entry_price"]) * row["quantity"] * key, 2

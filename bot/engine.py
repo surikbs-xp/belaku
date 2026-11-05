@@ -10,16 +10,10 @@ Signal source and execution venue are deliberately different instruments:
   :class:`~order_manager.OrderManager`, because GIFT Nifty is quote-only on
   Kite and cannot be traded there.
 
-Two clocks therefore matter, and they are not the same:
-
-* the engine **evaluates** on every closed GIFT Nifty bar, around the clock;
-* it only **executes** inside the NSE F&O session (09:15-15:30 IST), because
-  outside it the future cannot be filled.
-
-A signal that fires outside the window is recorded as ``deferred`` rather than
-dropped, so the dashboard can show it and an operator can see why nothing
-happened. It is deliberately *not* auto-executed at 09:15 - a stale direction
-from a 03:00 move is not a trade, it is a guess.
+The engine **evaluates** on every closed GIFT Nifty bar, around the clock.
+LIVE orders execute only inside the NSE F&O session (09:15-15:30 IST). PAPER
+orders can also simulate after-hours using the just-closed GIFT candle; a
+deferred LIVE signal is never auto-executed later.
 """
 
 from __future__ import annotations
@@ -27,13 +21,14 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import database as db
 import strategy
-from config import get_execution_mode, settings, strategy_params
+from config import PAPER, get_execution_mode, settings, strategy_params
 from gift_nifty import get_feed
-from kite_client import get_client, market_status
+from kite_client import IST, get_client, market_status
 from order_manager import BUY, SELL, get_order_manager
 
 log = logging.getLogger("engine")
@@ -88,13 +83,9 @@ class EngineState:
         }
 
 
-def required_bars(params: Optional[dict[str, Any]] = None) -> int:
+def required_bars() -> int:
     """Bars ``strategy.evaluate`` needs before it will produce a verdict."""
-    cfg = {**strategy.DEFAULTS, **(params or strategy_params())}
-    return max(
-        int(cfg["rsi_length"]) + 1,
-        int(cfg["tsv_length"]) + 1,
-    ) + 5
+    return max(length for _, length in strategy.SUPERTRENDS)
 
 
 class StrategyEngine:
@@ -123,7 +114,7 @@ class StrategyEngine:
         feed = get_feed()
         candles = feed.candles()
         params = strategy_params()
-        needed = required_bars(params)
+        needed = required_bars()
         with self._lock:
             self.state.warmup_needed = needed
             self.state.warmup_have = len(candles)
@@ -142,6 +133,7 @@ class StrategyEngine:
             }
 
         newest = candles[-1]["time"]
+        initial_bar = self._last_bar_at is None
         if not force and newest == self._last_bar_at:
             return {"ok": True, "reason": "no new closed bar", "skipped": True}
         self._last_bar_at = newest
@@ -169,6 +161,15 @@ class StrategyEngine:
         previous = self._last_signal
         self._last_signal = signal
 
+        if initial_bar:
+            return {
+                "ok": True,
+                "signal": signal,
+                "detail": verdict.detail,
+                "action": None,
+                "reason": "existing signal primed; waiting for the next transition",
+            }
+
         # Only act on a fresh transition, exactly like the Pine `not cond[1]`.
         if signal == previous or signal == strategy.NEUTRAL:
             return {
@@ -182,19 +183,33 @@ class StrategyEngine:
         action = BUY if signal == strategy.BULL else SELL
         with self._lock:
             self.state.signals_fired += 1
-        result = self.execute(action, verdict.detail)
+        closed_at = datetime.fromisoformat(newest) + timedelta(seconds=feed.seconds)
+        result = self.execute(
+            action,
+            verdict.detail,
+            paper_reference_price=verdict.close,
+            signal_timestamp=closed_at,
+        )
         return {"ok": True, "signal": signal, "detail": verdict.detail, "action": action,
                 "result": result}
 
     # -- execution -------------------------------------------------------
-    def execute(self, action: str, detail: str = "") -> dict[str, Any]:
-        """Place ``action`` on the Nifty future, respecting the NSE session."""
+    def execute(
+        self,
+        action: str,
+        detail: str = "",
+        *,
+        paper_reference_price: Optional[float] = None,
+        signal_timestamp: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Place a signal, using a GIFT-close fill only for after-hours PAPER."""
         manager = get_order_manager()
         mode = get_execution_mode()
         symbol = manager.current_symbol()
         market = market_status()
+        paper_after_hours = mode == PAPER and not market["is_open"]
 
-        if not market["is_open"]:
+        if not market["is_open"] and not paper_after_hours:
             with self._lock:
                 self.state.deferred += 1
                 self.state.last_action = f"{action} deferred"
@@ -210,6 +225,20 @@ class StrategyEngine:
             log.warning("%s", reason)
             return {"ok": False, "deferred": True, "reason": reason}
 
+        if paper_after_hours and (
+            paper_reference_price is None
+            or paper_reference_price <= 0
+            or signal_timestamp is None
+        ):
+            reason = "After-hours PAPER signal needs a closed-candle price and timestamp"
+            with self._lock:
+                self.state.orders_blocked += 1
+                self.state.last_error = reason
+                self.state.last_result = {"ok": False, "action": action, "reason": reason}
+            db.record_signal(action, f"GIFT {detail}".strip(), False, reason)
+            log.error("%s", reason)
+            return {"ok": False, "reason": reason}
+
         if manager.paused:
             with self._lock:
                 self.state.orders_blocked += 1
@@ -218,7 +247,11 @@ class StrategyEngine:
             log.warning("%s", reason)
             return {"ok": False, "reason": reason}
 
-        price = get_client().latest_known_price(symbol)
+        price = (
+            paper_reference_price
+            if paper_after_hours
+            else get_client().latest_known_price(symbol)
+        )
         payload: dict[str, Any] = {
             "action": action,
             "symbol": symbol,
@@ -227,7 +260,11 @@ class StrategyEngine:
             "strategy": "Surikbs",
             "source": "GIFT_NIFTY_ENGINE",
             "gift_detail": detail,
+            "paper_after_hours": paper_after_hours,
+            "max_age_seconds": 300,
         }
+        if signal_timestamp is not None:
+            payload["timestamp"] = signal_timestamp.astimezone(IST).isoformat()
         if price:
             payload["price"] = price
 
@@ -284,14 +321,31 @@ class StrategyEngine:
 
     def status(self) -> dict[str, Any]:
         feed = get_feed()
+        candles, current_bar_in_progress = feed.candle_snapshot()
+        current_values: Optional[dict[str, Any]] = None
+        current_conditions: Optional[dict[str, bool]] = None
+        current_bar_at = candles[-1]["time"] if candles else None
+        if len(candles) >= required_bars():
+            try:
+                current_verdict = strategy.evaluate(candles, strategy_params())
+            except strategy.InsufficientData:
+                pass
+            else:
+                current_values = current_verdict.values
+                current_conditions = current_verdict.conditions
         market = market_status()
         with self._lock:
             payload = self.state.to_dict()
         payload["feed"] = feed.status()
+        payload["current_values"] = current_values
+        payload["current_conditions"] = current_conditions
+        payload["current_bar_at"] = current_bar_at
+        payload["current_bar_in_progress"] = current_bar_in_progress
         payload["market"] = market
         payload["execution_symbol"] = get_order_manager().current_symbol()
-        payload["mode"] = get_execution_mode()
-        payload["will_execute"] = bool(market["is_open"])
+        mode = get_execution_mode()
+        payload["mode"] = mode
+        payload["will_execute"] = bool(market["is_open"] or mode == PAPER)
         payload["paused"] = get_order_manager().paused
         return payload
 

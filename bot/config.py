@@ -68,8 +68,8 @@ class Settings:
     # --- Execution --------------------------------------------------------
     execution_mode: str = _env("EXECUTION_MODE", PAPER).upper()
     default_lots: int = _env_int("DEFAULT_LOTS", 1)
-    lot_size: int = _env_int("NIFTY_LOT_SIZE", 75)
-    virtual_balance: float = _env_float("VIRTUAL_BALANCE", 1_000_000.0)
+    lot_size: int = _env_int("NIFTY_LOT_SIZE", 65)
+    virtual_balance: float = _env_float("VIRTUAL_BALANCE", 200_000.0)
     max_open_lots: int = _env_int("MAX_OPEN_LOTS", 4)
     slippage_ticks: float = _env_float("SLIPPAGE_TICKS", 1.0)
     tick_size: float = _env_float("TICK_SIZE", 0.05)
@@ -83,11 +83,7 @@ class Settings:
     http_timeout_seconds: float = _env_float("HTTP_TIMEOUT_SECONDS", 4.0)
 
     # --- Strategy (st.pine) ----------------------------------------------
-    # The engine evaluates these entry filters itself on GIFT Nifty candles.
-    strategy_rsi_length: int = _env_int("STRATEGY_RSI_LENGTH", 14)
-    strategy_rsi_buy_max: float = _env_float("STRATEGY_RSI_BUY_MAX", 20.0)
-    strategy_rsi_sell_min: float = _env_float("STRATEGY_RSI_SELL_MIN", 80.0)
-    strategy_tsv_length: int = _env_int("STRATEGY_TSV_LENGTH", 13)
+    # The engine evaluates the SuperTrend and PSAR entry filters on GIFT Nifty candles.
     strategy_st_min_agree: int = _env_int("STRATEGY_ST_MIN_AGREE", 2)
     strategy_psar_start: float = _env_float("STRATEGY_PSAR_START", 0.02)
     strategy_psar_increment: float = _env_float("STRATEGY_PSAR_INCREMENT", 0.02)
@@ -140,10 +136,6 @@ def set_execution_mode(mode: str) -> str:
 def strategy_params() -> dict[str, float]:
     """Indicator parameters for :mod:`strategy`, sourced from the environment."""
     return {
-        "rsi_length": settings.strategy_rsi_length,
-        "rsi_buy_max": settings.strategy_rsi_buy_max,
-        "rsi_sell_min": settings.strategy_rsi_sell_min,
-        "tsv_length": settings.strategy_tsv_length,
         "st_min_agree": settings.strategy_st_min_agree,
         "psar_start": settings.strategy_psar_start,
         "psar_increment": settings.strategy_psar_increment,

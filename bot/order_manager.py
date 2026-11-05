@@ -137,6 +137,12 @@ class OrderManager:
     def _price(
         self, symbol: str, payload: dict[str, Any], allow_payload_price: bool
     ) -> Optional[float]:
+        if allow_payload_price and payload.get("paper_after_hours") is True:
+            try:
+                price = float(payload.get("price"))
+            except (TypeError, ValueError):
+                return None
+            return price if price > 0 else None
         ltp = self.client.get_ltp(symbol)
         if ltp:
             return float(ltp)
@@ -264,7 +270,16 @@ class OrderManager:
         if signal_id and self._already_processed(signal_id, mode):
             return reject(f"Duplicate signal_id {signal_id}")
 
-        if action not in {FLAT, PANIC} and not is_market_open():
+        after_hours_paper_engine_signal = (
+            mode == PAPER
+            and source == "ENGINE"
+            and payload.get("paper_after_hours") is True
+        )
+        if (
+            action not in {FLAT, PANIC}
+            and not is_market_open()
+            and not after_hours_paper_engine_signal
+        ):
             return reject(f"Outside market hours ({market_status()['reason']})")
 
         age = _signal_age_seconds(payload)
@@ -571,7 +586,34 @@ class OrderManager:
     # -- valuation -------------------------------------------------------
     def price_map(self) -> dict[str, float]:
         prices: dict[str, float] = {}
-        for pos in db.get_open_positions():
+        positions = db.get_open_positions()
+        market_open = is_market_open()
+        gift_price: Optional[float] = None
+        if not market_open and any(
+            pos["mode"] == PAPER and pos["source"] == "ENGINE" for pos in positions
+        ):
+            from gift_nifty import get_feed
+
+            feed = get_feed().status()
+            candidate = feed.get("last_price")
+            if candidate is None:
+                candidate = feed.get("last_candle_close")
+            try:
+                parsed_price = float(candidate)
+            except (TypeError, ValueError):
+                parsed_price = 0.0
+            if parsed_price > 0:
+                gift_price = parsed_price
+
+        for pos in positions:
+            if (
+                gift_price is not None
+                and not market_open
+                and pos["mode"] == PAPER
+                and pos["source"] == "ENGINE"
+            ):
+                prices[pos["symbol"]] = gift_price
+                continue
             ltp = self.client.get_ltp(pos["symbol"])
             if ltp:
                 prices[pos["symbol"]] = ltp

@@ -161,7 +161,7 @@
         <div class="card-sm">
           <p class="metric-label">Current signal</p>
           <p id="e-signal" class="mt-1 text-2xl font-bold text-white">—</p>
-          <div class="warmup-track mt-2" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="20" aria-valuenow="0">
+          <div class="warmup-track mt-2" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="12" aria-valuenow="0">
             <div id="warmup-progress" class="warmup-progress"></div>
           </div>
           <p id="e-signal-sub" class="metric-sub">Waiting for candles…</p>
@@ -169,6 +169,7 @@
         <div class="card-sm">
           <p class="metric-label">GIFT Nifty · signal source</p>
           <p id="e-gift-price" class="mt-1 text-xl font-semibold tabular-nums text-white">—</p>
+          <p id="e-gift-timestamp" class="metric-sub">Last tick —</p>
           <p id="e-gift-sub" class="metric-sub">—</p>
         </div>
         <div class="card-sm">
@@ -180,11 +181,19 @@
 
       <div class="mt-5">
         <h3 class="section-title mb-2">Latest indicator values</h3>
-        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <div class="card-sm"><p class="metric-label">RSI · 14</p><p id="e-rsi" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-rsi-sub" class="metric-sub">BUY &lt;20 · SELL &gt;80</p></div>
-          <div class="card-sm"><p class="metric-label">TSV · 13</p><p id="e-tsv" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-tsv-sub" class="metric-sub">BUY &gt;0 · SELL &lt;0</p></div>
-          <div class="card-sm"><p class="metric-label">Parabolic SAR</p><p id="e-psar" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-psar-sub" class="metric-sub">Price above / below</p></div>
-          <div class="card-sm"><p class="metric-label">SuperTrend vote</p><p id="e-st" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-st-sub" class="metric-sub">2 of 3 must agree</p></div>
+        <div class="grid grid-cols-2 gap-3">
+          <div class="card-sm">
+            <p class="metric-label">Parabolic SAR</p>
+            <p id="e-psar" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
+            <p id="e-psar-time" class="metric-sub">Timestamp unavailable</p>
+            <p id="e-psar-sub" class="metric-sub">Price above / below</p>
+          </div>
+          <div class="card-sm">
+            <p class="metric-label">SuperTrend vote</p>
+            <p id="e-st" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
+            <p id="e-st-time" class="metric-sub">Timestamp unavailable</p>
+            <p id="e-st-sub" class="metric-sub">2 of 3 must agree</p>
+          </div>
         </div>
       </div>
     </div>
@@ -194,7 +203,7 @@
         <p class="metric-label">Active strategy</p>
         <h2 class="mt-1 text-xl font-semibold text-white">Surikbs · GIFT Nifty signal</h2>
         <p class="mt-1 text-sm text-slate-400">
-          Every completed 5-minute GIFT candle is checked. All four entry checks must pass.
+          Every completed 5-minute GIFT candle is checked. Both entry checks must pass.
           Signals come from GIFT Nifty; orders use the front-month Nifty future.
         </p>
       </div>
@@ -208,31 +217,27 @@
           <section class="strategy-rule strategy-rule-buy">
             <div class="flex items-center justify-between gap-2">
               <h4 class="text-base font-bold text-emerald-300">BUY</h4>
-              <span class="text-xs text-slate-400">All 4 checks required</span>
+              <span class="text-xs text-slate-400">Both checks required</span>
             </div>
             <ul class="strategy-rule-list">
               <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bullish</li>
-              <li><strong>RSI(14):</strong> below 20</li>
-              <li><strong>TSV(13):</strong> above 0</li>
               <li><strong>PSAR:</strong> candle close above Parabolic SAR</li>
             </ul>
           </section>
           <section class="strategy-rule strategy-rule-sell">
             <div class="flex items-center justify-between gap-2">
               <h4 class="text-base font-bold text-rose-300">SELL</h4>
-              <span class="text-xs text-slate-400">All 4 checks required</span>
+              <span class="text-xs text-slate-400">Both checks required</span>
             </div>
             <ul class="strategy-rule-list">
               <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bearish</li>
-              <li><strong>RSI(14):</strong> above 80</li>
-              <li><strong>TSV(13):</strong> below 0</li>
               <li><strong>PSAR:</strong> candle close below Parabolic SAR</li>
             </ul>
           </section>
         </div>
         <p class="mt-2 text-xs text-slate-500">
           SuperTrends use ATR length × multiplier 10×1, 11×2, and 12×3.
-          TSV uses the bot's tick-count volume proxy.
+          SuperTrend needs 12 candles to initialize; signals are evaluated on each later candle close.
         </p>
       </div>
 
@@ -247,7 +252,7 @@
       </div>
 
       <p class="mt-4 border-t border-edge pt-3 text-xs leading-5 text-slate-500">
-        A signal fires on the first closed candle where all four checks agree. The bot does not repeat entries
+        A signal fires on the first closed candle where both checks agree. The bot does not repeat entries
         while that condition remains true. Exits are on an opposite signal or manual; there is no stop-loss
         or profit target. The Pine script's custom SuperTrend/divergence visuals are not entry filters.
       </p>
@@ -346,6 +351,6 @@
 
 <div id="toast" class="pointer-events-none fixed bottom-6 right-6 z-50 hidden max-w-sm rounded-xl border px-4 py-3 text-sm shadow-xl"></div>
 
-<script src="/static/app.js?v=compact-controls-2" defer></script>
+<script src="/static/app.js?v=indicator-timestamps-1" defer></script>
 </body>
 </html>
