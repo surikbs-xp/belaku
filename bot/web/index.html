@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GIFT Nifty Execution Desk</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          ink:   { 950: '#080b14', 900: '#0d1220', 850: '#121a2c', 800: '#1a2438', 700: '#243049' },
+          edge:  '#1e293b',
+          good:  '#10b981',
+          bad:   '#f43f5e',
+          warn:  '#f59e0b',
+          brand: '#38bdf8',
+        },
+        fontFamily: {
+          mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+<link rel="stylesheet" href="/static/styles.css?v=compact-controls-2" />
+</head>
+
+<body class="bg-ink-950 text-slate-200 antialiased">
+<div class="mx-auto max-w-[1600px] px-4 py-5 lg:px-8">
+
+  <!-- ── Header ─────────────────────────────────────────────────────── -->
+  <header class="mb-6 flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+    <div class="flex items-center gap-3">
+      <div class="grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-brand to-indigo-500 text-lg font-bold text-ink-950">S</div>
+      <div>
+        <h1 class="text-xl font-semibold tracking-tight text-white">GIFT Nifty Execution Desk</h1>
+        <p class="text-sm text-slate-400">
+          <span id="hdr-symbol" class="font-mono text-slate-300">—</span>
+          <span class="mx-1.5 text-slate-600">·</span>
+          <span id="hdr-market">—</span>
+        </p>
+      </div>
+    </div>
+
+    <div class="header-tools">
+      <div class="header-control-row">
+        <button id="btn-mode-toggle" class="mode-toggle mode-toggle-compact" type="button" role="switch" aria-label="Execution mode" aria-describedby="mode-note" aria-checked="false" disabled>
+          <span class="mode-switch-track"><span class="mode-switch-thumb"></span></span>
+          <span class="mode-toggle-copy">
+            <strong id="mode-toggle-label">PAPER</strong>
+            <small id="mode-toggle-caption">Switch to Live</small>
+          </span>
+        </button>
+        <div class="header-connection">
+          <span id="kite-note" class="header-kite-note text-xs">Checking Kite…</span>
+          <button id="btn-kite-login" class="btn btn-neutral header-control-button" title="Connect or refresh Kite login">Connect</button>
+          <button id="btn-feed-reconnect" class="btn btn-neutral header-control-button hidden" title="Reconnect GIFT market data">Reconnect</button>
+        </div>
+        <button id="btn-pause" class="btn btn-neutral header-control-button">Pause</button>
+        <button id="btn-panic" class="btn btn-danger header-control-button" title="Emergency square-off all open positions">Square off</button>
+      </div>
+      <div class="header-status-row">
+        <span id="pill-market" class="pill pill-idle">Market —</span>
+        <span id="pill-feed" class="pill pill-idle">GIFT —</span>
+        <span id="pill-loop" class="pill pill-idle">Loop —</span>
+      </div>
+      <div id="kite-manual" class="header-manual hidden">
+        <input id="kite-token" type="text" class="field" placeholder="Paste request_token from the redirect URL" />
+        <button id="btn-kite-submit" class="btn btn-neutral header-control-button">Submit token</button>
+      </div>
+      <p id="mode-note" class="sr-only">Paper mode simulates orders. Live mode places real orders.</p>
+      <p id="action-status" class="header-action-status"></p>
+    </div>
+  </header>
+
+  <!-- ── Paused banner ──────────────────────────────────────────────── -->
+  <div id="paused-banner" class="mb-5 hidden items-center justify-between gap-4 rounded-xl border border-warn/40 bg-warn/10 px-4 py-3">
+    <div class="flex items-center gap-3 text-sm">
+      <span class="text-lg">⏸</span>
+      <div>
+        <p class="font-semibold text-warn">Strategy paused</p>
+        <p class="text-slate-400">New BUY/SELL entries are blocked. Exits still work.</p>
+      </div>
+    </div>
+    <button id="btn-resume" class="rounded-lg border border-warn/50 bg-warn/20 px-3 py-1.5 text-sm font-medium text-warn transition hover:bg-warn/30">
+      Resume strategy
+    </button>
+  </div>
+
+  <!-- ── Tabs ───────────────────────────────────────────────────────── -->
+  <nav class="mb-5 flex gap-1 rounded-xl border border-edge bg-ink-900/60 p-1" role="tablist">
+    <button class="tab tab-active" data-tab="monitor"   role="tab">Dashboard</button>
+    <button class="tab"            data-tab="orders"    role="tab">Orders &amp; signals</button>
+    <button class="tab"            data-tab="analytics" role="tab">Performance &amp; trades</button>
+  </nav>
+
+  <!-- ── View 1: Dashboard Monitor ──────────────────────────────────── -->
+  <section id="view-monitor" class="view">
+    <div class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <article class="card">
+        <p class="metric-label">Portfolio value</p>
+        <p id="m-equity" class="metric-value">—</p>
+        <p id="m-equity-sub" class="metric-sub">—</p>
+      </article>
+      <article class="card">
+        <p class="metric-label">Margin available</p>
+        <p id="m-margin" class="metric-value">—</p>
+        <div class="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-ink-700">
+          <div id="m-margin-bar" class="h-full rounded-full bg-brand transition-all duration-500" style="width:0%"></div>
+        </div>
+        <p id="m-margin-sub" class="metric-sub">—</p>
+      </article>
+      <article class="card">
+        <p class="metric-label">Active mode</p>
+        <p id="m-mode" class="metric-value">—</p>
+        <div class="mt-2"><span id="m-mode-pill" class="pill pill-idle">—</span></div>
+      </article>
+      <article class="card">
+        <p class="metric-label">Real-time PnL</p>
+        <p id="m-pnl" class="metric-value">—</p>
+        <p id="m-pnl-sub" class="metric-sub">—</p>
+      </article>
+    </div>
+
+    <div class="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-5">
+      <div class="card-sm"><p class="metric-label">Realised today</p><p id="m-today" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Unrealised</p><p id="m-unreal" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Net realised</p><p id="m-realised" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Win rate</p><p id="m-winrate" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Profit factor</p><p id="m-pf" class="text-lg font-semibold tabular-nums">—</p></div>
+    </div>
+
+    <div class="mt-4">
+      <div class="card">
+        <div class="mb-3 flex items-center justify-between">
+          <h2 class="section-title">Open positions</h2>
+          <span id="pos-count" class="text-xs text-slate-400">—</span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">LTP</th><th class="num">PnL</th><th>Mode</th></tr>
+            </thead>
+            <tbody id="positions-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <h2 class="section-title">Live values</h2>
+        <span id="pill-signal" class="pill pill-idle">Warming up</span>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div class="card-sm">
+          <p class="metric-label">Current signal</p>
+          <p id="e-signal" class="mt-1 text-2xl font-bold text-white">—</p>
+          <div class="warmup-track mt-2" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="20" aria-valuenow="0">
+            <div id="warmup-progress" class="warmup-progress"></div>
+          </div>
+          <p id="e-signal-sub" class="metric-sub">Waiting for candles…</p>
+        </div>
+        <div class="card-sm">
+          <p class="metric-label">GIFT Nifty · signal source</p>
+          <p id="e-gift-price" class="mt-1 text-xl font-semibold tabular-nums text-white">—</p>
+          <p id="e-gift-sub" class="metric-sub">—</p>
+        </div>
+        <div class="card-sm">
+          <p class="metric-label">Nifty future · execution</p>
+          <p id="e-exec" class="mt-1 text-lg font-semibold font-mono text-white">—</p>
+          <p id="e-exec-sub" class="metric-sub">—</p>
+        </div>
+      </div>
+
+      <div class="mt-5">
+        <h3 class="section-title mb-2">Latest indicator values</h3>
+        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div class="card-sm"><p class="metric-label">RSI · 14</p><p id="e-rsi" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-rsi-sub" class="metric-sub">BUY &lt;20 · SELL &gt;80</p></div>
+          <div class="card-sm"><p class="metric-label">TSV · 13</p><p id="e-tsv" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-tsv-sub" class="metric-sub">BUY &gt;0 · SELL &lt;0</p></div>
+          <div class="card-sm"><p class="metric-label">Parabolic SAR</p><p id="e-psar" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-psar-sub" class="metric-sub">Price above / below</p></div>
+          <div class="card-sm"><p class="metric-label">SuperTrend vote</p><p id="e-st" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p><p id="e-st-sub" class="metric-sub">2 of 3 must agree</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-4 card">
+      <div class="mb-4">
+        <p class="metric-label">Active strategy</p>
+        <h2 class="mt-1 text-xl font-semibold text-white">Surikbs · GIFT Nifty signal</h2>
+        <p class="mt-1 text-sm text-slate-400">
+          Every completed 5-minute GIFT candle is checked. All four entry checks must pass.
+          Signals come from GIFT Nifty; orders use the front-month Nifty future.
+        </p>
+      </div>
+
+      <div>
+        <div class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+          <h3 class="section-title">Entry rules</h3>
+          <span class="text-xs text-slate-500">No EMA 200 filter</span>
+        </div>
+        <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <section class="strategy-rule strategy-rule-buy">
+            <div class="flex items-center justify-between gap-2">
+              <h4 class="text-base font-bold text-emerald-300">BUY</h4>
+              <span class="text-xs text-slate-400">All 4 checks required</span>
+            </div>
+            <ul class="strategy-rule-list">
+              <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bullish</li>
+              <li><strong>RSI(14):</strong> below 20</li>
+              <li><strong>TSV(13):</strong> above 0</li>
+              <li><strong>PSAR:</strong> candle close above Parabolic SAR</li>
+            </ul>
+          </section>
+          <section class="strategy-rule strategy-rule-sell">
+            <div class="flex items-center justify-between gap-2">
+              <h4 class="text-base font-bold text-rose-300">SELL</h4>
+              <span class="text-xs text-slate-400">All 4 checks required</span>
+            </div>
+            <ul class="strategy-rule-list">
+              <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bearish</li>
+              <li><strong>RSI(14):</strong> above 80</li>
+              <li><strong>TSV(13):</strong> below 0</li>
+              <li><strong>PSAR:</strong> candle close below Parabolic SAR</li>
+            </ul>
+          </section>
+        </div>
+        <p class="mt-2 text-xs text-slate-500">
+          SuperTrends use ATR length × multiplier 10×1, 11×2, and 12×3.
+          TSV uses the bot's tick-count volume proxy.
+        </p>
+      </div>
+
+      <div class="mt-5">
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+          <h3 class="section-title">Live rule checks</h3>
+          <p id="e-counters" class="text-xs text-slate-500">—</p>
+        </div>
+        <div id="conditions" class="mt-2 grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <p class="text-sm text-amber-300">Collecting closed candles before evaluating the rules.</p>
+        </div>
+      </div>
+
+      <p class="mt-4 border-t border-edge pt-3 text-xs leading-5 text-slate-500">
+        A signal fires on the first closed candle where all four checks agree. The bot does not repeat entries
+        while that condition remains true. Exits are on an opposite signal or manual; there is no stop-loss
+        or profit target. The Pine script's custom SuperTrend/divergence visuals are not entry filters.
+      </p>
+    </div>
+
+  </section>
+
+  <!-- ── View 2: Order Logs ─────────────────────────────────────────── -->
+  <section id="view-orders" class="view hidden">
+    <div class="card">
+      <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 class="section-title">Order book</h2>
+          <p id="orders-caption" class="text-xs text-slate-400">—</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <input id="orders-search" type="search" placeholder="Search symbol, status, order id…" class="field w-64" />
+          <select id="orders-mode" class="field w-32">
+            <option value="">All modes</option>
+            <option value="PAPER">Paper</option>
+            <option value="LIVE">Live</option>
+          </select>
+          <button id="btn-orders-csv" class="btn btn-neutral">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="table-wrap max-h-[65vh]">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th><th>Symbol</th><th>Action</th><th class="num">Qty</th>
+              <th class="num">Price</th><th>Status</th><th>Mode</th><th>Source</th><th>Order ID</th><th>Note</th>
+            </tr>
+          </thead>
+          <tbody id="orders-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card mt-4">
+      <h2 class="section-title mb-3">Engine signals</h2>
+      <p class="mb-3 text-xs text-slate-400">
+        Every st.pine evaluation that produced an action, and why it was placed,
+        blocked or deferred.
+      </p>
+      <div class="table-wrap max-h-[35vh]">
+        <table class="data-table">
+          <thead><tr><th>Timestamp</th><th>Action</th><th>Placed</th><th>Reason</th><th>Detail</th></tr></thead>
+          <tbody id="signals-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── View 3: Performance ────────────────────────────────────────── -->
+  <section id="view-analytics" class="view hidden">
+    <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div class="card-sm"><p class="metric-label">Net profit</p><p id="a-net" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Total return</p><p id="a-return" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Max drawdown</p><p id="a-dd" class="text-lg font-semibold tabular-nums">—</p></div>
+      <div class="card-sm"><p class="metric-label">Trades</p><p id="a-trades" class="text-lg font-semibold tabular-nums">—</p></div>
+    </div>
+
+    <div class="card mt-4">
+      <h2 class="section-title mb-3">Trade ledger</h2>
+      <div class="table-wrap max-h-[45vh]">
+        <table class="data-table">
+          <thead>
+            <tr><th>Closed</th><th>Symbol</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Exit</th><th class="num">Gross</th><th class="num">Fees</th><th class="num">Net</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="trades-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Footer ─────────────────────────────────────────────────────── -->
+  <footer class="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+    <span id="footer-left">Connecting…</span>
+    <span id="footer-right">—</span>
+  </footer>
+</div>
+
+<!-- ── Confirm dialog ───────────────────────────────────────────────── -->
+<div id="modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/70 p-4">
+  <div class="w-full max-w-md rounded-2xl border border-edge bg-ink-900 p-6 shadow-2xl">
+    <h3 id="modal-title" class="text-lg font-semibold text-white">Confirm</h3>
+    <p id="modal-body" class="mt-2 text-sm text-slate-400"></p>
+    <div class="mt-5 flex justify-end gap-2">
+      <button id="modal-cancel" class="btn btn-neutral">Cancel</button>
+      <button id="modal-ok" class="btn btn-danger">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="pointer-events-none fixed bottom-6 right-6 z-50 hidden max-w-sm rounded-xl border px-4 py-3 text-sm shadow-xl"></div>
+
+<script src="/static/app.js?v=compact-controls-2" defer></script>
+</body>
+</html>

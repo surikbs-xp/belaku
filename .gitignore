@@ -1,0 +1,17 @@
+__pycache__
+.pytest_cache/
+.venv/
+
+# Real credentials. Note `*.env` does NOT match `.env.example`, so the
+# template stays committable while actual secrets stay out of git.
+*.env*s
+.env.*
+!.env.example
+!bot/.env.example
+
+# Runtime state
+paper_trading.db
+paper_trading.db-shm
+paper_trading.db-wal
+*.sqlite
+*.sqlite3
