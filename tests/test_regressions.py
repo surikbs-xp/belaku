@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import logging
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -29,82 +30,56 @@ def use_test_database(monkeypatch, tmp_path) -> None:
     db.init_db()
 
 
-def test_atr_matches_pine_seeding() -> None:
-    assert strategy.atr(
-        [10.0, 12.0, 14.0],
-        [8.0, 9.0, 11.0],
-        [9.0, 11.0, 13.0],
-        2,
-    ) == [None, 2.5, 2.75]
+def test_bot_configures_a_rotating_file_handler(monkeypatch, tmp_path) -> None:
+    root = logging.getLogger()
+    existing_handlers = list(root.handlers)
+    original_level = root.level
+    log_file = tmp_path / "bot.log"
+    monkeypatch.setattr(bot_app, "LOG_FILE", log_file)
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
+
+    try:
+        bot_app._configure_logging()
+        logging.getLogger("bot.test").info("indicator snapshot to rotating file")
+        file_handler = next(
+            handler
+            for handler in root.handlers
+            if isinstance(handler, bot_app.RotatingFileHandler)
+            and handler.baseFilename == str(log_file)
+        )
+        file_handler.flush()
+
+        assert "indicator snapshot to rotating file" in log_file.read_text()
+    finally:
+        for handler in list(root.handlers):
+            if handler not in existing_handlers:
+                root.removeHandler(handler)
+                handler.close()
+        root.setLevel(original_level)
 
 
-def test_rsi_uses_wilder_smoothing() -> None:
-    values = strategy.rsi([100.0, 102.0, 101.0, 103.0], length=2)
-
-    assert values[:2] == [None, None]
-    assert values[2] == pytest.approx(200 / 3)
-    assert values[3] == pytest.approx(600 / 7)
-
-
-def test_tsv_sums_close_change_weighted_by_volume() -> None:
-    values = strategy.tsv(
-        [100.0, 102.0, 101.0, 104.0],
-        [1.0, 2.0, 3.0, 4.0],
-        length=2,
-    )
-
-    assert values == [None, None, 1.0, 9.0]
-
-
-def test_psar_initializes_direction_from_first_close_change() -> None:
-    highs = [10.0, 9.0, 8.0]
-    lows = [8.0, 7.0, 6.0]
-    closes = [9.0, 8.0, 7.0]
-
-    assert strategy.psar(highs, lows, closes)[1] == 10.0
-
-
-def test_supertrend_starts_bearish_when_first_atr_becomes_available() -> None:
-    highs = [10.0, 20.0]
-    lows = [9.0, 10.0]
-    closes = [9.5, 20.0]
-
-    line, direction = strategy.supertrend(highs, lows, closes, factor=0.1, length=2)
-
-    assert direction == [0, 1]
-    assert line[1] == 15.575
-
-
-def test_strategy_signals_require_rsi_tsv_supertrend_history() -> None:
+def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
     candles = [
         {
-            "open": 100.0 + index,
             "high": 101.0 + index,
             "low": 99.0 + index,
             "close": 100.0 + index,
-            "volume": 100.0,
         }
-        for index in range(20)
+        for index in range(13)
     ]
 
-    assert engine.required_bars() == 15
-    with pytest.raises(strategy.InsufficientData, match="need 15 closed candles"):
-        strategy.evaluate(candles[:14])
+    assert engine.required_bars() == 13
+    with pytest.raises(strategy.InsufficientData, match="need 13 closed candles"):
+        strategy.evaluate(candles[:12])
 
-    verdict = strategy.evaluate(candles[:15])
+    verdict = strategy.evaluate(candles)
     assert set(verdict.conditions) == {
         "buy_supertrend",
-        "buy_rsi",
-        "buy_tsv",
         "buy_psar",
         "sell_supertrend",
-        "sell_rsi",
-        "sell_tsv",
         "sell_psar",
     }
     assert set(verdict.values) == {
-        "rsi",
-        "tsv",
         "psar",
         "supertrend_bull",
         "supertrend_bear",
@@ -112,12 +87,12 @@ def test_strategy_signals_require_rsi_tsv_supertrend_history() -> None:
         "st_11_2",
         "st_12_3",
     }
-    assert verdict.values["rsi"] == 100.0
-    assert verdict.values["tsv"] > 0
-    assert not verdict.conditions["buy_rsi"]
-    assert verdict.conditions["buy_tsv"]
-    assert verdict.conditions["sell_rsi"]
-    assert not verdict.conditions["sell_tsv"]
+    assert isinstance(verdict.values["psar"], float)
+    assert all(
+        isinstance(verdict.values[key], float)
+        for key in ("st_10_1", "st_11_2", "st_12_3")
+    )
+    assert verdict.values["supertrend_bull"] + verdict.values["supertrend_bear"] == 3
 
 
 def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
@@ -144,6 +119,57 @@ def test_candle_snapshot_includes_forming_candle() -> None:
     assert len(candles) == 1
     assert candles[0]["close"] == 100.0
     assert candles[0]["ticks"] == 1
+
+
+def test_feed_resumes_persisted_partial_candle_without_duplicate(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    class FixedDateTime(datetime):
+        current = datetime(2026, 11, 6, 6, 4, tzinfo=IST)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    start = gift_nifty.bucket_start(FixedDateTime.current, 300)
+    db.record_gift_candle(
+        start=start.isoformat(timespec="seconds"),
+        open_=100.0,
+        high=102.0,
+        low=99.0,
+        close=101.0,
+        volume=5.0,
+        ticks=5,
+    )
+    monkeypatch.setattr(gift_nifty, "datetime", FixedDateTime)
+
+    feed = GiftNiftyFeed("5minute")
+    assert feed.load_persisted() == 1
+    assert feed.candles() == []
+    assert feed.candle_snapshot() == ([], False)
+
+    feed._handle_ticks(None, [{"last_price": 103.0}])
+    snapshot, in_progress = feed.candle_snapshot()
+    assert in_progress
+    assert len(snapshot) == 1
+    assert snapshot[0] == {
+        "time": start.isoformat(timespec="seconds"),
+        "open": 100.0,
+        "high": 103.0,
+        "low": 99.0,
+        "close": 103.0,
+        "volume": 6.0,
+        "ticks": 6,
+    }
+
+    FixedDateTime.current = datetime(2026, 11, 6, 6, 5, tzinfo=IST)
+    feed._handle_ticks(None, [{"last_price": 104.0}])
+    closed = feed.candles()
+    snapshot, in_progress = feed.candle_snapshot()
+    assert len(closed) == 1
+    assert closed[0]["time"] == start.isoformat(timespec="seconds")
+    assert len(snapshot) == 2
+    assert snapshot[0]["time"] != snapshot[1]["time"]
+    assert in_progress
 
 
 def test_feed_status_exposes_last_candle_as_source_fallback() -> None:
@@ -279,6 +305,48 @@ def test_engine_waits_for_a_transition_after_startup(monkeypatch) -> None:
     feed.rows.append({"time": "2026-11-05T22:20:00+05:30"})
     assert runner.evaluate_now()["action"] == "SELL"
     assert actions == ["SELL"]
+
+
+def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog) -> None:
+    class FakeFeed:
+        seconds = 300
+
+        def candles(self):
+            return [{
+                "time": "2026-11-05T22:10:00+05:30",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+            }]
+
+    monkeypatch.setattr(engine, "get_feed", FakeFeed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(
+        engine.strategy,
+        "evaluate",
+        lambda *_args: strategy.StrategyVerdict(
+            strategy.NEUTRAL,
+            100.5,
+            values={"psar": 98.75, "st_10_1": 99.25},
+        ),
+    )
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+    caplog.set_level("INFO", logger="engine")
+
+    engine.StrategyEngine().evaluate_now()
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if record.name == "engine" and "Indicator values" in record.message
+    )
+    assert "source=NSEIX:GIFT NIFTY" in message
+    assert "interval_seconds=300" in message
+    assert "candle_at=2026-11-05T22:10:00+05:30" in message
+    assert '"close": 100.5' in message
+    assert '"psar": 98.75' in message
+    assert '"st_10_1": 99.25' in message
 
 
 def test_engine_reverses_opposing_paper_position_on_startup(monkeypatch) -> None:

@@ -18,6 +18,7 @@ deferred LIVE signal is never auto-executed later.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -27,7 +28,7 @@ from typing import Any, Optional
 import database as db
 import strategy
 from config import PAPER, get_execution_mode, settings, strategy_params
-from gift_nifty import get_feed
+from gift_nifty import GIFT_KEY, get_feed
 from kite_client import IST, get_client, market_status
 from order_manager import BUY, SELL, get_order_manager
 
@@ -85,12 +86,7 @@ class EngineState:
 
 def required_bars() -> int:
     """Bars ``strategy.evaluate`` needs before it will produce a verdict."""
-    params = {**strategy.DEFAULTS, **strategy_params()}
-    return max(
-        max(length for _, length in strategy.SUPERTRENDS),
-        int(params["rsi_length"]) + 1,
-        int(params["tsv_length"]) + 1,
-    )
+    return max(max(length for _, length in strategy.SUPERTRENDS) + 1, 2)
 
 
 class StrategyEngine:
@@ -163,6 +159,22 @@ class StrategyEngine:
                 self.state.ready = False
                 self.state.last_error = str(exc)
             return {"ok": False, "reason": f"insufficient history: {exc}"}
+
+        last_candle = candles[-1]
+        ohlc = {
+            key: last_candle.get(key)
+            for key in ("open", "high", "low", "close")
+        }
+        log.info(
+            "Indicator values source=%s interval_seconds=%s candle_at=%s "
+            "ohlc=%s indicators=%s signal=%s",
+            GIFT_KEY,
+            feed.seconds,
+            newest,
+            json.dumps(ohlc, sort_keys=True),
+            json.dumps(verdict.values, sort_keys=True),
+            verdict.signal,
+        )
 
         with self._lock:
             self.state.ready = True

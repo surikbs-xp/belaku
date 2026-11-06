@@ -1,37 +1,27 @@
-"""Surikbs entry filter - a faithful port of the ``st.pine`` strategy block.
+"""Surikbs entry rules based on the SuperTrend and PSAR sections of ``st.pine``.
 
-The Pine script only fires ``strategy.entry`` when all four entry filters agree
-(st.pine sections 11-14)::
+The Pine script only fires ``strategy.entry`` when both entry rules agree::
 
     buyST   = strategyBullCount >= 2          # triple SuperTrend (10,1) (11,2) (12,3)
-    buyRSI  = ta.rsi(close, 14) < 20
-    buyTSV  = sum((close - close[1]) * volume, 13) > 0
     buyPSAR = close > ta.sar(0.02, 0.02, 0.2)
 
-    longCondition  = buyST and buyRSI and buyTSV and buyPSAR
-    shortCondition = sellST and sellRSI and sellTSV and sellPSAR
+    longCondition  = buyST and buyPSAR
+    shortCondition = sellST and sellPSAR
     buySignal      = barstate.isconfirmed and longCondition and not longCondition[1]
 
-This module is the strategy: :mod:`engine` feeds it GIFT Nifty candles built
-from live ticks and acts on the verdict. There is no external signal source to
-reconcile against.
-
-The indicator maths is implemented here with the same semantics as Pine:
-
-* ``ta.sar``   -> Wilder's parabolic SAR with Pine's 2-bar flip rule.
-* ``ta.supertrend`` -> classic SuperTrend, direction negative = bullish.
-* ``ta.rsi``   -> Wilder smoothing with an SMA seed.
-* ``TSV``      -> Pine's rolling close-change × volume approximation.
+This module applies the strategy rules to actual GIFT Nifty candles using
+``pandas-ta`` for indicator calculations. It does not synthesize candles;
+order signals still use completed bars only.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Sequence
 
-log = logging.getLogger("strategy")
+import pandas as pd
+import pandas_ta as ta
 
 BULL = "BULL"
 BEAR = "BEAR"
@@ -43,10 +33,6 @@ DEFAULTS: dict[str, float] = {
     "psar_increment": 0.02,
     "psar_maximum": 0.2,
     "st_min_agree": 2,
-    "rsi_length": 14,
-    "rsi_buy_max": 20.0,
-    "rsi_sell_min": 80.0,
-    "tsv_length": 13,
 }
 
 # Triple SuperTrend (factor, atr_length) as configured in st.pine section 10.
@@ -60,99 +46,12 @@ class InsufficientData(RuntimeError):
 # ---------------------------------------------------------------------------
 # Indicators
 # ---------------------------------------------------------------------------
-def sma(values: Sequence[float], length: int) -> list[Optional[float]]:
-    if length <= 0:
-        raise ValueError("length must be positive")
-    out: list[Optional[float]] = [None] * len(values)
-    running = 0.0
-    for i, value in enumerate(values):
-        running += value
-        if i >= length:
-            running -= values[i - length]
-        if i >= length - 1:
-            out[i] = running / length
-    return out
+def _indicator_series(values: Sequence[float]) -> pd.Series:
+    return pd.Series(values, dtype="float64")
 
 
-def atr(
-    highs: Sequence[float],
-    lows: Sequence[float],
-    closes: Sequence[float],
-    length: int,
-) -> list[Optional[float]]:
-    """Wilder's ATR as used by ``ta.atr``."""
-    n = len(closes)
-    out: list[Optional[float]] = [None] * n
-    if length <= 0 or n < length:
-        return out
-    trs: list[float] = [0.0] * n
-    for i in range(n):
-        if i == 0:
-            trs[i] = highs[i] - lows[i]
-        else:
-            trs[i] = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-    seed = sum(trs[:length]) / length
-    out[length - 1] = seed
-    prev = seed
-    for i in range(length, n):
-        prev = (prev * (length - 1) + trs[i]) / length
-        out[i] = prev
-    return out
-
-
-def rsi(closes: Sequence[float], length: int) -> list[Optional[float]]:
-    """Wilder RSI, seeded with the first ``length`` close changes."""
-    if length <= 0:
-        raise ValueError("length must be positive")
-    out: list[Optional[float]] = [None] * len(closes)
-    if len(closes) <= length:
-        return out
-
-    gains = [0.0] * len(closes)
-    losses = [0.0] * len(closes)
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
-        gains[i] = max(change, 0.0)
-        losses[i] = max(-change, 0.0)
-
-    average_gain = sum(gains[1 : length + 1]) / length
-    average_loss = sum(losses[1 : length + 1]) / length
-    for i in range(length, len(closes)):
-        if i > length:
-            average_gain = (average_gain * (length - 1) + gains[i]) / length
-            average_loss = (average_loss * (length - 1) + losses[i]) / length
-
-        if average_loss == 0:
-            out[i] = 50.0 if average_gain == 0 else 100.0
-        elif average_gain == 0:
-            out[i] = 0.0
-        else:
-            relative_strength = average_gain / average_loss
-            out[i] = 100.0 - 100.0 / (1.0 + relative_strength)
-    return out
-
-
-def tsv(
-    closes: Sequence[float],
-    volumes: Sequence[float],
-    length: int,
-) -> list[Optional[float]]:
-    """Pine strategy's rolling sum of close change multiplied by volume."""
-    if length <= 0:
-        raise ValueError("length must be positive")
-    if len(closes) != len(volumes):
-        raise ValueError("closes and volumes must have equal lengths")
-    out: list[Optional[float]] = [None] * len(closes)
-    for i in range(length, len(closes)):
-        out[i] = sum(
-            (closes[j] - closes[j - 1]) * volumes[j]
-            for j in range(i - length + 1, i + 1)
-        )
-    return out
+def _optional_floats(values: Iterable[Any]) -> list[Optional[float]]:
+    return [None if pd.isna(value) else float(value) for value in values]
 
 
 def psar(
@@ -163,69 +62,23 @@ def psar(
     increment: float = 0.02,
     maximum: float = 0.2,
 ) -> list[Optional[float]]:
-    """Parabolic SAR, matching Pine's ``ta.sar`` initialization and reversals."""
-    n = len(highs)
-    out: list[Optional[float]] = [None] * n
-    if n < 2:
-        return out
-    result: Optional[float] = None
-    extreme: Optional[float] = None
-    accel: Optional[float] = None
-    is_below = False
+    """Return the library's Parabolic SAR line, merging long and short rows."""
+    if not (len(highs) == len(lows) == len(closes)):
+        raise ValueError("highs, lows, and closes must have equal lengths")
+    if len(highs) < 2:
+        return [None] * len(highs)
 
-    for i in range(n):
-        first_trend_bar = False
-        if i == 0:
-            continue
-        if i == 1:
-            if closes[i] > closes[i - 1]:
-                is_below = True
-                extreme = highs[i]
-                result = lows[i - 1]
-            else:
-                is_below = False
-                extreme = lows[i]
-                result = highs[i - 1]
-            first_trend_bar = True
-            accel = start
-
-        if result is None or extreme is None or accel is None:
-            continue
-
-        result += accel * (extreme - result)
-        if is_below:
-            if result > lows[i]:
-                first_trend_bar = True
-                is_below = False
-                result = max(highs[i], extreme)
-                extreme = lows[i]
-                accel = start
-        else:
-            if result < highs[i]:
-                first_trend_bar = True
-                is_below = True
-                result = min(lows[i], extreme)
-                extreme = highs[i]
-                accel = start
-
-        if not first_trend_bar:
-            if is_below and highs[i] > extreme:
-                extreme = highs[i]
-                accel = min(accel + increment, maximum)
-            elif not is_below and lows[i] < extreme:
-                extreme = lows[i]
-                accel = min(accel + increment, maximum)
-
-        if is_below:
-            result = min(result, lows[i - 1])
-            if i > 1:
-                result = min(result, lows[i - 2])
-        else:
-            result = max(result, highs[i - 1])
-            if i > 1:
-                result = max(result, highs[i - 2])
-        out[i] = result
-    return out
+    frame = ta.psar(
+        _indicator_series(highs),
+        _indicator_series(lows),
+        _indicator_series(closes),
+        af0=start,
+        af=increment,
+        max_af=maximum,
+    )
+    suffix = f"{float(start)}_{float(maximum)}"
+    line = frame[f"PSARl_{suffix}"].combine_first(frame[f"PSARs_{suffix}"])
+    return _optional_floats(line)
 
 
 def supertrend(
@@ -235,36 +88,29 @@ def supertrend(
     factor: float,
     length: int,
 ) -> tuple[list[Optional[float]], list[int]]:
-    """Classic SuperTrend. Direction is ``-1`` bullish, ``1`` bearish (Pine)."""
-    n = len(closes)
-    atrs = atr(highs, lows, closes, length)
-    line: list[Optional[float]] = [None] * n
-    direction: list[int] = [0] * n
-    upper = 0.0
-    lower = 0.0
-    trend = 1
-    started = False
-    for i in range(n):
-        a = atrs[i]
-        if a is None:
-            continue
-        hl2 = (highs[i] + lows[i]) / 2.0
-        band_top = hl2 + factor * a
-        band_bot = hl2 - factor * a
-        if not started:
-            upper, lower = band_top, band_bot
-            trend = 1
-            started = True
-        else:
-            upper = band_top if (band_top < upper or closes[i - 1] > upper) else upper
-            lower = band_bot if (band_bot > lower or closes[i - 1] < lower) else lower
-            if trend == 1 and closes[i] > upper:
-                trend = -1
-            elif trend == -1 and closes[i] < lower:
-                trend = 1
-        direction[i] = trend
-        line[i] = lower if trend == -1 else upper
-    return line, direction
+    """Return pandas-ta SuperTrend values with negative direction meaning bullish."""
+    if not (len(highs) == len(lows) == len(closes)):
+        raise ValueError("highs, lows, and closes must have equal lengths")
+    if length <= 0:
+        raise ValueError("length must be positive")
+    if not closes:
+        return [], []
+
+    frame = ta.supertrend(
+        _indicator_series(highs),
+        _indicator_series(lows),
+        _indicator_series(closes),
+        length=length,
+        multiplier=factor,
+    )
+    suffix = f"{length}_{float(factor)}"
+    line = _optional_floats(frame[f"SUPERT_{suffix}"])
+    library_directions = frame[f"SUPERTd_{suffix}"]
+    directions = [
+        0 if pd.isna(value) else -int(value)
+        for value in library_directions
+    ]
+    return line, directions
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +161,8 @@ def evaluate(
 ) -> StrategyVerdict:
     """Evaluate the ``st.pine`` long/short conditions on the last closed candle.
 
-    ``candles`` is chronological OHLC data (oldest first) with ``open``,
-    ``high``, ``low`` and ``close`` keys. The final element must be a closed bar.
-    ``volume`` is used by the Pine TSV approximation.
+    ``candles`` is chronological OHLC data (oldest first) with ``high``,
+    ``low`` and ``close`` keys. The final element must be a closed bar.
     """
     cfg = {**DEFAULTS, **(params or {})}
     if len(candles) < 2:
@@ -326,12 +171,9 @@ def evaluate(
     highs = _series(candles, "high")
     lows = _series(candles, "low")
     closes = _series(candles, "close")
-    volumes = _series(candles, "volume")
     n = len(closes)
 
-    rsi_length = int(cfg["rsi_length"])
-    tsv_length = int(cfg["tsv_length"])
-    need = max(max(length for _, length in SUPERTRENDS), rsi_length + 1, tsv_length + 1)
+    need = max(max(length for _, length in SUPERTRENDS) + 1, 2)
     if n < need:
         raise InsufficientData(f"need {need} closed candles, got {n}")
 
@@ -343,14 +185,9 @@ def evaluate(
         float(cfg["psar_increment"]),
         float(cfg["psar_maximum"]),
     )
-    rsi_series = rsi(closes, rsi_length)
-    tsv_series = tsv(closes, volumes, tsv_length)
-
     last = n - 1
     close = closes[last]
     psar_val = psar_series[last]
-    rsi_val = rsi_series[last]
-    tsv_val = tsv_series[last]
 
     directions: list[int] = []
     st_lines: dict[str, Optional[float]] = {}
@@ -359,11 +196,8 @@ def evaluate(
         directions.append(direction[last])
         st_lines[f"st_{length}_{factor:g}"] = line[last]
 
-    if (
-        any(d == 0 for d in directions)
-        or psar_val is None
-        or rsi_val is None
-        or tsv_val is None
+    if any(d == 0 for d in directions) or psar_val is None or any(
+        line is None for line in st_lines.values()
     ):
         raise InsufficientData("indicators not warm on the final candle")
 
@@ -373,15 +207,11 @@ def evaluate(
 
     buy = {
         "supertrend": bull_count >= min_agree,
-        "rsi": rsi_val < float(cfg["rsi_buy_max"]),
-        "tsv": tsv_val > 0,
-        "psar": close > float(psar_val),  # type: ignore[arg-type]
+        "psar": close > psar_val,
     }
     sell = {
         "supertrend": bear_count >= min_agree,
-        "rsi": rsi_val > float(cfg["rsi_sell_min"]),
-        "tsv": tsv_val < 0,
-        "psar": close < float(psar_val),  # type: ignore[arg-type]
+        "psar": close < psar_val,
     }
 
     long_ok = all(buy.values())
@@ -396,16 +226,13 @@ def evaluate(
         signal = NEUTRAL
 
     values = {
-        "rsi": round(rsi_val, 4),
-        "tsv": round(tsv_val, 4),
-        "psar": round(float(psar_val), 4),  # type: ignore[arg-type]
+        "psar": round(psar_val, 4),
         "supertrend_bull": bull_count,
         "supertrend_bear": bear_count,
         **{k: (round(v, 4) if isinstance(v, float) and math.isfinite(v) else v) for k, v in st_lines.items()},
     }
     detail = (
-        f"close={close:.2f} rsi={rsi_val:.2f} tsv={tsv_val:.2f} "
-        f"psar={float(psar_val):.2f} "
+        f"close={close:.2f} psar={psar_val:.2f} "
         f"ST bull={bull_count}/3 bear={bear_count}/3"
     )
     return StrategyVerdict(
@@ -427,8 +254,6 @@ __all__ = [
     "InsufficientData",
     "StrategyVerdict",
     "evaluate",
-    "sma",
-    "atr",
     "psar",
     "supertrend",
 ]

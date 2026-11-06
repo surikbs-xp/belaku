@@ -1,5 +1,7 @@
 # GIFT Nifty → Nifty Futures execution bot
 
+Requires Python 3.12 or newer.
+
 Single-process algorithmic trading bot for the `Surikbs` Pine strategy
 (`bot/st.pine`). The bot subscribes to **GIFT Nifty** ticks, builds candles, evaluates
 the Pine conditions itself and trades the **NFO Nifty future**. No TradingView in
@@ -12,7 +14,7 @@ the loop.
 | `bot/bot.py` | **The bot.** Entrypoint: tick feed, engine, mark loop, API, dashboard |
 | `bot/gift_nifty.py` | GIFT Nifty instrument resolution, KiteTicker subscription, tick→candle aggregation |
 | `bot/engine.py` | Evaluates `bot/st.pine` on GIFT Nifty bars; routes orders to the Nifty future |
-| `bot/strategy.py` | The `bot/st.pine` entry filters in Python (RSI / TSV / PSAR / triple SuperTrend) |
+| `bot/strategy.py` | The `bot/st.pine` entry rules in Python (PSAR / triple SuperTrend) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
 | `bot/kite_client.py` | KiteConnect wrapper; quotes, instrument lookup, mocked orders in PAPER |
 | `bot/kite_auth.py` | Kite login callback, request-token exchange, and access-token persistence |
@@ -68,20 +70,19 @@ auto-executed at 09:15.
 ### Warmup, stated plainly
 
 Kite serves **no historical data for NSEIX**, so the bot must build its own
-candles from live ticks. Entry filters are RSI (14, buy below 20/sell above 80),
-TSV (13-bar sum of close change × volume, buy positive/sell negative), PSAR, and
-2-of-3 SuperTrend. The engine needs 15 closed candles before its first valid
-signal (about 75 minutes at `5minute`). After that, it
+candles from live ticks. Entry rules are PSAR and 2-of-3 SuperTrend. The engine
+needs 13 closed candles before its first valid signal (about 65 minutes at
+`5minute`), matching `pandas-ta`'s SuperTrend warm-up. After that, it
 evaluates each completed candle. Bars are persisted to the `gift_candles` table,
 so a restart **resumes** the warmup instead of restarting it.
 
-The first ~60 minutes after a fresh install will not trade because GIFT Nifty
+The first ~65 minutes after a fresh install will not trade because GIFT Nifty
 history is unavailable; persisted bars can reduce that wait after a restart.
 
 ## Setup
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 test -f bot/.env || cp bot/.env.example bot/.env   # then edit bot/.env
 ```
 
@@ -188,8 +189,8 @@ requires `confirm=true`. Both are rejected with a `4xx` otherwise.
 
 * **Dashboard** — portfolio value, margin available (with utilisation
   bar), active mode pill (green LIVE / amber PAPER), real-time PnL coloured by
-  sign, the GIFT Nifty signal engine (verdict, indicator values, which of the
-  four entry filters are live, warmup progress), open positions, a Paper/Live
+  sign, the GIFT Nifty signal engine (verdict, indicator values, entry-rule
+  checks, warmup progress), open positions, a Paper/Live
   toggle, pause, and the panic button. Live mode still requires an explicit
   confirmation.
 * **Order Logs** — searchable, mode-filtered order book plus the engine signal
@@ -236,19 +237,27 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 
 ### Strategy evaluation
 
-`bot/strategy.py` implements the four entry filters from `bot/st.pine` §11–14
-(RSI, TSV, 2-of-3 SuperTrends, and PSAR). TSV uses the Pine script's stated
-approximation; GIFT Nifty volume is a tick-count proxy, not exchange volume.
+`bot/strategy.py` applies the Pine strategy's entry rules using `pandas-ta` for
+PSAR and triple SuperTrend calculations on GIFT Nifty OHLC. The dashboard shows
+indicator values for the forming candle when available, but strategy signals
+and orders remain based on completed candles. No synthetic or buffer candles
+are added; all 13 warm-up bars must be observed or restored from persisted
+GIFT Nifty data. The local library calculations are not intended to match
+TradingView's numeric values exactly.
 `bot/engine.py` evaluates each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
 — mirroring the Pine `not longCondition[1]` guard, so a run of bullish bars
 produces exactly one entry.
 
-The engine reports warm-up progress until 15 closed bars are available, then
-evaluates every completed candle. The RSI length plus its initial close change
-requires the longest warm-up.
+The engine reports warm-up progress until 13 closed bars are available, then
+evaluates every completed candle.
 
-The dashboard's condition checklist shows exactly which of the four are live,
+The dashboard's condition checklist shows exactly which of the two rules pass,
 so a quiet bot is explainable rather than mysterious.
+
+The indicator library is `pandas-ta` (pinned in `requirements.txt`); the bot
+logs the OHLC input and PSAR/SuperTrend outputs once per completed GIFT candle.
+Local runs write rotating logs to `bot/logs/bot.log`; Docker writes them to
+`/data/bot.log` in the persistent data volume.
 
 Evaluate the restored filters in paper mode before enabling live orders.
 

@@ -83,16 +83,11 @@ class Settings:
     http_timeout_seconds: float = _env_float("HTTP_TIMEOUT_SECONDS", 4.0)
 
     # --- Strategy (st.pine) ----------------------------------------------
-    # The engine evaluates RSI, TSV, SuperTrend and PSAR on GIFT Nifty candles.
+    # The engine evaluates SuperTrend and PSAR on GIFT Nifty candles.
     strategy_st_min_agree: int = _env_int("STRATEGY_ST_MIN_AGREE", 2)
     strategy_psar_start: float = _env_float("STRATEGY_PSAR_START", 0.02)
     strategy_psar_increment: float = _env_float("STRATEGY_PSAR_INCREMENT", 0.02)
     strategy_psar_maximum: float = _env_float("STRATEGY_PSAR_MAXIMUM", 0.2)
-    strategy_rsi_length: int = _env_int("STRATEGY_RSI_LENGTH", 14)
-    strategy_rsi_buy_max: float = _env_float("STRATEGY_RSI_BUY_MAX", 20.0)
-    strategy_rsi_sell_min: float = _env_float("STRATEGY_RSI_SELL_MIN", 80.0)
-    strategy_tsv_length: int = _env_int("STRATEGY_TSV_LENGTH", 13)
-
     # --- GIFT Nifty signal feed -------------------------------------------
     # The engine builds its own candles from live NSEIX ticks (Kite serves no
     # GIFT Nifty history), then evaluates st.pine on them. This interval must
@@ -144,10 +139,6 @@ def strategy_params() -> dict[str, float]:
         "psar_start": settings.strategy_psar_start,
         "psar_increment": settings.strategy_psar_increment,
         "psar_maximum": settings.strategy_psar_maximum,
-        "rsi_length": settings.strategy_rsi_length,
-        "rsi_buy_max": settings.strategy_rsi_buy_max,
-        "rsi_sell_min": settings.strategy_rsi_sell_min,
-        "tsv_length": settings.strategy_tsv_length,
     }
 
 
