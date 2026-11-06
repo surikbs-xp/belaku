@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import sys
 import logging
+import sys
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -12,6 +12,7 @@ import engine
 import gift_nifty
 import kite_auth
 import order_manager
+import pandas as pd
 import pytest
 import strategy
 from config import BASE_DIR
@@ -92,7 +93,32 @@ def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
         isinstance(verdict.values[key], float)
         for key in ("st_10_1", "st_11_2", "st_12_3")
     )
-    assert verdict.values["supertrend_bull"] + verdict.values["supertrend_bear"] == 3
+    assert verdict.values["supertrend_bull"] == 3
+    assert verdict.values["supertrend_bear"] == 0
+
+
+def test_psar_passes_configured_acceleration_to_pandas_ta(monkeypatch) -> None:
+    captured = {}
+
+    def fake_psar(high, low, close, *, af0, af, max_af):
+        captured.update(af0=af0, af=af, max_af=max_af)
+        return pd.DataFrame({
+            "PSARl_0.03_0.3": [float("nan"), 80.0, float("nan")],
+            "PSARs_0.03_0.3": [float("nan"), float("nan"), 85.0],
+        })
+
+    monkeypatch.setattr(strategy.ta, "psar", fake_psar)
+    values = strategy.psar(
+        [100.0, 101.0, 102.0],
+        [98.0, 99.0, 100.0],
+        [99.0, 100.0, 101.0],
+        start=0.03,
+        increment=0.05,
+        maximum=0.3,
+    )
+
+    assert captured == {"af0": 0.03, "af": 0.05, "max_af": 0.3}
+    assert values == [None, 80.0, 85.0]
 
 
 def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
