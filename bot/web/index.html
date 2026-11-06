@@ -26,8 +26,7 @@
     },
   };
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=tradezilla-1" />
-<script src="https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js" defer></script>
+<link rel="stylesheet" href="/static/styles.css?v=trader-2" />
 </head>
 
 <body class="bg-ink-950 text-slate-200 antialiased">
@@ -94,8 +93,7 @@
   <nav class="tabs" role="tablist">
     <button class="tab tab-active" data-tab="monitor"   role="tab">Dashboard</button>
     <button class="tab"            data-tab="orders"    role="tab">Orders &amp; signals</button>
-    <button class="tab"            data-tab="analytics" role="tab">Analytics</button>
-    <button class="tab"            data-tab="journal"   role="tab">Journal</button>
+    <button class="tab"            data-tab="analytics" role="tab">Performance &amp; trades</button>
   </nav>
 
   <!-- ── View 1: Dashboard Monitor ──────────────────────────────────── -->
@@ -183,13 +181,14 @@
         <div class="indicator-cell">
           <p class="metric-label">SuperTrend vote</p>
           <p id="e-st" class="indicator-value">—</p>
-          <div id="st-votes" class="st-votes" aria-hidden="true"></div>
+          <div id="st-votes" class="vote-bar" aria-hidden="true"></div>
           <p id="e-st-sub" class="metric-sub">Lines —</p>
           <p id="e-st-time" class="metric-sub">Timestamp unavailable</p>
         </div>
         <div class="indicator-cell">
           <p class="metric-label">Parabolic SAR</p>
           <p id="e-psar" class="indicator-value">—</p>
+          <div id="psar-votes" class="vote-bar" aria-hidden="true"></div>
           <p id="e-psar-sub" class="metric-sub">Price above / below</p>
           <p id="e-psar-time" class="metric-sub">Timestamp unavailable</p>
         </div>
@@ -315,115 +314,13 @@
     </div>
   </section>
 
-  <!-- ── View 3: Analytics ──────────────────────────────────────────── -->
+  <!-- ── View 3: Performance ────────────────────────────────────────── -->
   <section id="view-analytics" class="view hidden">
-
-    <!-- Headline KPIs -->
-    <div class="kpi-grid">
-      <div class="panel panel-metric">
-        <p class="metric-label">Net P&amp;L</p>
-        <p id="a-net" class="metric-value">—</p>
-        <p id="a-net-sub" class="metric-sub">—</p>
-      </div>
-      <div class="panel panel-metric">
-        <p class="metric-label">Win rate</p>
-        <p id="a-winrate" class="metric-value">—</p>
-        <p id="a-winrate-sub" class="metric-sub">—</p>
-      </div>
-      <div class="panel panel-metric">
-        <p class="metric-label">Profit factor</p>
-        <p id="a-pf" class="metric-value">—</p>
-        <p id="a-pf-sub" class="metric-sub">—</p>
-      </div>
-      <div class="panel panel-metric">
-        <p class="metric-label">Expectancy</p>
-        <p id="a-expectancy" class="metric-value">—</p>
-        <p id="a-expectancy-sub" class="metric-sub">—</p>
-      </div>
-      <div class="panel panel-metric">
-        <p class="metric-label">Max drawdown</p>
-        <p id="a-dd" class="metric-value">—</p>
-        <p id="a-dd-sub" class="metric-sub">—</p>
-      </div>
-      <div class="panel panel-metric">
-        <p class="metric-label">Trades</p>
-        <p id="a-trades" class="metric-value">—</p>
-        <p id="a-trades-sub" class="metric-sub">—</p>
-      </div>
-    </div>
-
-    <!-- Equity curve + drawdown -->
-    <div class="panel">
-      <div class="panel-head">
-        <h2 class="section-title">Equity curve</h2>
-        <span id="equity-source" class="metric-sub">—</span>
-      </div>
-      <div class="chart-wrap">
-        <div id="equity-chart" class="chart"></div>
-        <p id="equity-empty" class="chart-empty hidden">No equity history yet — it builds as positions are marked.</p>
-      </div>
-    </div>
-
-    <!-- Daily P&L + streaks -->
-    <div class="split-grid">
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">Daily P&amp;L</h2>
-          <span id="daily-caption" class="metric-sub">—</span>
-        </div>
-        <div class="chart-wrap chart-wrap-sm">
-          <div id="daily-chart" class="chart"></div>
-          <p id="daily-empty" class="chart-empty hidden">No settled days yet.</p>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">Streaks &amp; risk</h2>
-        </div>
-        <div class="stat-list">
-          <div class="stat-row"><span>Current streak</span><strong id="s-streak">—</strong></div>
-          <div class="stat-row"><span>Longest win streak</span><strong id="s-maxwin">—</strong></div>
-          <div class="stat-row"><span>Longest loss streak</span><strong id="s-maxloss">—</strong></div>
-          <div class="stat-row"><span>Largest win</span><strong id="s-bigwin">—</strong></div>
-          <div class="stat-row"><span>Largest loss</span><strong id="s-bigloss">—</strong></div>
-          <div class="stat-row"><span>Average win</span><strong id="s-avgwin">—</strong></div>
-          <div class="stat-row"><span>Average loss</span><strong id="s-avgloss">—</strong></div>
-          <div class="stat-row"><span>Average hold</span><strong id="s-hold">—</strong></div>
-          <div class="stat-row"><span>Average move</span><strong id="s-points">—</strong></div>
-          <div class="stat-row"><span>Total fees</span><strong id="s-fees">—</strong></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Breakdowns -->
-    <div class="split-grid split-grid-3">
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">By direction</h2>
-        </div>
-        <div id="breakdown-direction" class="breakdown"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">By weekday</h2>
-        </div>
-        <div id="breakdown-weekday" class="breakdown"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">By hour (IST)</h2>
-        </div>
-        <div id="breakdown-hour" class="breakdown"></div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-head">
-        <h2 class="section-title">By exit reason</h2>
-        <span class="metric-sub">How each position actually ended</span>
-      </div>
-      <div id="breakdown-exit" class="breakdown"></div>
+    <div class="metric-grid metric-grid-4">
+      <div class="panel panel-metric"><p class="metric-label">Net profit</p><p id="a-net" class="metric-value">—</p></div>
+      <div class="panel panel-metric"><p class="metric-label">Total return</p><p id="a-return" class="metric-value">—</p></div>
+      <div class="panel panel-metric"><p class="metric-label">Max drawdown</p><p id="a-dd" class="metric-value">—</p></div>
+      <div class="panel panel-metric"><p class="metric-label">Trades</p><p id="a-trades" class="metric-value">—</p></div>
     </div>
 
     <div class="panel">
@@ -435,80 +332,10 @@
         <table class="data-table">
           <thead>
             <tr><th>Closed</th><th>Symbol</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
-                <th class="num">Exit</th><th class="num">Points</th><th class="num">Gross</th><th class="num">Fees</th>
-                <th class="num">Net</th><th>Reason</th><th>Journal</th></tr>
+                <th class="num">Exit</th><th class="num">Gross</th><th class="num">Fees</th><th class="num">Net</th><th>Reason</th></tr>
           </thead>
           <tbody id="trades-body"></tbody>
         </table>
-      </div>
-    </div>
-  </section>
-
-  <!-- ── View 4: Journal ────────────────────────────────────────────── -->
-  <section id="view-journal" class="view hidden">
-    <div class="journal-layout">
-
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">Settled trades</h2>
-          <span id="journal-caption" class="metric-sub">—</span>
-        </div>
-        <div class="toolbar journal-toolbar">
-          <input id="journal-search" type="search" placeholder="Search symbol, setup, tags…" class="field field-search" />
-          <button id="btn-journal-unannotated" class="btn btn-neutral" type="button">Unannotated only</button>
-        </div>
-        <div id="journal-list" class="journal-list">
-          <p class="condition-empty">No settled trades yet — the journal opens up after the first round-trip closes.</p>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head">
-          <h2 class="section-title">Trade note</h2>
-          <span id="journal-editor-state" class="metric-sub">Nothing selected</span>
-        </div>
-
-        <div id="journal-editor-empty" class="journal-editor-empty">
-          <p>Select a trade to add notes.</p>
-          <p class="metric-sub">Journal entries live in their own table — writing or deleting one never changes the trade ledger or any metric.</p>
-        </div>
-
-        <form id="journal-form" class="journal-form hidden">
-          <div id="journal-trade-summary" class="journal-trade-summary"></div>
-
-          <label class="field-group">
-            <span class="field-label">Setup</span>
-            <input id="journal-setup" class="field" list="setup-options" placeholder="e.g. SuperTrend flip at PSAR" maxlength="200" />
-            <datalist id="setup-options"></datalist>
-          </label>
-
-          <label class="field-group">
-            <span class="field-label">Tags <em>comma separated</em></span>
-            <input id="journal-tags" class="field" placeholder="trend, breakout, patience" maxlength="400" />
-          </label>
-
-          <div class="field-group">
-            <span class="field-label">Execution rating</span>
-            <div id="journal-rating" class="rating" role="radiogroup" aria-label="Execution rating"></div>
-          </div>
-
-          <label class="field-group">
-            <span class="field-label">Notes</span>
-            <textarea id="journal-note" class="field field-area" rows="5" placeholder="What did you see? What did you do? What would you repeat?" maxlength="4000"></textarea>
-          </label>
-
-          <label class="field-group">
-            <span class="field-label">Mistakes</span>
-            <textarea id="journal-mistakes" class="field field-area" rows="3" placeholder="What would you do differently?" maxlength="1000"></textarea>
-          </label>
-
-          <div class="journal-actions">
-            <button type="submit" id="journal-save" class="btn btn-primary">Save note</button>
-            <button type="button" id="journal-clear" class="btn btn-neutral">Clear</button>
-            <button type="button" id="journal-delete" class="btn btn-danger-outline">Delete</button>
-          </div>
-          <p id="journal-status" class="journal-status"></p>
-        </form>
       </div>
     </div>
   </section>

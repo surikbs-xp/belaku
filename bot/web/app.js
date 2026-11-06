@@ -22,9 +22,6 @@ const ENDPOINTS = {
   orders:    '/api/orders?limit=500',
   trades:    '/api/trades?limit=500',
   signals:   '/api/signals?limit=100',
-  equity:    '/api/equity?limit=2000',
-  analytics: '/api/analytics',
-  journal:   '/api/journal?limit=500',
   toggle:    '/api/toggle-mode',
   pause:     '/api/pause',
   panic:     '/api/panic',
@@ -45,15 +42,6 @@ const state = {
   serverOffsetMs: 0,
   // Client-side price samples; the API has no tick history endpoint.
   spark: [],
-  // Analytics + journal state. These load on a slower cadence than the 1.5s
-  // monitor poll because none of it changes tick-to-tick.
-  analytics: null,
-  journal: [],
-  journalLoadedAt: 0,
-  selectedTradeId: null,
-  journalRating: null,
-  journalUnannotatedOnly: false,
-  charts: {},
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -147,6 +135,13 @@ function level(value, decimals = 2) {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
+}
+
+/** Signed index-point move, e.g. "+443.40". */
+function signedPoints(value) {
+  const n = num(value);
+  if (n === null) return '—';
+  return `${n >= 0 ? '+' : '-'}${level(Math.abs(n))}`;
 }
 
 function escapeHtml(value) {
@@ -460,10 +455,15 @@ function renderEngine(eng, market) {
       : psarConditions.sell_psar ? 'Price below · SELL condition passes' : 'BUY above · SELL below');
     setText('e-st', `${values.supertrend_bull ?? 0}/3 bullish`);
     setText('e-st-sub', `Lines ${level(values.st_10_1)} · ${level(values.st_11_2)} · ${level(values.st_12_3)}`);
-    renderVotes(values.supertrend_bull, values.supertrend_bear);
+    renderVotes('st-votes', values.supertrend_bull, values.supertrend_bear, 3);
+    // PSAR is a single binary check: close above SAR is bullish.
+    const psarAbove = !!psarConditions.buy_psar;
+    const psarBelow = !!psarConditions.sell_psar;
+    renderVotes('psar-votes', psarAbove ? 1 : 0, psarBelow ? 1 : 0, 1);
   } else {
     ['e-psar', 'e-st'].forEach((id) => setText(id, '—'));
-    renderVotes(null, null);
+    renderVotes('st-votes', 0, 0, 3);
+    renderVotes('psar-votes', 0, 0, 1);
   }
 
   setText('e-counters',
@@ -475,24 +475,28 @@ function renderEngine(eng, market) {
   }
 }
 
-/** Three-segment bar showing the live 2-of-3 SuperTrend split. */
-function renderVotes(bull, bear) {
-  const host = $('st-votes');
+/**
+ * Segmented green/red vote bar. `segments` slots are drawn: green for each
+ * bullish vote, red for each bearish vote, then grey placeholders — so both the
+ * count and the direction read from one visual language. SuperTrend uses three
+ * slots (2-of-3 rule), PSAR uses one (a single price-position check).
+ */
+function renderVotes(id, bull, bear, segments) {
+  const host = $(id);
   if (!host) return;
-  const up = num(bull) || 0;
-  const down = num(bear) || 0;
+  const up = Math.max(0, num(bull) || 0);
+  const down = Math.max(0, num(bear) || 0);
   if (!up && !down) {
     host.innerHTML = '';
     return;
   }
-  const segments = [
-    ...Array(up).fill('bull'),
-    ...Array(down).fill('bear'),
-  ];
-  while (segments.length < 3) segments.push('');
-  host.innerHTML = segments
-    .slice(0, 3)
-    .map((state) => `<span class="st-vote ${state}"></span>`)
+  const filled = [
+    ...Array(Math.min(up, segments)).fill('bull'),
+    ...Array(Math.min(down, segments)).fill('bear'),
+  ].slice(0, segments);
+  while (filled.length < segments) filled.push('');
+  host.innerHTML = filled
+    .map((kind) => `<span class="vote-seg ${kind}"></span>`)
     .join('');
 }
 
@@ -599,6 +603,12 @@ function renderPortfolio(portfolio) {
   setText('m-realised', signedInr(portfolio.realized_total), pnlClass(portfolio.realized_total));
   setText('m-winrate', `${portfolio.win_rate}%`);
   setText('m-pf', portfolio.profit_factor === null ? '∞' : portfolio.profit_factor);
+
+  setText('a-net', signedInr(portfolio.total_pnl), pnlClass(portfolio.total_pnl));
+  setText('a-return', `${portfolio.total_return_pct >= 0 ? '+' : ''}${portfolio.total_return_pct}%`,
+    pnlClass(portfolio.total_return_pct));
+  setText('a-dd', `${portfolio.max_drawdown_pct}%`, pnlClass(portfolio.max_drawdown_pct));
+  setText('a-trades', portfolio.total_trades);
 }
 
 function renderPositions(payload) {
@@ -697,223 +707,17 @@ function renderSignals() {
   }).join('');
 }
 
-/* ── Analytics ─────────────────────────────────────────────────────── */
-
-/** Ratio/KPI formatters shared by the analytics panel. */
-function ratio(value) {
-  const n = num(value);
-  if (n === null) return '—';
-  if (!Number.isFinite(n)) return '∞';
-  return n.toFixed(2);
-}
-
-function pct(value, decimals = 1) {
-  const n = num(value);
-  if (n === null) return '—';
-  return `${n.toFixed(decimals)}%`;
-}
-
-function points(value) {
-  const n = num(value);
-  if (n === null) return '—';
-  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`;
-}
-
-function hours(minutes) {
-  const n = num(minutes);
-  if (n === null || n === 0) return '—';
-  if (n < 60) return `${Math.round(n)}m`;
-  const h = Math.floor(n / 60);
-  const m = Math.round(n % 60);
-  return m ? `${h}h ${m}m` : `${h}h`;
-}
-
-function renderAnalytics(data) {
-  state.analytics = data;
-  const s = data.summary || {};
-  const streaks = data.streaks || {};
-
-  setText('a-net', signedInr(s.net_pnl), pnlClass(s.net_pnl));
-  setText('a-net-sub', `${signedInr(s.gross_pnl)} gross · ${signedInr(-(s.fees || 0))} fees`);
-  setText('a-winrate', s.trades ? pct(s.win_rate) : '—');
-  setText('a-winrate-sub', `${s.wins ?? 0}W · ${s.losses ?? 0}L · ${s.breakeven ?? 0}BE`);
-  setText('a-pf', s.trades ? ratio(s.profit_factor) : '—');
-  setText('a-pf-sub', `${signedInr(s.gross_win)} won · ${signedInr(-(s.gross_loss || 0))} lost`);
-  setText('a-expectancy', s.trades ? signedInr(s.expectancy) : '—');
-  setText('a-expectancy-sub', `per trade · ${points(s.avg_points)} pts avg`);
-  setText('a-dd', data.max_drawdown ? signedInr(data.max_drawdown) : '—', data.max_drawdown ? 'neg' : 'flat');
-  setText('a-dd-sub', `${pct(data.max_drawdown_pct)} of peak`);
-  setText('a-trades', s.trades ?? 0);
-  setText('a-trades-sub', `avg hold ${hours(s.avg_hold_minutes)}`);
-
-  setText('s-streak', streaks.current_kind === 'none'
-    ? '—'
-    : `${streaks.current_run} ${streaks.current_kind}${streaks.current_run === 1 ? '' : 'es'}`,
-    streaks.current_kind === 'win' ? 'pos' : streaks.current_kind === 'loss' ? 'neg' : 'flat');
-  setText('s-maxwin', streaks.max_win ?? '—');
-  setText('s-maxloss', streaks.max_loss ?? '—');
-  setText('s-bigwin', signedInr(s.largest_win), 'pos');
-  setText('s-bigloss', signedInr(s.largest_loss), 'neg');
-  setText('s-avgwin', signedInr(s.avg_win), 'pos');
-  setText('s-avgloss', signedInr(s.avg_loss), 'neg');
-  setText('s-hold', hours(s.avg_hold_minutes));
-  setText('s-points', points(s.avg_points));
-  setText('s-fees', inr(s.fees));
-
-  renderBreakdown('breakdown-direction', (data.by_direction
-    ? Object.entries(data.by_direction).map(([label, bucket]) => ({ label, bucket }))
-    : []));
-  renderBreakdown('breakdown-weekday',
-    (data.by_weekday || []).map((row) => ({ label: row.weekday, bucket: row })));
-  renderBreakdown('breakdown-hour',
-    (data.by_hour || []).map((row) => ({ label: `${String(row.hour).padStart(2, '0')}:00`, bucket: row })));
-  renderBreakdown('breakdown-exit',
-    (data.by_exit_reason || []).map((row) => ({ label: row.reason, bucket: row })));
-
-  renderDailyChart(data.days || []);
-}
-
-/** Horizontal bar per bucket, scaled to the largest absolute P&L. */
-function renderBreakdown(id, rows) {
-  const host = $(id);
-  if (!host) return;
-  if (!rows.length) {
-    host.innerHTML = '<p class="breakdown-empty">No data yet.</p>';
-    return;
-  }
-  const scale = Math.max(...rows.map((row) => Math.abs(num(row.bucket.net_pnl) || 0)), 1);
-  host.innerHTML = rows.map(({ label, bucket }) => {
-    const net = num(bucket.net_pnl) || 0;
-    const width = Math.max(2, (Math.abs(net) / scale) * 100);
-    const kind = net > 0 ? 'pos' : net < 0 ? 'neg' : 'flat';
-    return `
-      <div class="breakdown-row">
-        <span class="breakdown-label">${escapeHtml(label)}</span>
-        <span class="breakdown-track"><span class="breakdown-fill ${kind}" style="width:${width.toFixed(1)}%"></span></span>
-        <span class="breakdown-meta ${pnlClass(net)}">${signedInr(net, 0)} · ${bucket.wins}W/${bucket.losses}L</span>
-      </div>`;
-  }).join('');
-}
-
-function renderDailyChart(days) {
-  const host = $('daily-chart');
-  const empty = $('daily-empty');
-  if (!host) return;
-  const usable = days.filter((day) => day.date && day.date !== 'unknown');
-  setText('daily-caption', usable.length
-    ? `${usable.length} day${usable.length === 1 ? '' : 's'}`
-    : '—');
-
-  if (!usable.length) {
-    host.innerHTML = '';
-    empty.classList.remove('hidden');
-    return;
-  }
-  empty.classList.add('hidden');
-  const max = Math.max(...usable.map((day) => Math.abs(day.net_pnl)), 1);
-  host.innerHTML = usable.map((day) => {
-    const height = Math.max(4, (Math.abs(day.net_pnl) / max) * 100);
-    const kind = day.net_pnl >= 0 ? 'pos' : 'neg';
-    return `
-      <div class="daily-bar-wrap" title="${escapeHtml(day.date)} · ${signedInr(day.net_pnl, 0)} · ${day.trades} trades">
-        <div class="daily-bar daily-bar-${kind}" style="height:${height.toFixed(1)}%"></div>
-        <span class="daily-bar-label">${escapeHtml(day.date.slice(5))}</span>
-      </div>`;
-  }).join('');
-}
-
-/**
- * Equity curve via TradingView Lightweight Charts.
- *
- * Two failure modes are handled explicitly because both corrupted the chart
- * permanently in testing:
- *   * the library requires strictly ascending, unique timestamps, and the
- *     equity table can contain duplicate seconds;
- *   * a chart created while its tab is hidden has no measurable container and
- *     ends up throwing on every redraw, so it is only ever built on screen.
- *
- * The library is also optional: if the CDN is blocked, the KPIs and ledger
- * still work and the chart degrades to a notice.
- */
-function renderEquityChart(points) {
-  const host = $('equity-chart');
-  const empty = $('equity-empty');
-  if (!host) return;
-
-  const byTime = new Map();
-  for (const point of points || []) {
-    const time = Math.floor(new Date(point.ts).getTime() / 1000);
-    const value = num(point.equity);
-    if (Number.isFinite(time) && value !== null) byTime.set(time, { time, value });
-  }
-  const series = [...byTime.values()].sort((a, b) => a.time - b.time);
-
-  if (!series.length) {
-    empty.classList.remove('hidden');
-    return;
-  }
-
-  const lib = window.LightweightCharts;
-  if (!lib) {
-    host.innerHTML = '<p class="chart-empty">Chart library unavailable — see the ledger below.</p>';
-    return;
-  }
-  // Creating a chart needs a laid-out container; updating an existing one does not.
-  if (!state.charts.equity && (!host.clientWidth || !host.clientHeight)) return;
-
-  empty.classList.add('hidden');
-
-  try {
-    if (!state.charts.equity) {
-      state.charts.equity = lib.createChart(host, {
-        autoSize: true,
-        layout: { background: { color: 'transparent' }, textColor: '#8fa0b8', fontSize: 11 },
-        grid: {
-          vertLines: { color: 'rgba(27,39,64,0.5)' },
-          horzLines: { color: 'rgba(27,39,64,0.5)' },
-        },
-        rightPriceScale: { borderColor: '#1b2740' },
-        timeScale: { borderColor: '#1b2740', timeVisible: true, secondsVisible: false },
-        crosshair: { mode: 0 },
-      });
-    }
-    if (!state.charts.equitySeries) {
-      state.charts.equitySeries = state.charts.equity.addSeries(lib.AreaSeries, {
-        lineColor: '#38bdf8',
-        topColor: 'rgba(56,189,248,0.35)',
-        bottomColor: 'rgba(56,189,248,0.02)',
-        lineWidth: 2,
-        priceLineVisible: false,
-      });
-    }
-    state.charts.equitySeries.setData(series);
-    state.charts.equity.timeScale().fitContent();
-    setText('equity-source', `${state.analytics?.equity_source || 'equity curve'} · ${series.length} points`);
-  } catch (error) {
-    // Tear the broken instance down and keep the rest of the tab usable.
-    try { state.charts.equity?.remove(); } catch { /* already gone */ }
-    state.charts.equity = null;
-    state.charts.equitySeries = null;
-    host.innerHTML = `<p class="chart-empty">Equity chart unavailable (${escapeHtml(error.message)}) — see the ledger below.</p>`;
-  }
-}
 
 function renderTrades() {
   const body = $('trades-body');
   if (!state.trades.length) {
-    body.innerHTML = '<tr class="empty-row"><td colspan="12">No settled trades yet.</td></tr>';
+    body.innerHTML = '<tr class="empty-row"><td colspan="10">No settled trades yet.</td></tr>';
     return;
   }
-  const notes = state.notesById || {};
   body.innerHTML = state.trades.map((t) => {
     const move = num(t.exit_price) !== null && num(t.entry_price) !== null
       ? (num(t.exit_price) - num(t.entry_price)) * (t.direction === 'LONG' ? 1 : -1)
       : null;
-    const note = notes[String(t.id)];
-    const hasNote = !!note;
-    const label = hasNote
-      ? [note.setup, note.tags].filter(Boolean).join(' · ') || 'note'
-      : 'add note';
     return `
     <tr>
       <td class="font-mono text-slate-400">${escapeHtml((t.exit_time || '').replace('T', ' '))}</td>
@@ -922,200 +726,15 @@ function renderTrades() {
       <td class="num">${t.quantity}</td>
       <td class="num">${inr(t.entry_price, 2)}</td>
       <td class="num">${inr(t.exit_price, 2)}</td>
-      <td class="num ${pnlClass(move)}">${move === null ? '—' : points(move)}</td>
+      <td class="num ${pnlClass(move)}">${move === null ? '—' : signedPoints(move)}</td>
       <td class="num ${pnlClass(t.gross_pnl)}">${signedInr(t.gross_pnl)}</td>
       <td class="num text-slate-400">${inr(t.fees, 2)}</td>
       <td class="num ${pnlClass(t.net_pnl)}">${signedInr(t.net_pnl)}</td>
       <td class="text-slate-400">${escapeHtml(t.exit_reason || '—')}</td>
-      <td><button type="button" class="journal-chip ${hasNote ? 'has-note' : ''}"
-            data-journal-trade="${t.id}"
-            title="${escapeHtml(hasNote ? (note.note || 'Journal entry saved') : 'Add a journal entry')}">
-            ${hasNote ? '★' : '+'} ${escapeHtml(label)}
-          </button></td>
     </tr>`;
   }).join('');
 }
 
-/* ── Journal ───────────────────────────────────────────────────────── */
-
-/** Rebuild the setup datalist from notes already written, newest first. */
-function refreshSetupOptions() {
-  const setups = [...new Set(
-    state.journal.map((entry) => entry.note && entry.note.setup).filter(Boolean),
-  )].sort();
-  $('setup-options').innerHTML = setups
-    .map((setup) => `<option value="${escapeHtml(setup)}"></option>`)
-    .join('');
-}
-
-function renderJournal() {
-  const host = $('journal-list');
-  const needle = $('journal-search').value.trim().toLowerCase();
-  const annotated = state.journal.filter((entry) => entry.note).length;
-  setText('journal-caption',
-    `${state.journal.length} trades · ${annotated} annotated`);
-
-  refreshSetupOptions();
-
-  const rows = state.journal.filter((entry) => {
-    const trade = entry.trade || {};
-    const note = entry.note;
-    if (state.journalUnannotatedOnly && note) return false;
-    if (!needle) return true;
-    const haystack = [
-      trade.symbol, trade.direction, trade.exit_reason,
-      note && note.setup, note && note.tags, note && note.note, note && note.mistakes,
-    ].join(' ').toLowerCase();
-    return haystack.includes(needle);
-  });
-
-  if (!rows.length) {
-    host.innerHTML = `<p class="condition-empty">${state.journal.length
-      ? 'No trades match this filter.'
-      : 'No settled trades yet — the journal opens up after the first round-trip closes.'}</p>`;
-    return;
-  }
-
-  host.innerHTML = rows.map((entry) => {
-    const trade = entry.trade || {};
-    const note = entry.note;
-    const kind = num(trade.net_pnl) > 0 ? 'tag-buy' : num(trade.net_pnl) < 0 ? 'tag-sell' : 'tag-muted';
-    const stars = note && note.rating ? '★'.repeat(note.rating) : '';
-    const setup = (note && note.setup) || '';
-    const tags = (note && note.tags) || '';
-    const noteText = (note && note.note) || '';
-    return `
-      <button type="button" class="journal-item ${state.selectedTradeId === trade.id ? 'is-selected' : ''}"
-              data-journal-select="${trade.id}">
-        <span>
-          <span class="tag ${kind}">${escapeHtml(trade.direction || '—')}</span>
-        </span>
-        <span class="journal-item-main">
-          <span class="journal-item-head">
-            <strong>${escapeHtml((trade.exit_time || '').slice(0, 16).replace('T', ' '))}</strong>
-            <span class="tag ${num(trade.net_pnl) > 0 ? 'tag-buy' : 'tag-sell'}">${signedInr(trade.net_pnl)}</span>
-            <span class="metric-sub">${points((num(trade.exit_price) - num(trade.entry_price)) * (trade.direction === 'LONG' ? 1 : -1))} pts</span>
-          </span>
-          <span class="journal-item-sub">${escapeHtml(
-            [setup, tags, noteText].filter(Boolean).join(' · ') || 'No note yet',
-          )}</span>
-        </span>
-        <span class="journal-item-flags">
-          ${stars ? `<span class="journal-flag">${escapeHtml(stars)}</span>` : ''}
-          <span class="journal-flag ${note ? 'is-annotated' : ''}">${note ? 'noted' : 'blank'}</span>
-        </span>
-      </button>`;
-  }).join('');
-}
-
-function openJournalEditor(tradeId) {
-  const entry = state.journal.find((row) => (row.trade || {}).id === tradeId);
-  if (!entry) return;
-  state.selectedTradeId = tradeId;
-  const trade = entry.trade || {};
-  const note = entry.note || {};
-
-  $('journal-editor-empty').classList.add('hidden');
-  $('journal-form').classList.remove('hidden');
-
-  const move = (num(trade.exit_price) - num(trade.entry_price)) * (trade.direction === 'LONG' ? 1 : -1);
-  $('journal-trade-summary').innerHTML = `
-    <div><p class="metric-label">Direction</p><p class="metric-sub-inline">${escapeHtml(trade.direction || '—')}</p></div>
-    <div><p class="metric-label">Net P&amp;L</p><p class="metric-sub-inline ${pnlClass(trade.net_pnl)}">${signedInr(trade.net_pnl)}</p></div>
-    <div><p class="metric-label">Move</p><p class="metric-sub-inline ${pnlClass(move)}">${points(move)} pts</p></div>
-    <div><p class="metric-label">Closed</p><p class="metric-sub-inline">${escapeHtml((trade.exit_time || '').slice(0, 16).replace('T', ' '))}</p></div>`;
-
-  $('journal-setup').value = note.setup || '';
-  $('journal-tags').value = note.tags || '';
-  $('journal-note').value = note.note || '';
-  $('journal-mistakes').value = note.mistakes || '';
-  setJournalRating(note.rating || null);
-  setJournalStatus(note.trade_id ? `Saved ${note.updated_at || ''}` : 'No note yet', note.trade_id ? 'ok' : '');
-  renderJournal();
-}
-
-function setJournalRating(value) {
-  state.journalRating = num(value);
-  $('journal-rating').innerHTML = [1, 2, 3, 4, 5].map((star) => `
-    <button type="button" class="rating-star ${state.journalRating >= star ? 'is-on' : ''}"
-            data-rating="${star}" role="radio"
-            aria-checked="${state.journalRating === star}"
-            aria-label="${star} of 5">${star}</button>`).join('');
-}
-
-function setJournalStatus(message, kind) {
-  const el = $('journal-status');
-  el.textContent = message;
-  el.className = `journal-status ${kind === 'ok' ? 'pos' : kind === 'err' ? 'neg' : ''}`;
-}
-
-async function saveJournal(event) {
-  event.preventDefault();
-  if (!state.selectedTradeId) return;
-  setJournalStatus('Saving…');
-  try {
-    const result = await api(`/api/journal/${state.selectedTradeId}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        note: $('journal-note').value,
-        setup: $('journal-setup').value,
-        tags: $('journal-tags').value,
-        rating: state.journalRating || null,
-        mistakes: $('journal-mistakes').value,
-      }),
-    });
-    setJournalStatus(`Saved ${result.note?.updated_at || ''}`, 'ok');
-    toast('Journal note saved', 'ok');
-    await loadJournal();
-    renderTrades();
-    openJournalEditor(state.selectedTradeId);
-  } catch (error) {
-    setJournalStatus(error.message, 'err');
-    toast(`Could not save note: ${error.message}`, 'err');
-  }
-}
-
-async function clearJournalEntry() {
-  if (!state.selectedTradeId) return;
-  const confirmed = await confirmDialog({
-    title: 'Delete this journal note?',
-    body: 'The trade itself is untouched — only your written note is removed.',
-    okLabel: 'Delete note',
-  });
-  if (!confirmed) return;
-  try {
-    await api(`/api/journal/${state.selectedTradeId}`, { method: 'DELETE' });
-    toast('Journal note deleted', 'ok');
-    await loadJournal();
-    renderTrades();
-    openJournalEditor(state.selectedTradeId);
-  } catch (error) {
-    setJournalStatus(error.message, 'err');
-  }
-}
-
-async function loadJournal() {
-  const data = await api(ENDPOINTS.journal);
-  state.journal = data.entries || [];
-  state.journalLoadedAt = Date.now();
-  state.notesById = Object.fromEntries(
-    state.journal.filter((entry) => entry.note)
-      .map((entry) => [String((entry.trade || {}).id), entry.note]),
-  );
-  renderJournal();
-}
-
-/** Trade KPIs + equity curve. Cheap enough to refetch on a slow cadence. */
-async function loadAnalytics() {
-  const [analytics, equity] = await Promise.all([
-    api(ENDPOINTS.analytics),
-    api(ENDPOINTS.equity),
-  ]);
-  state.analyticsLoadedAt = Date.now();
-  renderAnalytics(analytics);
-  if (equity.source) analytics.equity_source = equity.source;
-  renderEquityChart(equity.points || []);
-}
 
 /* ── Polling ───────────────────────────────────────────────────────── */
 
@@ -1154,16 +773,6 @@ async function poll() {
     if (!state.kite || Date.now() - (state.kiteCheckedAt || 0) > 20000) {
       state.kiteCheckedAt = Date.now();
       refreshKiteStatus();
-    }
-    // Analytics and the journal only change when a trade settles, so load them
-    // on the tab that shows them and refresh slowly in the background. Failures
-    // here must not break the monitor poll, hence the catch.
-    const slowLoad = [];
-    if (state.tab === 'analytics') slowLoad.push(loadAnalytics());
-    else if (Date.now() - (state.analyticsLoadedAt || 0) > 30000) slowLoad.push(loadAnalytics());
-    if (state.tab === 'journal' && Date.now() - state.journalLoadedAt > 15000) slowLoad.push(loadJournal());
-    if (slowLoad.length) {
-      Promise.allSettled(slowLoad).catch(() => { /* reported per-loader */ });
     }
   } catch (error) {
     state.failures += 1;
@@ -1419,16 +1028,10 @@ function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((btn) => {
     btn.classList.toggle('tab-active', btn.dataset.tab === tab);
   });
-  ['monitor', 'orders', 'analytics', 'journal'].forEach((name) => {
+  ['monitor', 'orders', 'analytics'].forEach((name) => {
     $(`view-${name}`).classList.toggle('hidden', name !== tab);
   });
   if (tab === 'orders') renderOrders();
-  if (tab === 'analytics') {
-    loadAnalytics().catch((error) => toast(`Analytics unavailable: ${error.message}`, 'err'));
-  }
-  if (tab === 'journal') {
-    loadJournal().catch((error) => toast(`Journal unavailable: ${error.message}`, 'err'));
-  }
 }
 
 /* ── Wiring ────────────────────────────────────────────────────────── */
@@ -1449,47 +1052,6 @@ function init() {
   $('btn-resume').addEventListener('click', togglePause);
   $('btn-panic').addEventListener('click', panic);
   $('btn-orders-csv').addEventListener('click', exportCsv);
-
-  // Journal: delegation keeps the list markup replaceable without rebinding.
-  $('journal-list').addEventListener('click', (event) => {
-    const item = event.target.closest('[data-journal-select]');
-    if (item) openJournalEditor(Number(item.dataset.journalSelect));
-  });
-  $('trades-body').addEventListener('click', (event) => {
-    const chip = event.target.closest('[data-journal-trade]');
-    if (!chip) return;
-    switchTab('journal');
-    loadJournal()
-      .then(() => openJournalEditor(Number(chip.dataset.journalTrade)))
-      .catch((error) => toast(`Journal unavailable: ${error.message}`, 'err'));
-  });
-  $('journal-form').addEventListener('submit', saveJournal);
-  $('journal-delete').addEventListener('click', clearJournalEntry);
-  $('journal-clear').addEventListener('click', () => {
-    $('journal-setup').value = '';
-    $('journal-tags').value = '';
-    $('journal-note').value = '';
-    $('journal-mistakes').value = '';
-    setJournalRating(null);
-    setJournalStatus('Cleared — save to persist');
-  });
-  $('journal-rating').addEventListener('click', (event) => {
-    const star = event.target.closest('[data-rating]');
-    if (!star) return;
-    const value = Number(star.dataset.rating);
-    setJournalRating(state.journalRating === value ? null : value);
-  });
-  let journalTimer = null;
-  $('journal-search').addEventListener('input', () => {
-    clearTimeout(journalTimer);
-    journalTimer = setTimeout(renderJournal, 120);
-  });
-  $('btn-journal-unannotated').addEventListener('click', () => {
-    state.journalUnannotatedOnly = !state.journalUnannotatedOnly;
-    $('btn-journal-unannotated').classList.toggle('btn-primary', state.journalUnannotatedOnly);
-    $('btn-journal-unannotated').classList.toggle('btn-neutral', !state.journalUnannotatedOnly);
-    renderJournal();
-  });
 
   let searchTimer = null;
   $('orders-search').addEventListener('input', () => {
