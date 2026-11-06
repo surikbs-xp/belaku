@@ -105,9 +105,9 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
 
--- GIFT Nifty candles built from live ticks. Kite serves no NSEIX history, so
--- this table *is* the warmup: it lets the strategy survive a restart instead of
--- re-accumulating 20 bars from scratch.
+-- GIFT Nifty candles. Kite history is the source of truth; tick-built bars are
+-- a fallback. This table also lets the strategy survive a restart instead of
+-- re-accumulating its warm-up from scratch.
 CREATE TABLE IF NOT EXISTS gift_candles (
     start                 TEXT PRIMARY KEY,
     open                  REAL NOT NULL,
@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS gift_candles (
     close                 REAL NOT NULL,
     volume                REAL NOT NULL DEFAULT 0,
     ticks                 INTEGER NOT NULL DEFAULT 0,
-    created_at            TEXT NOT NULL
+    created_at            TEXT NOT NULL,
+    -- 0 complete; 1 missing ticks inside the bar; 2 cut off by a shutdown.
+    partial               INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_gift_candles_start ON gift_candles (start DESC);
 """
@@ -185,6 +187,11 @@ def init_db(path: Optional[str] = None, initial_balance: Optional[float] = None)
     conn = _connect(path)
     try:
         conn.executescript(SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(gift_candles)")}
+        if "partial" not in columns:
+            conn.execute(
+                "ALTER TABLE gift_candles ADD COLUMN partial INTEGER NOT NULL DEFAULT 0"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO account (id, initial_balance, balance, updated_at) "
             "VALUES (1, ?, ?, ?)",
@@ -458,17 +465,20 @@ def record_gift_candle(
     close: float,
     volume: float = 0.0,
     ticks: int = 0,
+    partial: int = 0,
     path: Optional[str] = None,
 ) -> None:
     """Upsert one GIFT Nifty bar (``start`` is the bucket timestamp)."""
     init_db(path)
     with session(path) as conn:
         conn.execute(
-            "INSERT INTO gift_candles (start, open, high, low, close, volume, ticks, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO gift_candles "
+            "(start, open, high, low, close, volume, ticks, created_at, partial) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(start) DO UPDATE SET open=excluded.open, high=excluded.high, "
-            "low=excluded.low, close=excluded.close, volume=excluded.volume, ticks=excluded.ticks",
-            (start, open_, high, low, close, volume, ticks, iso()),
+            "low=excluded.low, close=excluded.close, volume=excluded.volume, "
+            "ticks=excluded.ticks, partial=excluded.partial",
+            (start, open_, high, low, close, volume, ticks, iso(), partial),
         )
 
 

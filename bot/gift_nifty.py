@@ -1,20 +1,26 @@
-"""GIFT Nifty market data: instrument resolution, tick subscription, candle building.
+"""GIFT Nifty market data: authoritative Kite history plus a live tick feed.
 
 GIFT Nifty (NSEIX, NSE IFSC) is the pre-market proxy for Nifty 50 and trades
-~20 hours a day. It is **quote-only** on Kite:
+~20 hours a day. It is quote-only on Kite (it cannot be traded), but Kite *does*
+serve its historical candles, including the overnight session::
 
-* ``kite.quote("NSEIX:GIFT NIFTY")`` works (index token 291849);
-* ``kite.historical_data()`` does **not** serve NSEIX, so there is no history to
-  warm the indicators from.
+    kite.historical_data(291849, ..., interval="5minute")
 
-Consequence, stated plainly: this module must build its own candles forward from
-live ticks. Until ``strategy`` has enough bars (12 for SuperTrend warmup), it
-refuses to emit signals rather than trading on cold indicators. Bars are
-persisted to SQLite so a restart resumes the warmup instead of starting over.
+That history is the **authoritative** candle source for the strategy. Building
+candles locally from ticks was measured against it and disagreed on 21 of 42
+bars, because ticks are throttled and dropped, so the local OHLC was wrong and
+every recursive indicator (PSAR, SuperTrend) inherited the error.
 
-Only ticks during a session advance the candle. The 20-hour GIFT session and the
-09:15-15:30 NSE F&O session are different windows, and an out-of-hours tick must
-not be glued onto the last in-hours bar - that would corrupt the OHLC.
+So this module:
+
+* loads closed candles from Kite history (the source of truth),
+* keeps the in-progress bucket separate and updates it from live ticks,
+* falls back to tick-built candles only when history is unavailable, and
+* persists bars to SQLite so a restart has data before the first API call.
+
+Only ticks during a session advance the forming candle. The 20-hour GIFT session
+and the 09:15-15:30 NSE F&O session are different windows, and an out-of-hours
+tick must not be glued onto the last in-hours bar - that would corrupt the OHLC.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 import database as db
@@ -41,6 +47,18 @@ GIFT_KEY = f"{GIFT_EXCHANGE}:{GIFT_SYMBOL}"
 GIFT_FALLBACK_TOKEN = 291849
 VOLUME_BASIS = "tick_count_proxy"
 
+# A tick-built bar is only trustworthy if the feed watched it from its opening.
+# Such bars are used only when Kite history is unavailable.
+PARTIAL_NONE = 0
+PARTIAL_GAP = 1  # ticks missing inside the bar (joined late / feed outage)
+PARTIAL_CUT = 2  # cut off by a shutdown; resumable if restarted in-bucket
+JOIN_GRACE_SECONDS = 10.0
+
+# Kite history is authoritative; refresh it at most this often unless forced.
+HISTORY_REFRESH_SECONDS = 30.0
+# How much history to request, so recursive indicators are fully converged.
+HISTORY_LOOKBACK_DAYS = 5
+
 
 @dataclass
 class Candle:
@@ -53,6 +71,7 @@ class Candle:
     close: float
     volume: float = 0.0
     ticks: int = 0
+    partial: int = PARTIAL_NONE
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -62,6 +81,7 @@ class Candle:
             "low": self.low,
             "close": self.close,
             "volume": self.volume,
+            "partial": self.partial,
         }
 
     def to_strategy_candle(self) -> dict[str, Any]:
@@ -120,6 +140,16 @@ class CandleBuilder:
     current: Optional[Candle] = None
     closed: list[Candle] = field(default_factory=list)
     max_history: int = 2000
+    outage: bool = False
+
+    def mark_outage(self) -> None:
+        """Record that ticks may have been missed (feed disconnect)."""
+        self.outage = True
+        if self.current is not None and self.current.partial == PARTIAL_NONE:
+            self.current.partial = PARTIAL_GAP
+
+    def _opened_late(self, moment: datetime, start: datetime) -> bool:
+        return (moment - start).total_seconds() > JOIN_GRACE_SECONDS
 
     def add_tick(self, price: float, moment: Optional[datetime] = None, volume: float = 0.0) -> Optional[Candle]:
         """Feed one tick. Returns the bar that closed, if any."""
@@ -129,15 +159,24 @@ class CandleBuilder:
         start = bucket_start(moment, self.seconds)
 
         if self.current is None:
-            self.current = Candle(start=start, open=price, high=price, low=price, close=price,
-                                  volume=volume, ticks=1)
+            self.current = Candle(
+                start=start, open=price, high=price, low=price, close=price,
+                volume=volume, ticks=1,
+                partial=PARTIAL_GAP if self._opened_late(moment, start) else PARTIAL_NONE,
+            )
+            self.outage = False
             return None
 
         if start > self.current.start:
             finished = self.current
             self._store(finished)
-            self.current = Candle(start=start, open=price, high=price, low=price, close=price,
-                                  volume=volume, ticks=1)
+            late = self.outage and self._opened_late(moment, start)
+            self.outage = False
+            self.current = Candle(
+                start=start, open=price, high=price, low=price, close=price,
+                volume=volume, ticks=1,
+                partial=PARTIAL_GAP if late else PARTIAL_NONE,
+            )
             if self.on_close:
                 self.on_close(finished)
             return finished
@@ -160,6 +199,11 @@ class CandleBuilder:
         if self.current is None:
             return None
         finished = self.current
+        if (
+            finished.partial == PARTIAL_NONE
+            and datetime.now(IST) < finished.start + timedelta(seconds=self.seconds)
+        ):
+            finished.partial = PARTIAL_CUT
         self._store(finished)
         self.current = None
         if self.on_close:
@@ -198,10 +242,13 @@ class GiftNiftyFeed:
         self._resume_candle: Optional[Candle] = None
         self._history_loaded = False
         self._loaded_count = 0
+        self._history_source = "none"
+        self._history_at: Optional[datetime] = None
+        self._history_error: Optional[str] = None
 
-    # -- persistence -----------------------------------------------------
+    # -- history ---------------------------------------------------------
     def load_persisted(self) -> int:
-        """Seed the series from SQLite so warmup survives a restart."""
+        """Seed the series from SQLite so a restart has bars before any API call."""
         with self._lock:
             if self._history_loaded:
                 return self._loaded_count
@@ -218,7 +265,9 @@ class GiftNiftyFeed:
                 close=float(row["close"]),
                 volume=float(row["volume"]),
                 ticks=int(row["ticks"]),
+                partial=int(row.get("partial") or PARTIAL_NONE),
             )
+        rows = [r for r in rows if not r.get("partial")]
         with self._lock:
             if self._history_loaded:
                 return self._loaded_count
@@ -236,12 +285,88 @@ class GiftNiftyFeed:
             self._resume_candle = resume_candle
             self._history_loaded = True
             self._loaded_count = len(rows) + (1 if resume_candle else 0)
+            if rows:
+                self._history_source = "sqlite"
         if self._loaded_count:
             log.info(
                 "Loaded %d persisted GIFT Nifty candles (warmup carry-over)",
                 self._loaded_count,
             )
         return self._loaded_count
+
+    def refresh_history(self, force: bool = False) -> int:
+        """Replace the closed-candle series with Kite's authoritative history.
+
+        Kite serves NSEIX history, so this is the source of truth for the
+        indicators. Returns the number of closed bars now held.
+        """
+        now = datetime.now(IST)
+        with self._lock:
+            if (
+                not force
+                and self._history_at is not None
+                and (now - self._history_at).total_seconds() < HISTORY_REFRESH_SECONDS
+            ):
+                return len(self._history)
+            token = self.token
+        if token is None:
+            token = self.resolve_token()
+        if token is None:
+            with self._lock:
+                self._history_error = "GIFT Nifty token unresolved"
+            return self.bar_count()
+
+        rows = get_client().historical_data(
+            instrument_token=token,
+            from_date=now - timedelta(days=HISTORY_LOOKBACK_DAYS),
+            to_date=now,
+            interval=self.interval,
+        )
+        if not rows:
+            with self._lock:
+                self._history_at = now
+                self._history_error = "Kite returned no GIFT Nifty history"
+            log.warning("Kite returned no GIFT Nifty history; keeping %d bars", self.bar_count())
+            return self.bar_count()
+
+        current_start = bucket_start(now, self.seconds)
+        closed: list[dict[str, Any]] = []
+        forming: Optional[Candle] = None
+        for row in rows:
+            moment = row["date"]
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=IST)
+            start = bucket_start(moment, self.seconds)
+            candle = Candle(
+                start=start,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row.get("volume") or 0.0),
+            )
+            if start >= current_start:
+                forming = candle
+                continue
+            closed.append(candle.to_strategy_candle())
+
+        with self._lock:
+            self._history = closed[-self._builder.max_history:]
+            self._history_at = now
+            self._history_error = None
+            self._history_source = "kite"
+            self._loaded_count = len(self._history)
+            self._history_loaded = True
+            if forming is not None:
+                # Kite's newest row is the bucket still in progress; keep it as
+                # the forming candle so the dashboard shows live values.
+                self._builder.current = forming
+                self._resume_candle = None
+        log.info(
+            "GIFT Nifty history refreshed from Kite: %d closed bars, forming=%s",
+            len(closed), forming.start.strftime("%H:%M") if forming else "none",
+        )
+        return len(closed)
 
     def _persist(self, candle: Candle) -> None:
         try:
@@ -253,6 +378,7 @@ class GiftNiftyFeed:
                 close=candle.close,
                 volume=candle.volume,
                 ticks=candle.ticks,
+                partial=candle.partial,
             )
         except Exception as exc:  # pragma: no cover - best effort
             log.warning("Failed to persist GIFT candle: %s", exc)
@@ -260,6 +386,24 @@ class GiftNiftyFeed:
     # -- candles ---------------------------------------------------------
     def _on_bar_close(self, candle: Candle) -> None:
         self._persist(candle)
+        with self._lock:
+            authoritative = self._history_source == "kite"
+        if authoritative:
+            # Kite history is the source of truth; the next refresh replaces
+            # this bar with the exchange's own OHLC.
+            log.info(
+                "GIFT bar closed %s O=%.2f H=%.2f L=%.2f C=%.2f ticks=%d "
+                "(awaiting Kite history confirmation)",
+                candle.start.strftime("%H:%M"), candle.open, candle.high,
+                candle.low, candle.close, candle.ticks,
+            )
+            return
+        if candle.partial:
+            log.info(
+                "GIFT bar %s excluded from indicators: incomplete tick coverage "
+                "(ticks=%d)", candle.start.strftime("%H:%M"), candle.ticks,
+            )
+            return
         with self._lock:
             self._history.append(candle.to_strategy_candle())
             if len(self._history) > self._builder.max_history:
@@ -308,15 +452,16 @@ class GiftNiftyFeed:
                 self.tick_count += 1
                 self.session_ticks += 1
                 self._builder.on_close = self._on_bar_close
-                if self._resume_candle is not None:
+                if self._resume_candle is not None and self._history_source != "kite":
                     tick_start = bucket_start(self.last_tick_at, self.seconds)
                     if tick_start == self._resume_candle.start:
+                        if self._resume_candle.partial == PARTIAL_CUT:
+                            self._resume_candle.partial = PARTIAL_NONE
                         self._builder.current = self._resume_candle
                         self._resume_candle = None
                     elif tick_start > self._resume_candle.start:
-                        self._history.append(self._resume_candle.to_strategy_candle())
-                        if len(self._history) > self._builder.max_history:
-                            del self._history[:-self._builder.max_history]
+                        # The bar was cut off by the shutdown and not resumed
+                        # in time, so its OHLC is incomplete.
                         self._resume_candle = None
                 self._builder.add_tick(float(price), self.last_tick_at, volume=1.0)
 
@@ -345,6 +490,8 @@ class GiftNiftyFeed:
 
     def _handle_close(self, _ws: Any, code: Any, reason: Any) -> None:
         self.connected = False
+        with self._lock:
+            self._builder.mark_outage()
         self.error = f"websocket closed ({code}): {reason}"
         log.warning("GIFT Nifty ticker closed (%s): %s", code, reason)
 
@@ -494,6 +641,11 @@ class GiftNiftyFeed:
                 "interval_seconds": self.seconds,
                 "volume_basis": VOLUME_BASIS,
                 "bars": len(self._history),
+                "history_source": self._history_source,
+                "history_at": self._history_at.isoformat(timespec="seconds")
+                if self._history_at
+                else None,
+                "history_error": self._history_error,
                 "in_progress": self._builder.current is not None,
                 "last_price": self.last_price,
                 "last_tick_at": self.last_tick_at.isoformat(timespec="seconds")

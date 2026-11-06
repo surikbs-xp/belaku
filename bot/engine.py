@@ -2,10 +2,10 @@
 
 Signal source and execution venue are deliberately different instruments:
 
-* **signals** come from GIFT Nifty (``NSEIX:GIFT NIFTY``) candles, built from
-  live ticks by :mod:`gift_nifty`. GIFT Nifty is the 20-hour pre-market proxy
-  for Nifty 50, so it reacts to overnight and early-morning global moves before
-  NSE opens.
+* **signals** come from GIFT Nifty (``NSEIX:GIFT NIFTY``) candles, loaded from
+  Kite history by :mod:`gift_nifty` (tick-built bars are a fallback). GIFT Nifty
+  is the 20-hour pre-market proxy for Nifty 50, so it reacts to overnight and
+  early-morning global moves before NSE opens.
 * **orders** go to the front-month NFO Nifty future via
   :class:`~order_manager.OrderManager`, because GIFT Nifty is quote-only on
   Kite and cannot be traded there.
@@ -126,6 +126,12 @@ class StrategyEngine:
         (used by the API for an on-demand check).
         """
         feed = get_feed()
+        # Kite history is authoritative; refresh it so the indicators run on
+        # exchange OHLC rather than tick-built approximations.
+        try:
+            feed.refresh_history()
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("GIFT Nifty history refresh failed: %s", exc)
         candles = feed.candles()
         params = strategy_params()
         needed = required_bars()
@@ -167,10 +173,11 @@ class StrategyEngine:
         }
         log.info(
             "Indicator values source=%s interval_seconds=%s candle_at=%s "
-            "ohlc=%s indicators=%s signal=%s",
+            "history_bars=%d ohlc=%s indicators=%s signal=%s",
             GIFT_KEY,
             feed.seconds,
             newest,
+            verdict.bars,
             json.dumps(ohlc, sort_keys=True),
             json.dumps(verdict.values, sort_keys=True),
             verdict.signal,
@@ -353,6 +360,10 @@ class StrategyEngine:
 
     def status(self) -> dict[str, Any]:
         feed = get_feed()
+        try:
+            feed.refresh_history()
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("GIFT Nifty history refresh failed: %s", exc)
         candles, current_bar_in_progress = feed.candle_snapshot()
         current_values: Optional[dict[str, Any]] = None
         current_conditions: Optional[dict[str, bool]] = None

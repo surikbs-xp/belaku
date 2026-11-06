@@ -320,6 +320,40 @@ class KiteClient:
             "source": "KITE",
         }
 
+    def historical_data(
+        self,
+        instrument_token: int,
+        from_date: datetime,
+        to_date: datetime,
+        interval: str = "5minute",
+    ) -> list[dict[str, Any]]:
+        """Historical OHLC bars for ``instrument_token``; empty when unavailable.
+
+        Kite *does* serve NSEIX (GIFT Nifty) history, including the overnight
+        session, so this is the authoritative candle source for the strategy.
+        """
+        if not self.sdk_ready:
+            return []
+        for attempt in range(3):
+            try:
+                rows = self.kite.historical_data(
+                    instrument_token=instrument_token,
+                    from_date=from_date,
+                    to_date=to_date,
+                    interval=interval,
+                )
+                return list(rows or [])
+            except TokenException as exc:
+                self._auth_error = f"Access token invalid/expired: {exc}"
+                return []
+            except (KiteException, NetworkException) as exc:
+                self._auth_error = str(exc)
+                if attempt == 2:
+                    log.warning("Historical data failed for %s: %s", instrument_token, exc)
+                    return []
+                time.sleep(0.2 * (attempt + 1))
+        return []
+
     def get_ltp(self, symbol: str) -> Optional[float]:
         quote = self.get_quote(symbol)
         if quote:
