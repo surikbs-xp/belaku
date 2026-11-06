@@ -161,7 +161,7 @@
         <div class="card-sm">
           <p class="metric-label">Current signal</p>
           <p id="e-signal" class="mt-1 text-2xl font-bold text-white">—</p>
-          <div class="warmup-track mt-2" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="12" aria-valuenow="0">
+          <div class="warmup-track mt-2" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="15" aria-valuenow="0">
             <div id="warmup-progress" class="warmup-progress"></div>
           </div>
           <p id="e-signal-sub" class="metric-sub">Waiting for candles…</p>
@@ -183,6 +183,18 @@
         <h3 class="section-title mb-2">Latest indicator values</h3>
         <div class="grid grid-cols-2 gap-3">
           <div class="card-sm">
+            <p class="metric-label">RSI · 14</p>
+            <p id="e-rsi" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
+            <p id="e-rsi-time" class="metric-sub">Timestamp unavailable</p>
+            <p id="e-rsi-sub" class="metric-sub">BUY &lt;20 · SELL &gt;80</p>
+          </div>
+          <div class="card-sm">
+            <p class="metric-label">TSV · 13</p>
+            <p id="e-tsv" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
+            <p id="e-tsv-time" class="metric-sub">Timestamp unavailable</p>
+            <p id="e-tsv-sub" class="metric-sub">BUY &gt;0 · SELL &lt;0</p>
+          </div>
+          <div class="card-sm">
             <p class="metric-label">Parabolic SAR</p>
             <p id="e-psar" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
             <p id="e-psar-time" class="metric-sub">Timestamp unavailable</p>
@@ -203,7 +215,7 @@
         <p class="metric-label">Active strategy</p>
         <h2 class="mt-1 text-xl font-semibold text-white">Surikbs · GIFT Nifty signal</h2>
         <p class="mt-1 text-sm text-slate-400">
-          Every completed 5-minute GIFT candle is checked. Both entry checks must pass.
+          Every completed 5-minute GIFT candle is checked. All four entry checks must pass.
           Signals come from GIFT Nifty; orders use the front-month Nifty future.
         </p>
       </div>
@@ -217,27 +229,32 @@
           <section class="strategy-rule strategy-rule-buy">
             <div class="flex items-center justify-between gap-2">
               <h4 class="text-base font-bold text-emerald-300">BUY</h4>
-              <span class="text-xs text-slate-400">Both checks required</span>
+              <span class="text-xs text-slate-400">All four checks required</span>
             </div>
             <ul class="strategy-rule-list">
               <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bullish</li>
+              <li><strong>RSI:</strong> below 20</li>
+              <li><strong>TSV:</strong> positive</li>
               <li><strong>PSAR:</strong> candle close above Parabolic SAR</li>
             </ul>
           </section>
           <section class="strategy-rule strategy-rule-sell">
             <div class="flex items-center justify-between gap-2">
               <h4 class="text-base font-bold text-rose-300">SELL</h4>
-              <span class="text-xs text-slate-400">Both checks required</span>
+              <span class="text-xs text-slate-400">All four checks required</span>
             </div>
             <ul class="strategy-rule-list">
               <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bearish</li>
+              <li><strong>RSI:</strong> above 80</li>
+              <li><strong>TSV:</strong> negative</li>
               <li><strong>PSAR:</strong> candle close below Parabolic SAR</li>
             </ul>
           </section>
         </div>
         <p class="mt-2 text-xs text-slate-500">
           SuperTrends use ATR length × multiplier 10×1, 11×2, and 12×3.
-          SuperTrend needs 12 candles to initialize; signals are evaluated on each later candle close.
+          RSI uses Wilder smoothing (14), TSV uses a 13-bar price-change × tick-volume sum,
+          and the filters need 15 closed candles to initialize.
         </p>
       </div>
 

@@ -38,6 +38,24 @@ def test_atr_matches_pine_seeding() -> None:
     ) == [None, 2.5, 2.75]
 
 
+def test_rsi_uses_wilder_smoothing() -> None:
+    values = strategy.rsi([100.0, 102.0, 101.0, 103.0], length=2)
+
+    assert values[:2] == [None, None]
+    assert values[2] == pytest.approx(200 / 3)
+    assert values[3] == pytest.approx(600 / 7)
+
+
+def test_tsv_sums_close_change_weighted_by_volume() -> None:
+    values = strategy.tsv(
+        [100.0, 102.0, 101.0, 104.0],
+        [1.0, 2.0, 3.0, 4.0],
+        length=2,
+    )
+
+    assert values == [None, None, 1.0, 9.0]
+
+
 def test_psar_initializes_direction_from_first_close_change() -> None:
     highs = [10.0, 9.0, 8.0]
     lows = [8.0, 7.0, 6.0]
@@ -57,7 +75,7 @@ def test_supertrend_starts_bearish_when_first_atr_becomes_available() -> None:
     assert line[1] == 15.575
 
 
-def test_strategy_signals_after_supertrend_history_without_rsi_or_tsv() -> None:
+def test_strategy_signals_require_rsi_tsv_supertrend_history() -> None:
     candles = [
         {
             "open": 100.0 + index,
@@ -69,13 +87,24 @@ def test_strategy_signals_after_supertrend_history_without_rsi_or_tsv() -> None:
         for index in range(20)
     ]
 
-    assert engine.required_bars() == 12
-    with pytest.raises(strategy.InsufficientData, match="need 12 closed candles"):
-        strategy.evaluate(candles[:11])
+    assert engine.required_bars() == 15
+    with pytest.raises(strategy.InsufficientData, match="need 15 closed candles"):
+        strategy.evaluate(candles[:14])
 
-    verdict = strategy.evaluate(candles[:12])
-    assert set(verdict.conditions) == {"buy_supertrend", "buy_psar", "sell_supertrend", "sell_psar"}
+    verdict = strategy.evaluate(candles[:15])
+    assert set(verdict.conditions) == {
+        "buy_supertrend",
+        "buy_rsi",
+        "buy_tsv",
+        "buy_psar",
+        "sell_supertrend",
+        "sell_rsi",
+        "sell_tsv",
+        "sell_psar",
+    }
     assert set(verdict.values) == {
+        "rsi",
+        "tsv",
         "psar",
         "supertrend_bull",
         "supertrend_bear",
@@ -83,6 +112,12 @@ def test_strategy_signals_after_supertrend_history_without_rsi_or_tsv() -> None:
         "st_11_2",
         "st_12_3",
     }
+    assert verdict.values["rsi"] == 100.0
+    assert verdict.values["tsv"] > 0
+    assert not verdict.conditions["buy_rsi"]
+    assert verdict.conditions["buy_tsv"]
+    assert verdict.conditions["sell_rsi"]
+    assert not verdict.conditions["sell_tsv"]
 
 
 def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
@@ -140,9 +175,9 @@ def test_engine_status_reports_forming_bar_indicators_without_signaling(monkeypa
             "close": 100.0 + index,
             "volume": 1.0,
         }
-        for index in range(11)
+        for index in range(15)
     ]
-    feed._handle_ticks(None, [{"last_price": 112.0}])
+    feed._handle_ticks(None, [{"last_price": 116.0}])
     monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "market_status", lambda: {"is_open": True})
     monkeypatch.setattr(
@@ -153,9 +188,15 @@ def test_engine_status_reports_forming_bar_indicators_without_signaling(monkeypa
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
 
     status = engine.StrategyEngine().status()
+    snapshot, _ = feed.candle_snapshot()
 
     assert status["current_bar_in_progress"]
     assert status["current_values"] is not None
+    assert status["current_values"] == strategy.evaluate(snapshot).values
+    assert status["current_bar_at"] == snapshot[-1]["time"]
+    assert status["previous_values"] == strategy.evaluate(feed.candles()).values
+    assert status["previous_bar_at"] == feed.candles()[-1]["time"]
+    assert status["previous_values"]["psar"] != status["current_values"]["psar"]
     assert status["last_signal"] == strategy.NEUTRAL
 
 
@@ -218,6 +259,13 @@ def test_engine_waits_for_a_transition_after_startup(monkeypatch) -> None:
     monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine.strategy, "evaluate", lambda *_args: next(verdicts))
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(
+        engine,
+        "get_order_manager",
+        lambda: SimpleNamespace(current_symbol=lambda: "NIFTY"),
+    )
+    monkeypatch.setattr(db, "get_open_positions", lambda mode=None: [])
     runner = engine.StrategyEngine()
     monkeypatch.setattr(
         runner,
@@ -231,6 +279,49 @@ def test_engine_waits_for_a_transition_after_startup(monkeypatch) -> None:
     feed.rows.append({"time": "2026-11-05T22:20:00+05:30"})
     assert runner.evaluate_now()["action"] == "SELL"
     assert actions == ["SELL"]
+
+
+def test_engine_reverses_opposing_paper_position_on_startup(monkeypatch) -> None:
+    class FakeFeed:
+        seconds = 300
+
+        def candles(self):
+            return [{"time": "2026-11-05T22:50:00+05:30"}]
+
+    feed = FakeFeed()
+    verdict = strategy.StrategyVerdict(strategy.BEAR, 95.0)
+    captured = []
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(engine.strategy, "evaluate", lambda *_args: verdict)
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(
+        engine,
+        "get_order_manager",
+        lambda: SimpleNamespace(current_symbol=lambda: "NIFTY"),
+    )
+    monkeypatch.setattr(
+        db,
+        "get_open_positions",
+        lambda mode=None: [{
+            "symbol": "NIFTY",
+            "position_key": 1,
+            "quantity": 65,
+        }],
+    )
+    runner = engine.StrategyEngine()
+    monkeypatch.setattr(
+        runner,
+        "execute",
+        lambda action, detail, **kwargs: captured.append(
+            (action, kwargs["paper_reference_price"])
+        ) or {"ok": True},
+    )
+
+    result = runner.evaluate_now()
+
+    assert result["action"] == "SELL"
+    assert captured == [("SELL", 95.0)]
 
 
 def test_after_hours_paper_engine_pnl_uses_gift_mark(monkeypatch, tmp_path) -> None:

@@ -85,7 +85,12 @@ class EngineState:
 
 def required_bars() -> int:
     """Bars ``strategy.evaluate`` needs before it will produce a verdict."""
-    return max(length for _, length in strategy.SUPERTRENDS)
+    params = {**strategy.DEFAULTS, **strategy_params()}
+    return max(
+        max(length for _, length in strategy.SUPERTRENDS),
+        int(params["rsi_length"]) + 1,
+        int(params["tsv_length"]) + 1,
+    )
 
 
 class StrategyEngine:
@@ -103,6 +108,19 @@ class StrategyEngine:
         self._thread: Optional[threading.Thread] = None
         self._last_signal = strategy.NEUTRAL
         self._last_bar_at: Optional[str] = None
+
+    def _opposes_open_paper_position(self, signal: str) -> bool:
+        if get_execution_mode() != PAPER or signal not in {strategy.BULL, strategy.BEAR}:
+            return False
+
+        symbol = get_order_manager().current_symbol()
+        target = 1 if signal == strategy.BULL else -1
+        quantity = sum(
+            int(position["quantity"]) * int(position["position_key"])
+            for position in db.get_open_positions(mode=PAPER)
+            if position["symbol"] == symbol
+        )
+        return quantity * target < 0
 
     # -- evaluation ------------------------------------------------------
     def evaluate_now(self, force: bool = False) -> dict[str, Any]:
@@ -162,13 +180,15 @@ class StrategyEngine:
         self._last_signal = signal
 
         if initial_bar:
-            return {
-                "ok": True,
-                "signal": signal,
-                "detail": verdict.detail,
-                "action": None,
-                "reason": "existing signal primed; waiting for the next transition",
-            }
+            if not self._opposes_open_paper_position(signal):
+                return {
+                    "ok": True,
+                    "signal": signal,
+                    "detail": verdict.detail,
+                    "action": None,
+                    "reason": "existing signal primed; waiting for the next transition",
+                }
+            previous = strategy.NEUTRAL
 
         # Only act on a fresh transition, exactly like the Pine `not cond[1]`.
         if signal == previous or signal == strategy.NEUTRAL:
@@ -324,6 +344,10 @@ class StrategyEngine:
         candles, current_bar_in_progress = feed.candle_snapshot()
         current_values: Optional[dict[str, Any]] = None
         current_conditions: Optional[dict[str, bool]] = None
+        previous_values: Optional[dict[str, Any]] = None
+        previous_conditions: Optional[dict[str, bool]] = None
+        closed_candles = candles[:-1] if current_bar_in_progress else candles
+        previous_bar_at = closed_candles[-1]["time"] if closed_candles else None
         current_bar_at = candles[-1]["time"] if candles else None
         if len(candles) >= required_bars():
             try:
@@ -333,6 +357,14 @@ class StrategyEngine:
             else:
                 current_values = current_verdict.values
                 current_conditions = current_verdict.conditions
+        if len(closed_candles) >= required_bars():
+            try:
+                previous_verdict = strategy.evaluate(closed_candles, strategy_params())
+            except strategy.InsufficientData:
+                pass
+            else:
+                previous_values = previous_verdict.values
+                previous_conditions = previous_verdict.conditions
         market = market_status()
         with self._lock:
             payload = self.state.to_dict()
@@ -341,6 +373,9 @@ class StrategyEngine:
         payload["current_conditions"] = current_conditions
         payload["current_bar_at"] = current_bar_at
         payload["current_bar_in_progress"] = current_bar_in_progress
+        payload["previous_values"] = previous_values
+        payload["previous_conditions"] = previous_conditions
+        payload["previous_bar_at"] = previous_bar_at
         payload["market"] = market
         payload["execution_symbol"] = get_order_manager().current_symbol()
         mode = get_execution_mode()
