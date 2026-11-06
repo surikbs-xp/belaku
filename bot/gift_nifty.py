@@ -195,12 +195,33 @@ class GiftNiftyFeed:
         self.error: Optional[str] = None
         self.session_ticks = 0
         self._history: list[dict[str, Any]] = []
+        self._resume_candle: Optional[Candle] = None
+        self._history_loaded = False
+        self._loaded_count = 0
 
     # -- persistence -----------------------------------------------------
     def load_persisted(self) -> int:
         """Seed the series from SQLite so warmup survives a restart."""
-        rows = db.get_gift_candles(limit=self._builder.max_history)
         with self._lock:
+            if self._history_loaded:
+                return self._loaded_count
+        rows = db.get_gift_candles(limit=self._builder.max_history)
+        current_start = bucket_start(datetime.now(IST), self.seconds)
+        resume_candle: Optional[Candle] = None
+        if rows and datetime.fromisoformat(rows[-1]["start"]) == current_start:
+            row = rows.pop()
+            resume_candle = Candle(
+                start=current_start,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+                ticks=int(row["ticks"]),
+            )
+        with self._lock:
+            if self._history_loaded:
+                return self._loaded_count
             self._history = [
                 {
                     "time": r["start"],
@@ -212,9 +233,15 @@ class GiftNiftyFeed:
                 }
                 for r in rows
             ]
-        if rows:
-            log.info("Loaded %d persisted GIFT Nifty candles (warmup carry-over)", len(rows))
-        return len(rows)
+            self._resume_candle = resume_candle
+            self._history_loaded = True
+            self._loaded_count = len(rows) + (1 if resume_candle else 0)
+        if self._loaded_count:
+            log.info(
+                "Loaded %d persisted GIFT Nifty candles (warmup carry-over)",
+                self._loaded_count,
+            )
+        return self._loaded_count
 
     def _persist(self, candle: Candle) -> None:
         try:
@@ -281,6 +308,16 @@ class GiftNiftyFeed:
                 self.tick_count += 1
                 self.session_ticks += 1
                 self._builder.on_close = self._on_bar_close
+                if self._resume_candle is not None:
+                    tick_start = bucket_start(self.last_tick_at, self.seconds)
+                    if tick_start == self._resume_candle.start:
+                        self._builder.current = self._resume_candle
+                        self._resume_candle = None
+                    elif tick_start > self._resume_candle.start:
+                        self._history.append(self._resume_candle.to_strategy_candle())
+                        if len(self._history) > self._builder.max_history:
+                            del self._history[:-self._builder.max_history]
+                        self._resume_candle = None
                 self._builder.add_tick(float(price), self.last_tick_at, volume=1.0)
 
     def _handle_connect(self, ws: Any, _response: Any) -> None:

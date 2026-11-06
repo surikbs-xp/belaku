@@ -259,7 +259,7 @@ function renderEngine(eng, market) {
   const feed = eng.feed || {};
   const closedValues = eng.previous_values
     || (Object.keys(eng.values || {}).length ? eng.values : null);
-  const values = closedValues || eng.current_values || {};
+  const values = eng.current_values || closedValues || {};
   const conditions = eng.conditions || {};
   const indicatorConditions = eng.previous_conditions || conditions;
   const hasIndicatorValues = !!eng.current_values || !!eng.ready;
@@ -287,7 +287,7 @@ function renderEngine(eng, market) {
   const ready = !!eng.ready;
   const signal = eng.last_signal || 'NEUTRAL';
   const warmupHave = Math.max(0, Number(eng.warmup_have) || 0);
-  const warmupNeeded = Math.max(1, Number(eng.warmup_needed) || 15);
+  const warmupNeeded = Math.max(1, Number(eng.warmup_needed) || 12);
   const warmupPercent = ready ? 100 : Math.min(100, (warmupHave / warmupNeeded) * 100);
   const warmupProgress = $('warmup-progress');
   warmupProgress.style.width = `${warmupPercent}%`;
@@ -337,43 +337,33 @@ function renderEngine(eng, market) {
       : `orders held · ${market.reason || 'closed'}`));
 
   const box = $('conditions');
-  const displayedBarAt = closedValues
-    ? (eng.previous_bar_at || eng.last_bar_at)
-    : (eng.current_bar_at || eng.last_bar_at);
+  const displayedBarAt = eng.current_values
+    ? eng.current_bar_at
+    : (eng.previous_bar_at || eng.last_bar_at);
   const indicatorTime = formatIstTimestamp(displayedBarAt);
-  const indicatorLabel = closedValues
-    ? (eng.current_bar_in_progress ? 'Previous candle' : 'Latest closed candle')
-    : 'Forming candle';
+  const indicatorLabel = eng.current_bar_in_progress ? 'Forming candle' : 'Latest closed candle';
   const indicatorTimestamp = indicatorTime
     ? `${indicatorLabel} · ${indicatorTime} IST`
     : 'Timestamp unavailable';
-  ['e-st-time', 'e-rsi-time', 'e-tsv-time']
-    .forEach((id) => setText(id, indicatorTimestamp));
-  const psarTime = formatIstTimestamp(eng.current_bar_at || displayedBarAt);
-  const psarLabel = eng.current_bar_in_progress ? 'Forming candle' : 'Latest closed candle';
-  setText('e-psar-time', psarTime
-    ? `${psarLabel} · ${psarTime} IST`
-    : 'Timestamp unavailable');
+  ['e-st-time', 'e-psar-time'].forEach((id) => setText(id, indicatorTimestamp));
   if (!ready) {
     box.innerHTML = `
       <div class="warmup-message">
         <strong>Rule checks will appear when indicators are ready.</strong>
         <span>${warmupHave} of ${warmupNeeded} closed candles collected. No signal is being evaluated yet.</span>
       </div>`;
-    ['e-psar', 'e-st', 'e-rsi', 'e-tsv'].forEach((id) => setText(id, '—'));
+    ['e-psar', 'e-st'].forEach((id) => setText(id, '—'));
   } else {
-    const order = ['supertrend', 'rsi', 'tsv', 'psar'];
+    const order = ['supertrend', 'psar'];
     const labels = {
       supertrend: 'Trend vote · 2 of 3',
-      rsi: 'RSI threshold',
-      tsv: 'TSV direction',
       psar: 'Price vs PSAR',
     };
     box.innerHTML = ['buy', 'sell'].map((side) => `
       <div class="condition-panel condition-panel-${side}">
         <div class="condition-panel-heading">
           <strong>${side.toUpperCase()}</strong>
-          <span>All four checks must pass</span>
+          <span>Both checks must pass</span>
         </div>
         <div class="condition-check-grid">
         ${order.map((key) => {
@@ -393,15 +383,10 @@ function renderEngine(eng, market) {
       minimumFractionDigits: digits,
       maximumFractionDigits: digits,
     });
-    setText('e-rsi', format(values.rsi));
-    setText('e-rsi-sub', 'BUY <20 · SELL >80');
-    setText('e-tsv', format(values.tsv));
-    setText('e-tsv-sub', 'BUY >0 · SELL <0 · tick-volume proxy');
-    const psarValues = eng.current_values || values;
     const psarConditions = eng.current_values
       ? eng.current_conditions || conditions
       : indicatorConditions;
-    setText('e-psar', format(psarValues.psar));
+    setText('e-psar', format(values.psar));
     setText('e-psar-sub', psarConditions.buy_psar
       ? 'Price above · BUY condition passes'
       : psarConditions.sell_psar ? 'Price below · SELL condition passes' : 'BUY above · SELL below');
@@ -411,7 +396,7 @@ function renderEngine(eng, market) {
       `Lines ${format(values.st_10_1)} · ${format(values.st_11_2)} · ${format(values.st_12_3)}`,
     );
   } else {
-    ['e-psar', 'e-st', 'e-rsi', 'e-tsv'].forEach((id) => setText(id, '—'));
+    ['e-psar', 'e-st'].forEach((id) => setText(id, '—'));
   }
 
   setText('e-counters',

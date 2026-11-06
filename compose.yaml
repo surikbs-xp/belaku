@@ -12,6 +12,7 @@ services:
       WEBHOOK_HOST: 0.0.0.0
       WEBHOOK_PORT: "9000"
       DB_PATH: /data/paper_trading.db
+      LOG_FILE: /data/bot.log
     ports:
       - "127.0.0.1:9000:9000"
     volumes:

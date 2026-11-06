@@ -34,6 +34,7 @@ import time
 import webbrowser
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,17 +52,41 @@ from gift_nifty import GIFT_KEY, get_feed, reset_feed
 from kite_client import future_symbol, get_client, market_status
 from order_manager import get_order_manager
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("bot")
-
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
+LOG_FILE = Path(os.getenv("LOG_FILE", BASE_DIR / "logs" / "bot.log")).expanduser()
+log = logging.getLogger("bot")
 
 STARTED_AT = time.time()
 STARTED_ISO = db.iso()
+
+
+def _configure_logging() -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if not root.handlers:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
+
+    log_path = LOG_FILE.resolve()
+    if not any(
+        isinstance(handler, RotatingFileHandler)
+        and Path(handler.baseFilename) == log_path
+        for handler in root.handlers
+    ):
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
 
 # ---------------------------------------------------------------------------
 # Shared runtime state (this process only - that is the point)
@@ -208,6 +233,7 @@ class PanicRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _configure_logging()
     db.init_db()
     with STATUS_LOCK:
         STATUS.update(running=True, started_at=db.iso(), heartbeat_ts=time.time())
