@@ -17,3 +17,4 @@ paper_trading.db-wal
 *.sqlite
 *.sqlite3
 bot/logs/
+bot/data/

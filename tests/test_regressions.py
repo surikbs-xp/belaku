@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from datetime import date, datetime
@@ -11,6 +12,7 @@ import database as db
 import engine
 import gift_nifty
 import kite_auth
+import kite_client
 import order_manager
 import pytest
 import strategy
@@ -1060,3 +1062,128 @@ def test_live_position_mismatch_blocks_reconciliation(monkeypatch, tmp_path) -> 
 
     assert message is not None
     assert "Position mismatch" in message
+
+
+# ---------------------------------------------------------------------------
+# NSE holiday calendar
+# ---------------------------------------------------------------------------
+
+def _calendar(monkeypatch, tmp_path, payload=None, *, fail=False):
+    """Build a HolidayCalendar whose network call is stubbed."""
+    import market_calendar
+
+    if fail:
+        def boom(*_args, **_kwargs):
+            raise OSError("network down")
+
+        monkeypatch.setattr(market_calendar.urllib.request, "urlopen", boom)
+    else:
+        class Response:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        monkeypatch.setattr(
+            market_calendar.urllib.request,
+            "urlopen",
+            lambda *_a, **_k: Response(json.dumps(payload).encode()),
+        )
+    return market_calendar.HolidayCalendar(cache_path=tmp_path / "nse_holidays.json")
+
+
+def test_holiday_calendar_parses_the_nse_fo_segment(monkeypatch, tmp_path) -> None:
+    calendar = _calendar(
+        monkeypatch,
+        tmp_path,
+        {
+            "CM": [{"tradingDate": "01-Jan-2026", "description": "New Year"}],
+            "FO": [
+                {"tradingDate": "10-Nov-2026", "description": "Diwali-Balipratipada"},
+                {"tradingDate": "24-Nov-2026", "description": "Guru Nanak Gurpurb"},
+                {"tradingDate": "not-a-date", "description": "junk"},
+            ],
+        },
+    )
+
+    assert calendar.available
+    assert calendar.status()["source"] == "nse"
+    assert calendar.holiday_name(date(2026, 11, 10)) == "Diwali-Balipratipada"
+    assert calendar.holiday_name(date(2026, 11, 24)) == "Guru Nanak Gurpurb"
+    # The CM-only date must not leak into the F&O calendar.
+    assert calendar.holiday_name(date(2026, 1, 1)) is None
+    assert calendar.status()["count"] == 2
+
+
+def test_holiday_calendar_falls_back_to_cache_when_nse_is_unreachable(monkeypatch, tmp_path) -> None:
+    cache = tmp_path / "nse_holidays.json"
+    cache.write_text(json.dumps({"holidays": {"2026-11-10": "Diwali-Balipratipada"}}))
+
+    import market_calendar
+
+    def boom(*_args, **_kwargs):
+        raise OSError("network down")
+
+    monkeypatch.setattr(market_calendar.urllib.request, "urlopen", boom)
+    calendar = market_calendar.HolidayCalendar(cache_path=cache)
+
+    assert calendar.available
+    assert calendar.status()["source"] == "cache"
+    assert calendar.holiday_name(date(2026, 11, 10)) == "Diwali-Balipratipada"
+    assert calendar.status()["error"] is not None
+
+
+def test_holiday_calendar_reports_unavailable_without_network_or_cache(monkeypatch, tmp_path) -> None:
+    calendar = _calendar(monkeypatch, tmp_path, fail=True)
+
+    assert not calendar.available
+    assert calendar.status()["source"] == "none"
+    assert calendar.holiday_name(date(2026, 11, 10)) is None
+
+
+def test_market_status_closes_on_a_trading_holiday(monkeypatch, tmp_path) -> None:
+    calendar = _calendar(
+        monkeypatch,
+        tmp_path,
+        {"FO": [{"tradingDate": "10-Nov-2026", "description": "Diwali-Balipratipada"}]},
+    )
+    monkeypatch.setattr(kite_client, "get_calendar", lambda: calendar)
+
+    # 10 Nov 2026 is a Tuesday inside the 09:15-15:30 window.
+    status = kite_client.market_status(datetime(2026, 11, 10, 11, 0, tzinfo=IST))
+
+    assert status["is_open"] is False
+    assert status["holiday"] == "Diwali-Balipratipada"
+    assert "Holiday" in status["reason"]
+
+
+def test_market_status_is_unverified_without_a_calendar(monkeypatch, tmp_path) -> None:
+    calendar = _calendar(monkeypatch, tmp_path, fail=True)
+    monkeypatch.setattr(kite_client, "get_calendar", lambda: calendar)
+
+    status = kite_client.market_status(datetime(2026, 11, 10, 11, 0, tzinfo=IST))
+
+    assert status["is_open"] is False
+    assert status["calendar_known"] is False
+    assert "unverified" in status["reason"]
+
+
+def test_market_status_opens_on_a_normal_session(monkeypatch, tmp_path) -> None:
+    calendar = _calendar(
+        monkeypatch,
+        tmp_path,
+        {"FO": [{"tradingDate": "10-Nov-2026", "description": "Diwali-Balipratipada"}]},
+    )
+    monkeypatch.setattr(kite_client, "get_calendar", lambda: calendar)
+
+    status = kite_client.market_status(datetime(2026, 11, 11, 11, 0, tzinfo=IST))
+
+    assert status["is_open"] is True
+    assert status["calendar_known"] is True

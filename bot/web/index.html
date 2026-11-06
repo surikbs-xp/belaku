@@ -89,6 +89,16 @@
     <button id="btn-resume" class="btn btn-warn">Resume strategy</button>
   </div>
 
+  <!-- ── LIVE readiness ─────────────────────────────────────────────── -->
+  <div id="live-banner" class="live-banner hidden">
+    <span class="live-banner-icon">⚠</span>
+    <div class="live-banner-body">
+      <p id="live-banner-title" class="live-banner-title">LIVE pre-flight</p>
+      <ul id="live-banner-checks" class="live-banner-list"></ul>
+    </div>
+    <button id="btn-kite-relogin" class="btn btn-warn">Re-login to Kite</button>
+  </div>
+
   <!-- ── Tabs ───────────────────────────────────────────────────────── -->
   <nav class="tabs" role="tablist">
     <button class="tab tab-active" data-tab="monitor"   role="tab">Dashboard</button>
@@ -323,6 +333,50 @@
       <div class="panel panel-metric"><p class="metric-label">Trades</p><p id="a-trades" class="metric-value">—</p></div>
     </div>
 
+    <!-- P&L calendar -->
+    <div class="panel">
+      <div class="panel-head panel-head-wrap">
+        <div>
+          <h2 class="section-title">P&amp;L calendar</h2>
+          <p id="cal-caption" class="metric-sub">—</p>
+        </div>
+        <div class="toolbar">
+          <button id="cal-prev" class="btn btn-neutral btn-icon" type="button" aria-label="Previous month">&lsaquo;</button>
+          <button id="cal-today" class="btn btn-neutral" type="button">This month</button>
+          <button id="cal-next" class="btn btn-neutral btn-icon" type="button" aria-label="Next month">&rsaquo;</button>
+        </div>
+      </div>
+
+      <div class="cal-head">
+        <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+      </div>
+      <div id="cal-grid" class="cal-grid"></div>
+
+      <div class="cal-legend">
+        <span class="cal-swatch cal-swatch-win"></span><span>Profit</span>
+        <span class="cal-swatch cal-swatch-loss"></span><span>Loss</span>
+        <span class="cal-swatch cal-swatch-holiday"></span><span>Exchange holiday</span>
+        <span class="cal-swatch cal-swatch-flat"></span><span>No trades</span>
+      </div>
+    </div>
+
+    <!-- Trades for the clicked day -->
+    <div id="cal-day-panel" class="panel hidden">
+      <div class="panel-head">
+        <h2 id="cal-day-title" class="section-title">—</h2>
+        <span id="cal-day-summary" class="metric-sub">—</span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr><th>Time</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Exit</th><th class="num">Points</th><th class="num">Net</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="cal-day-body"></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="panel">
       <div class="panel-head">
         <h2 class="section-title">Trade ledger</h2>
@@ -332,7 +386,8 @@
         <table class="data-table">
           <thead>
             <tr><th>Closed</th><th>Symbol</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
-                <th class="num">Exit</th><th class="num">Gross</th><th class="num">Fees</th><th class="num">Net</th><th>Reason</th></tr>
+                <th class="num">Exit</th><th class="num">Points</th><th class="num">Gross</th><th class="num">Fees</th>
+                <th class="num">Net</th><th>Reason</th></tr>
           </thead>
           <tbody id="trades-body"></tbody>
         </table>
