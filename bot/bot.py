@@ -46,7 +46,15 @@ from pydantic import BaseModel, Field
 
 import database as db
 import kite_auth
-from config import LIVE, PAPER, get_execution_mode, set_execution_mode, settings, validate
+from config import (
+    LIVE,
+    PAPER,
+    get_execution_mode,
+    set_execution_mode,
+    settings,
+    strategy_summary,
+    validate,
+)
 from engine import get_engine
 from gift_nifty import GIFT_KEY, get_feed, reset_feed
 from kite_client import future_symbol, get_client, market_status
@@ -356,6 +364,7 @@ def api_status() -> dict[str, Any]:
             },
         },
         "engine": get_engine().status(),
+        "strategy_config": strategy_summary(),
         "market": market,
         "symbol": {
             "current": manager.current_symbol(),

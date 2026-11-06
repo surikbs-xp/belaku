@@ -9,8 +9,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
+
+import strategy
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -85,6 +88,9 @@ class Settings:
     # --- Strategy (st.pine) ----------------------------------------------
     # The engine evaluates SuperTrend and PSAR on GIFT Nifty candles.
     strategy_st_min_agree: int = _env_int("STRATEGY_ST_MIN_AGREE", 2)
+    # Triple SuperTrend as "atr_length:multiplier" pairs. Each pair is one vote
+    # in the trend tally; STRATEGY_ST_MIN_AGREE of them must agree.
+    strategy_supertrends: str = _env("STRATEGY_SUPERTRENDS", "11:1,12:2,13:3")
     strategy_psar_start: float = _env_float("STRATEGY_PSAR_START", 0.02)
     strategy_psar_increment: float = _env_float("STRATEGY_PSAR_INCREMENT", 0.02)
     strategy_psar_maximum: float = _env_float("STRATEGY_PSAR_MAXIMUM", 0.2)
@@ -133,13 +139,45 @@ def set_execution_mode(mode: str) -> str:
     return mode
 
 
-def strategy_params() -> dict[str, float]:
+def strategy_params() -> dict[str, Any]:
     """Indicator parameters for :mod:`strategy`, sourced from the environment."""
     return {
         "st_min_agree": settings.strategy_st_min_agree,
+        "supertrends": supertrend_config(),
         "psar_start": settings.strategy_psar_start,
         "psar_increment": settings.strategy_psar_increment,
         "psar_maximum": settings.strategy_psar_maximum,
+    }
+
+
+def supertrend_config() -> tuple[tuple[float, int], ...]:
+    """Configured SuperTrend instances as ``(multiplier, atr_length)`` pairs.
+
+    Read from ``STRATEGY_SUPERTRENDS`` on every call so a restart-free edit of
+    the environment is picked up, and parsed by :mod:`strategy` so the format
+    lives in one place.
+    """
+    return strategy.parse_supertrends(
+        _env("STRATEGY_SUPERTRENDS", settings.strategy_supertrends)
+    )
+
+
+def strategy_summary() -> dict[str, Any]:
+    """Human-readable strategy configuration for the dashboard."""
+    configs = supertrend_config()
+    return {
+        "supertrends": [
+            {"length": length, "multiplier": factor} for factor, length in configs
+        ],
+        "supertrend_label": " · ".join(
+            f"{length}×{factor:g}" for factor, length in configs
+        ),
+        "min_agree": settings.strategy_st_min_agree,
+        "psar": {
+            "start": settings.strategy_psar_start,
+            "increment": settings.strategy_psar_increment,
+            "maximum": settings.strategy_psar_maximum,
+        },
     }
 
 

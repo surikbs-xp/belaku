@@ -57,6 +57,9 @@ const state = {
   // broker for margin and position state.
   readiness: null,
   readinessCheckedAt: 0,
+  // Strategy configuration from /api/status, so the vote bar and labels follow
+  // STRATEGY_SUPERTRENDS instead of hardcoded periods.
+  strategyConfig: null,
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -310,12 +313,17 @@ function renderExecutionMeta(status) {
   const config = status.config || {};
   const symbol = status.symbol || {};
   const feed = (status.engine || {}).feed || {};
+  state.strategyConfig = status.strategy_config || null;
   setText('exec-lots', `${config.default_lots ?? '—'} lot`);
   setText('exec-product', `${config.order_type || '—'} · ${config.product || '—'}`);
   $('exec-product').title = symbol.next && symbol.next !== symbol.current
     ? `Rolls to ${symbol.next} on expiry`
     : '';
   setText('indicator-source', `GIFT ${feed.interval || '—'} · ${feed.bars ?? 0} bars · source ${feed.history_source || '—'}`);
+  const summary = state.strategyConfig;
+  if (summary?.supertrend_label) {
+    setText('st-config-label', `SuperTrend ${summary.supertrend_label} with PSAR`);
+  }
 }
 
 /**
@@ -438,7 +446,7 @@ function renderEngine(eng, market) {
   } else {
     const order = ['supertrend', 'psar'];
     const labels = {
-      supertrend: 'Trend vote · 2 of 3',
+      supertrend: `Trend vote · ${state.strategyConfig?.min_agree ?? 2} of ${state.strategyConfig?.supertrends?.length ?? 3}`,
       psar: 'Price vs PSAR',
     };
     box.innerHTML = ['buy', 'sell'].map((side) => `
@@ -464,20 +472,29 @@ function renderEngine(eng, market) {
     const psarConditions = eng.current_values
       ? eng.current_conditions || conditions
       : indicatorConditions;
+    const stConfig = Array.isArray(values.supertrend_config) && values.supertrend_config.length
+      ? values.supertrend_config
+      : (state.strategyConfig?.supertrends || []);
+    const stTotal = Number(values.supertrend_total) || stConfig.length || 3;
+    const stLines = stConfig.length
+      ? stConfig.map((item) => level(values[item.key])).join(' · ')
+      : '—';
     setText('e-psar', level(values.psar));
     setText('e-psar-sub', psarConditions.buy_psar
       ? 'Price above · BUY condition passes'
       : psarConditions.sell_psar ? 'Price below · SELL condition passes' : 'BUY above · SELL below');
-    setText('e-st', `${values.supertrend_bull ?? 0}/3 bullish`);
-    setText('e-st-sub', `Lines ${level(values.st_10_1)} · ${level(values.st_11_2)} · ${level(values.st_12_3)}`);
-    renderVotes('st-votes', values.supertrend_bull, values.supertrend_bear, 3);
+    setText('e-st', `${values.supertrend_bull ?? 0}/${stTotal} bullish`);
+    setText('e-st-sub', `Lines ${stLines}`);
+    renderVotes('st-votes', values.supertrend_bull, values.supertrend_bear, stTotal);
+    renderVoteLegend('st-legend', stConfig, values);
     // PSAR is a single binary check: close above SAR is bullish.
     const psarAbove = !!psarConditions.buy_psar;
     const psarBelow = !!psarConditions.sell_psar;
     renderVotes('psar-votes', psarAbove ? 1 : 0, psarBelow ? 1 : 0, 1);
   } else {
     ['e-psar', 'e-st'].forEach((id) => setText(id, '—'));
-    renderVotes('st-votes', 0, 0, 3);
+    renderVotes('st-votes', 0, 0, state.strategyConfig?.supertrends?.length || 3);
+    renderVoteLegend('st-legend', state.strategyConfig?.supertrends || [], {});
     renderVotes('psar-votes', 0, 0, 1);
   }
 
@@ -513,6 +530,25 @@ function renderVotes(id, bull, bear, segments) {
   host.innerHTML = filled
     .map((kind) => `<span class="vote-seg ${kind}"></span>`)
     .join('');
+}
+
+/**
+ * Caption under the vote bar naming each SuperTrend instance, so a trader can
+ * tell which period voted which way instead of reading one merged bar.
+ */
+function renderVoteLegend(id, config, values) {
+  const host = $(id);
+  if (!host) return;
+  if (!Array.isArray(config) || !config.length) {
+    host.innerHTML = '';
+    return;
+  }
+  host.innerHTML = config.map((item) => {
+    const direction = num(item.direction);
+    const kind = direction === null || direction === 0 ? '' : direction < 0 ? 'bull' : 'bear';
+    const label = `${item.length}×${Number(item.multiplier)}`;
+    return `<span class="${kind}" title="${label} · line ${level(values[item.key])}">${label}</span>`;
+  }).join('');
 }
 
 /**
