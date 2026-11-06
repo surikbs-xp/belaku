@@ -12,7 +12,7 @@ the loop.
 | `bot/bot.py` | **The bot.** Entrypoint: tick feed, engine, mark loop, API, dashboard |
 | `bot/gift_nifty.py` | GIFT Nifty instrument resolution, KiteTicker subscription, tick→candle aggregation |
 | `bot/engine.py` | Evaluates `bot/st.pine` on GIFT Nifty bars; routes orders to the Nifty future |
-| `bot/strategy.py` | The `bot/st.pine` entry filters in Python (PSAR / triple SuperTrend) |
+| `bot/strategy.py` | The `bot/st.pine` entry filters in Python (RSI / TSV / PSAR / triple SuperTrend) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
 | `bot/kite_client.py` | KiteConnect wrapper; quotes, instrument lookup, mocked orders in PAPER |
 | `bot/kite_auth.py` | Kite login callback, request-token exchange, and access-token persistence |
@@ -68,9 +68,10 @@ auto-executed at 09:15.
 ### Warmup, stated plainly
 
 Kite serves **no historical data for NSEIX**, so the bot must build its own
-candles from live ticks. RSI and TSV are not entry filters. The remaining longest
-indicator is SuperTrend with ATR length 12, so the engine needs 12 closed candles
-before its first valid signal (about 60 minutes at `5minute`). After that, it
+candles from live ticks. Entry filters are RSI (14, buy below 20/sell above 80),
+TSV (13-bar sum of close change × volume, buy positive/sell negative), PSAR, and
+2-of-3 SuperTrend. The engine needs 15 closed candles before its first valid
+signal (about 75 minutes at `5minute`). After that, it
 evaluates each completed candle. Bars are persisted to the `gift_candles` table,
 so a restart **resumes** the warmup instead of restarting it.
 
@@ -188,7 +189,7 @@ requires `confirm=true`. Both are rejected with a `4xx` otherwise.
 * **Dashboard** — portfolio value, margin available (with utilisation
   bar), active mode pill (green LIVE / amber PAPER), real-time PnL coloured by
   sign, the GIFT Nifty signal engine (verdict, indicator values, which of the
-  two entry filters are live, warmup progress), open positions, a Paper/Live
+  four entry filters are live, warmup progress), open positions, a Paper/Live
   toggle, pause, and the panic button. Live mode still requires an explicit
   confirmation.
 * **Order Logs** — searchable, mode-filtered order book plus the engine signal
@@ -235,21 +236,21 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 
 ### Strategy evaluation
 
-`bot/strategy.py` implements the two entry filters from `bot/st.pine` §12–14
-(2-of-3 SuperTrends and PSAR). RSI and TSV are removed. `bot/engine.py` evaluates
-each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
+`bot/strategy.py` implements the four entry filters from `bot/st.pine` §11–14
+(RSI, TSV, 2-of-3 SuperTrends, and PSAR). TSV uses the Pine script's stated
+approximation; GIFT Nifty volume is a tick-count proxy, not exchange volume.
+`bot/engine.py` evaluates each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
 — mirroring the Pine `not longCondition[1]` guard, so a run of bullish bars
 produces exactly one entry.
 
-The engine reports warm-up progress until 12 closed bars are available, then
-evaluates every completed candle. The 12-bar minimum is required by the longest
-remaining SuperTrend ATR length.
+The engine reports warm-up progress until 15 closed bars are available, then
+evaluates every completed candle. The RSI length plus its initial close change
+requires the longest warm-up.
 
-The dashboard's condition checklist shows exactly which of the two are live,
+The dashboard's condition checklist shows exactly which of the four are live,
 so a quiet bot is explainable rather than mysterious.
 
-Removing RSI and TSV makes signals less selective; evaluate the changed strategy
-in paper mode before enabling live orders.
+Evaluate the restored filters in paper mode before enabling live orders.
 
 The Pine strategy defines entries but no stop-loss, profit target, or timed
 exit. Positions remain open until an opposite entry or manual square-off; the
