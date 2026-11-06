@@ -67,12 +67,12 @@ def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
             "low": 99.0 + index,
             "close": 100.0 + index,
         }
-        for index in range(13)
+        for index in range(14)
     ]
 
-    assert engine.required_bars() == 13
-    with pytest.raises(strategy.InsufficientData, match="need 13 closed candles"):
-        strategy.evaluate(candles[:12])
+    assert engine.required_bars() == 14
+    with pytest.raises(strategy.InsufficientData, match="need 14 closed candles"):
+        strategy.evaluate(candles[:13])
 
     verdict = strategy.evaluate(candles)
     assert set(verdict.conditions) == {
@@ -85,17 +85,51 @@ def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
         "psar",
         "supertrend_bull",
         "supertrend_bear",
-        "st_10_1",
-        "st_11_2",
-        "st_12_3",
+        "supertrend_total",
+        "supertrend_config",
+        "st_11_1",
+        "st_12_2",
+        "st_13_3",
     }
     assert isinstance(verdict.values["psar"], float)
     assert all(
         isinstance(verdict.values[key], float)
-        for key in ("st_10_1", "st_11_2", "st_12_3")
+        for key in ("st_11_1", "st_12_2", "st_13_3")
     )
     assert verdict.values["supertrend_bull"] == 3
     assert verdict.values["supertrend_bear"] == 0
+    assert verdict.values["supertrend_total"] == 3
+
+
+def test_supertrend_config_is_parsed_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_SUPERTRENDS", "9:1.5, 21:4")
+    assert config.supertrend_config() == ((1.5, 9), (4.0, 21))
+    assert config.strategy_params()["supertrends"] == ((1.5, 9), (4.0, 21))
+    assert config.strategy_summary()["supertrend_label"] == "9×1.5 · 21×4"
+
+
+def test_supertrend_config_falls_back_when_the_spec_is_unusable(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_SUPERTRENDS", "nonsense, 0:1, 12:-2")
+    assert config.supertrend_config() == strategy.DEFAULT_SUPERTRENDS
+
+
+def test_configured_supertrends_drive_the_vote_and_warmup() -> None:
+    candles = [
+        {"high": 101.0 + index, "low": 99.0 + index, "close": 100.0 + index}
+        for index in range(22)
+    ]
+    params = {"supertrends": ((1.0, 9), (2.0, 21))}
+
+    assert strategy.required_bars(params["supertrends"]) == 22
+    with pytest.raises(strategy.InsufficientData, match="need 22 closed candles"):
+        strategy.evaluate(candles[:21], params)
+
+    verdict = strategy.evaluate(candles, params)
+    assert verdict.values["supertrend_total"] == 2
+    assert verdict.values["supertrend_bull"] == 2
+    assert {"st_9_1", "st_21_2"} <= set(verdict.values)
+    assert "st_11_1" not in verdict.values
+    assert verdict.detail.endswith("ST bull=2/2 bear=0/2")
 
 
 def test_psar_initializes_direction_from_first_close_change() -> None:
@@ -601,7 +635,7 @@ def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog
         lambda *_args: strategy.StrategyVerdict(
             strategy.NEUTRAL,
             100.5,
-            values={"psar": 98.75, "st_10_1": 99.25},
+            values={"psar": 98.75, "st_11_1": 99.25},
         ),
     )
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
@@ -619,7 +653,7 @@ def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog
     assert "candle_at=2026-11-05T22:10:00+05:30" in message
     assert '"close": 100.5' in message
     assert '"psar": 98.75' in message
-    assert '"st_10_1": 99.25' in message
+    assert '"st_11_1": 99.25' in message
 
 
 def test_engine_reverses_opposing_paper_position_on_startup(monkeypatch) -> None:

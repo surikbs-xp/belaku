@@ -2,7 +2,7 @@
 
 The Pine script only fires ``strategy.entry`` when both entry rules agree::
 
-    buyST   = strategyBullCount >= 2          # triple SuperTrend (10,1) (11,2) (12,3)
+    buyST   = strategyBullCount >= 2          # triple SuperTrend (11,1) (12,2) (13,3)
     buyPSAR = close > ta.sar(0.02, 0.02, 0.2)
 
     longCondition  = buyST and buyPSAR
@@ -33,16 +33,61 @@ BULL = "BULL"
 BEAR = "BEAR"
 NEUTRAL = "NEUTRAL"
 
+# Triple SuperTrend as (multiplier, atr_length). Each entry is one vote in the
+# trend tally; ``st_min_agree`` of them must agree before a signal is allowed.
+DEFAULT_SUPERTRENDS: tuple[tuple[float, int], ...] = ((1.0, 11), (2.0, 12), (3.0, 13))
+
 # Defaults mirror the input.* values in st.pine.
-DEFAULTS: dict[str, float] = {
+DEFAULTS: dict[str, Any] = {
     "psar_start": 0.02,
     "psar_increment": 0.02,
     "psar_maximum": 0.2,
     "st_min_agree": 2,
+    "supertrends": DEFAULT_SUPERTRENDS,
 }
 
-# Triple SuperTrend (factor, atr_length) as configured in st.pine section 10.
-SUPERTRENDS: tuple[tuple[float, int], ...] = ((1.0, 10), (2.0, 11), (3.0, 12))
+# Kept as the module-level default so callers that do not pass params still work.
+SUPERTRENDS: tuple[tuple[float, int], ...] = DEFAULT_SUPERTRENDS
+
+
+def parse_supertrends(
+    spec: str,
+    default: tuple[tuple[float, int], ...] = DEFAULT_SUPERTRENDS,
+) -> tuple[tuple[float, int], ...]:
+    """Parse ``"11:1,12:2,13:3"`` into ``((1.0, 11), (2.0, 12), (3.0, 13))``.
+
+    Each entry is ``atr_length:multiplier``. Entries that are malformed or
+    non-positive are dropped rather than raising, so a typo in the environment
+    cannot stop the bot from booting; if nothing usable remains the ``default``
+    triple is returned.
+    """
+    parsed: list[tuple[float, int]] = []
+    for chunk in spec.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        length_text, separator, factor_text = chunk.partition(":")
+        if not separator:
+            continue
+        try:
+            length = int(length_text.strip())
+            factor = float(factor_text.strip())
+        except ValueError:
+            continue
+        if length <= 0 or factor <= 0:
+            continue
+        parsed.append((factor, length))
+    return tuple(parsed) or default
+
+
+def required_bars(supertrends: Optional[Sequence[tuple[float, int]]] = None) -> int:
+    """Closed bars needed before every indicator has a value.
+
+    The longest SuperTrend needs ``length`` bars of ATR warm-up plus one bar to
+    compare against, so the requirement tracks the configured periods.
+    """
+    configs = tuple(supertrends) if supertrends else SUPERTRENDS
+    return max(max(length for _, length in configs) + 1, 2)
 
 
 class InsufficientData(RuntimeError):
@@ -121,6 +166,11 @@ def psar(
     return out
 
 
+def supertrend_key(factor: float, length: int) -> str:
+    """Stable dict key for one SuperTrend instance, e.g. ``st_11_1``."""
+    return f"st_{length}_{factor:g}"
+
+
 def supertrend(
     highs: Sequence[float],
     lows: Sequence[float],
@@ -143,6 +193,8 @@ def supertrend(
         length=length,
         multiplier=factor,
     )
+    # pandas-ta names its columns from the arguments, so the suffix must be
+    # derived from the same values rather than hardcoded.
     suffix = f"{length}_{float(factor)}"
     line = _optional_floats(frame[f"SUPERT_{suffix}"])
     library_directions = frame[f"SUPERTd_{suffix}"]
@@ -208,12 +260,14 @@ def evaluate(
     if len(candles) < 2:
         raise InsufficientData("need at least 2 candles")
 
+    supertrends = tuple(cfg.get("supertrends") or SUPERTRENDS)
+
     highs = _series(candles, "high")
     lows = _series(candles, "low")
     closes = _series(candles, "close")
     n = len(closes)
 
-    need = max(max(length for _, length in SUPERTRENDS) + 1, 2)
+    need = required_bars(supertrends)
     if n < need:
         raise InsufficientData(f"need {need} closed candles, got {n}")
 
@@ -231,10 +285,10 @@ def evaluate(
 
     directions: list[int] = []
     st_lines: dict[str, Optional[float]] = {}
-    for factor, length in SUPERTRENDS:
+    for factor, length in supertrends:
         line, direction = supertrend(highs, lows, closes, factor, length)
         directions.append(direction[last])
-        st_lines[f"st_{length}_{factor:g}"] = line[last]
+        st_lines[supertrend_key(factor, length)] = line[last]
 
     if any(d == 0 for d in directions) or psar_val is None or any(
         line is None for line in st_lines.values()
@@ -269,11 +323,22 @@ def evaluate(
         "psar": round(psar_val, 4),
         "supertrend_bull": bull_count,
         "supertrend_bear": bear_count,
+        "supertrend_total": len(supertrends),
+        "supertrend_config": [
+            {
+                "length": length,
+                "multiplier": factor,
+                "key": supertrend_key(factor, length),
+                # Negative is bullish, matching the internal convention.
+                "direction": direction,
+            }
+            for (factor, length), direction in zip(supertrends, directions)
+        ],
         **{k: (round(v, 4) if isinstance(v, float) and math.isfinite(v) else v) for k, v in st_lines.items()},
     }
     detail = (
         f"close={close:.2f} psar={psar_val:.2f} "
-        f"ST bull={bull_count}/3 bear={bear_count}/3"
+        f"ST bull={bull_count}/{len(supertrends)} bear={bear_count}/{len(supertrends)}"
     )
     return StrategyVerdict(
         signal=signal,
@@ -290,10 +355,14 @@ __all__ = [
     "BEAR",
     "NEUTRAL",
     "DEFAULTS",
+    "DEFAULT_SUPERTRENDS",
     "SUPERTRENDS",
     "InsufficientData",
     "StrategyVerdict",
     "evaluate",
+    "parse_supertrends",
     "psar",
+    "required_bars",
     "supertrend",
+    "supertrend_key",
 ]

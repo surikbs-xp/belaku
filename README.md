@@ -71,9 +71,10 @@ auto-executed at 09:15.
 
 Kite **does** serve GIFT Nifty (NSEIX) history, including the overnight session,
 so the bot loads its candles from `kite.historical_data` and treats them as the
-source of truth. Entry rules are PSAR and 2-of-3 SuperTrend. The engine needs 13
-closed candles before its first valid signal (about 65 minutes at `5minute`),
-matching the SuperTrend warm-up. After that, it evaluates each completed candle.
+source of truth. Entry rules are PSAR and 2-of-3 SuperTrend. The engine needs 14
+closed candles before its first valid signal (about 70 minutes at `5minute`),
+matching the longest SuperTrend's warm-up. After that, it evaluates each
+completed candle.
 Bars are persisted to the `gift_candles` table, so a restart **resumes** the
 warmup instead of restarting it.
 
@@ -218,7 +219,9 @@ visible without tailing logs.
 |---|---|
 | `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
-| `STRATEGY_*` | the SuperTrend agreement threshold and PSAR parameters |
+| `STRATEGY_SUPERTRENDS` | the SuperTrend instances as `atr_length:multiplier` pairs (default `11:1,12:2,13:3`) |
+| `STRATEGY_ST_MIN_AGREE` | how many SuperTrends must agree before a signal is allowed |
+| `STRATEGY_PSAR_*` | Parabolic SAR start / increment / maximum |
 
 If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 — the indicators are only meaningful on the timeframe they were tuned for.
@@ -243,14 +246,16 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 `pandas-ta-classic` for triple SuperTrend and a standard Wilder Parabolic SAR on
 GIFT Nifty OHLC. The dashboard shows indicator values for the forming candle
 when available, but strategy signals and orders remain based on completed
-candles. No synthetic or buffer candles are added; all 13 warm-up bars must be
+candles. No synthetic or buffer candles are added; all 14 warm-up bars must be
 observed or restored from persisted GIFT Nifty data.
 `bot/engine.py` evaluates each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
 — mirroring the Pine `not longCondition[1]` guard, so a run of bullish bars
 produces exactly one entry.
 
-The engine reports warm-up progress until 13 closed bars are available, then
-evaluates every completed candle.
+The engine reports warm-up progress until enough closed bars are available, then
+evaluates every completed candle. The requirement is derived from the configured
+SuperTrend periods (`longest ATR length + 1`), so it follows
+`STRATEGY_SUPERTRENDS` automatically.
 
 The dashboard's condition checklist shows exactly which of the two rules pass,
 so a quiet bot is explainable rather than mysterious.

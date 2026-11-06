@@ -86,7 +86,7 @@ class EngineState:
 
 def required_bars() -> int:
     """Bars ``strategy.evaluate`` needs before it will produce a verdict."""
-    return max(max(length for _, length in strategy.SUPERTRENDS) + 1, 2)
+    return strategy.required_bars(strategy_params().get("supertrends"))
 
 
 class StrategyEngine:

@@ -192,6 +192,7 @@
           <p class="metric-label">SuperTrend vote</p>
           <p id="e-st" class="indicator-value">—</p>
           <div id="st-votes" class="vote-bar" aria-hidden="true"></div>
+          <div id="st-legend" class="vote-legend" aria-hidden="true"></div>
           <p id="e-st-sub" class="metric-sub">Lines —</p>
           <p id="e-st-time" class="metric-sub">Timestamp unavailable</p>
         </div>
@@ -265,7 +266,7 @@
     <div class="panel">
       <div class="panel-head">
         <h2 class="section-title">Live rule checks</h2>
-        <span class="metric-sub">SuperTrend 10×1 · 11×2 · 12×3 with PSAR</span>
+        <span id="st-config-label" class="metric-sub">SuperTrend 11×1 · 12×2 · 13×3 with PSAR</span>
       </div>
       <div id="conditions" class="condition-grid">
         <p class="condition-empty">Collecting closed candles before evaluating the rules.</p>
