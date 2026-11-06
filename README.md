@@ -69,15 +69,17 @@ auto-executed at 09:15.
 
 ### Warmup, stated plainly
 
-Kite serves **no historical data for NSEIX**, so the bot must build its own
-candles from live ticks. Entry rules are PSAR and 2-of-3 SuperTrend. The engine
-needs 13 closed candles before its first valid signal (about 65 minutes at
-`5minute`), matching `pandas-ta`'s SuperTrend warm-up. After that, it
-evaluates each completed candle. Bars are persisted to the `gift_candles` table,
-so a restart **resumes** the warmup instead of restarting it.
+Kite **does** serve GIFT Nifty (NSEIX) history, including the overnight session,
+so the bot loads its candles from `kite.historical_data` and treats them as the
+source of truth. Entry rules are PSAR and 2-of-3 SuperTrend. The engine needs 13
+closed candles before its first valid signal (about 65 minutes at `5minute`),
+matching the SuperTrend warm-up. After that, it evaluates each completed candle.
+Bars are persisted to the `gift_candles` table, so a restart **resumes** the
+warmup instead of restarting it.
 
-The first ~65 minutes after a fresh install will not trade because GIFT Nifty
-history is unavailable; persisted bars can reduce that wait after a restart.
+A fresh install therefore warms up immediately from Kite history rather than
+waiting ~65 minutes for ticks to accumulate. Tick-built candles are used only
+while history is unavailable, and the feed logs which source it is on.
 
 ## Setup
 
@@ -237,13 +239,12 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 
 ### Strategy evaluation
 
-`bot/strategy.py` applies the Pine strategy's entry rules using `pandas-ta` for
-PSAR and triple SuperTrend calculations on GIFT Nifty OHLC. The dashboard shows
-indicator values for the forming candle when available, but strategy signals
-and orders remain based on completed candles. No synthetic or buffer candles
-are added; all 13 warm-up bars must be observed or restored from persisted
-GIFT Nifty data. The local library calculations are not intended to match
-TradingView's numeric values exactly.
+`bot/strategy.py` applies the Pine strategy's entry rules using
+`pandas-ta-classic` for triple SuperTrend and a standard Wilder Parabolic SAR on
+GIFT Nifty OHLC. The dashboard shows indicator values for the forming candle
+when available, but strategy signals and orders remain based on completed
+candles. No synthetic or buffer candles are added; all 13 warm-up bars must be
+observed or restored from persisted GIFT Nifty data.
 `bot/engine.py` evaluates each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
 — mirroring the Pine `not longCondition[1]` guard, so a run of bullish bars
 produces exactly one entry.
@@ -254,8 +255,32 @@ evaluates every completed candle.
 The dashboard's condition checklist shows exactly which of the two rules pass,
 so a quiet bot is explainable rather than mysterious.
 
-The indicator library is `pandas-ta` (pinned in `requirements.txt`); the bot
-logs the OHLC input and PSAR/SuperTrend outputs once per completed GIFT candle.
+SuperTrend comes from `pandas-ta-classic` (pinned in `requirements.txt`), the
+maintained fork of `pandas-ta`; the original's last release needs numba and
+cannot be installed on this project's Python 3.11 at all. Both forks produce
+identical SuperTrend output. Parabolic SAR is computed in `bot/strategy.py` with
+the standard Wilder algorithm because the library's `psar` was measured to
+deviate from it on about 30% of bars. Both indicators are pinned by tests that
+compare them against independently transcribed Pine references, and both match
+those references exactly on 1119 real GIFT Nifty bars. The bot logs the OHLC
+input, history length and PSAR/SuperTrend outputs once per completed GIFT candle.
+
+#### Candle data quality
+
+Indicators are recursive, so a hole or a truncated bar skews every later value
+until it washes out (measured: PSAR off by tens of points and SuperTrend by up to
+~14 points right after a gap, converging after roughly 50 bars). The feed
+therefore never feeds a bar to the strategy unless it observed it from the open:
+
+* a bar whose first tick arrived more than 10 s late (feed joined mid-bar),
+* a bar spanning a websocket disconnect, and
+* a bar cut off by a shutdown (kept only so a restart *inside the same
+  5-minute bucket* can resume it)
+
+are stored with a `partial` flag and excluded. The `history_bars` field in the
+indicator log shows how much clean history the bot has. Hours when the bot was
+not running are backfilled from Kite history on the next refresh, so a restart
+does not leave a hole in the series.
 Local runs write rotating logs to `bot/logs/bot.log`; Docker writes them to
 `/data/bot.log` in the persistent data volume.
 

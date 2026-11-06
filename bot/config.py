@@ -89,8 +89,9 @@ class Settings:
     strategy_psar_increment: float = _env_float("STRATEGY_PSAR_INCREMENT", 0.02)
     strategy_psar_maximum: float = _env_float("STRATEGY_PSAR_MAXIMUM", 0.2)
     # --- GIFT Nifty signal feed -------------------------------------------
-    # The engine builds its own candles from live NSEIX ticks (Kite serves no
-    # GIFT Nifty history), then evaluates st.pine on them. This interval must
+    # The engine loads GIFT Nifty candles from Kite history (the source of
+    # truth) and falls back to building them from live NSEIX ticks only while
+    # history is unavailable, then evaluates st.pine on them. This interval must
     # match the timeframe the Pine strategy was tuned on.
     gift_candle_interval: str = _env("GIFT_CANDLE_INTERVAL", "5minute")
 

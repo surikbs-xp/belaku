@@ -242,6 +242,12 @@ async def lifespan(app: FastAPI):
     feed = get_feed()
     restored = feed.load_persisted()
     _connect_kite_on_startup()
+    # Kite serves GIFT Nifty history, so warm the indicators from it instead of
+    # waiting ~65 minutes for tick-built candles.
+    try:
+        restored = feed.refresh_history(force=True) or restored
+    except Exception as exc:  # pragma: no cover - network
+        log.warning("Initial GIFT Nifty history load failed: %s", exc)
 
     # 2. Strategy engine: evaluates GIFT Nifty bars, trades the NFO future.
     engine = get_engine()

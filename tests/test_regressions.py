@@ -12,7 +12,6 @@ import engine
 import gift_nifty
 import kite_auth
 import order_manager
-import pandas as pd
 import pytest
 import strategy
 from config import BASE_DIR
@@ -97,28 +96,274 @@ def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
     assert verdict.values["supertrend_bear"] == 0
 
 
-def test_psar_passes_configured_acceleration_to_pandas_ta(monkeypatch) -> None:
-    captured = {}
+def test_psar_initializes_direction_from_first_close_change() -> None:
+    assert strategy.psar([10.0, 9.0, 8.0], [8.0, 7.0, 6.0], [9.0, 8.0, 7.0])[1] == 10.0
 
-    def fake_psar(high, low, close, *, af0, af, max_af):
-        captured.update(af0=af0, af=af, max_af=max_af)
-        return pd.DataFrame({
-            "PSARl_0.03_0.3": [float("nan"), 80.0, float("nan")],
-            "PSARs_0.03_0.3": [float("nan"), float("nan"), 85.0],
-        })
 
-    monkeypatch.setattr(strategy.ta, "psar", fake_psar)
-    values = strategy.psar(
-        [100.0, 101.0, 102.0],
-        [98.0, 99.0, 100.0],
-        [99.0, 100.0, 101.0],
-        start=0.03,
-        increment=0.05,
-        maximum=0.3,
+def test_psar_follows_wilder_reversal_and_two_bar_clamp() -> None:
+    highs = [10.0, 11.0, 12.0, 11.0, 10.0, 12.0]
+    lows = [8.0, 9.0, 10.0, 9.0, 8.0, 10.0]
+    closes = [9.0, 10.0, 11.0, 10.0, 9.0, 11.0]
+
+    assert strategy.psar(highs, lows, closes) == [None, 8.0, 8.0, 8.16, 12.0, 8.0]
+
+
+def test_psar_uses_configured_acceleration_steps() -> None:
+    highs = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0]
+    lows = [value - 2.0 for value in highs]
+    closes = [value - 1.0 for value in highs]
+
+    default = strategy.psar(highs, lows, closes, increment=0.02)
+    faster = strategy.psar(highs, lows, closes, increment=0.05)
+
+    assert default[-1] != faster[-1]
+
+
+def _reference_series(bars: int = 300) -> tuple[list[float], list[float], list[float]]:
+    """Deterministic OHLC series used to pin the indicators to their references."""
+    import random
+
+    rng = random.Random(7)
+    closes = [24_600.0]
+    for _ in range(bars - 1):
+        closes.append(closes[-1] + rng.gauss(0, 12))
+    opens = [closes[0]] + closes[:-1]
+    highs = [max(o, c) + rng.uniform(0, 8) for o, c in zip(opens, closes)]
+    lows = [min(o, c) - rng.uniform(0, 8) for o, c in zip(opens, closes)]
+    return highs, lows, closes
+
+
+def _reference_psar(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    start: float = 0.02,
+    increment: float = 0.02,
+    maximum: float = 0.2,
+) -> list[float | None]:
+    """Published Pine ``ta.sar`` reference, transcribed independently of the bot."""
+    out: list[float | None] = [None] * len(highs)
+    if len(highs) < 2:
+        return out
+    is_below = closes[1] > closes[0]
+    result = lows[0] if is_below else highs[0]
+    extreme = highs[1] if is_below else lows[1]
+    acceleration = start
+    out[1] = result
+    for i in range(2, len(highs)):
+        result += acceleration * (extreme - result)
+        if is_below:
+            if result > lows[i]:
+                is_below = False
+                result = max(highs[i], extreme)
+                extreme = lows[i]
+                acceleration = start
+            elif highs[i] > extreme:
+                extreme = highs[i]
+                acceleration = min(acceleration + increment, maximum)
+        else:
+            if result < highs[i]:
+                is_below = True
+                result = min(lows[i], extreme)
+                extreme = highs[i]
+                acceleration = start
+            elif lows[i] < extreme:
+                extreme = lows[i]
+                acceleration = min(acceleration + increment, maximum)
+        if is_below:
+            result = min(result, lows[i - 1], lows[i - 2])
+        else:
+            result = max(result, highs[i - 1], highs[i - 2])
+        out[i] = result
+    return out
+
+
+def _reference_supertrend(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    length: int,
+    factor: float,
+) -> tuple[list[float | None], list[int]]:
+    """TradingView ``ta.supertrend`` reference: RMA ATR, ratcheted bands.
+
+    Returns ``(line, direction)`` with ``direction == 1`` meaning bullish, which
+    is the opposite sign of ``strategy.supertrend``'s convention.
+    """
+    count = len(highs)
+    true_range: list[float] = [float("nan")] * count
+    for i in range(1, count):
+        true_range[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+
+    atr: list[float] = [float("nan")] * count
+    seed: list[float] = []
+    running = float("nan")
+    for i, value in enumerate(true_range):
+        if value != value:  # NaN
+            continue
+        if running != running:
+            seed.append(value)
+            if len(seed) == length:
+                running = sum(seed) / length
+                atr[i] = running
+            continue
+        running = (running * (length - 1) + value) / length
+        atr[i] = running
+
+    final_upper: list[float] = [float("nan")] * count
+    final_lower: list[float] = [float("nan")] * count
+    line: list[float | None] = [None] * count
+    direction: list[int] = [0] * count
+    for i in range(1, count):
+        if atr[i] != atr[i]:
+            continue
+        middle = (highs[i] + lows[i]) / 2.0
+        upper = middle + factor * atr[i]
+        lower = middle - factor * atr[i]
+        if final_upper[i - 1] != final_upper[i - 1] or final_lower[i - 1] != final_lower[i - 1]:
+            final_upper[i], final_lower[i], trend = upper, lower, 1
+        else:
+            final_upper[i] = (
+                upper
+                if upper < final_upper[i - 1] or closes[i - 1] > final_upper[i - 1]
+                else final_upper[i - 1]
+            )
+            final_lower[i] = (
+                lower
+                if lower > final_lower[i - 1] or closes[i - 1] < final_lower[i - 1]
+                else final_lower[i - 1]
+            )
+            if closes[i] > final_upper[i - 1]:
+                trend = 1
+            elif closes[i] < final_lower[i - 1]:
+                trend = -1
+            else:
+                trend = direction[i - 1]
+        direction[i] = trend
+        line[i] = final_lower[i] if trend > 0 else final_upper[i]
+    return line, direction
+
+
+def test_psar_matches_the_pine_reference_on_a_long_series() -> None:
+    highs, lows, closes = _reference_series()
+
+    values = strategy.psar(highs, lows, closes)
+    expected = _reference_psar(highs, lows, closes)
+
+    assert values == pytest.approx(expected, abs=1e-9)
+
+
+def test_supertrend_matches_the_pine_reference_on_a_long_series() -> None:
+    highs, lows, closes = _reference_series()
+
+    for factor, length in strategy.SUPERTRENDS:
+        line, directions = strategy.supertrend(highs, lows, closes, factor, length)
+        expected_line, expected_direction = _reference_supertrend(
+            highs, lows, closes, length, factor
+        )
+
+        assert line == pytest.approx(expected_line, abs=1e-9)
+        # strategy.supertrend negates the library direction, so bullish is < 0.
+        assert directions == [-value for value in expected_direction]
+
+
+def _gift_ticks(feed: GiftNiftyFeed, *ticks: tuple[float, datetime]) -> None:
+    feed._builder.on_close = feed._on_bar_close
+    for price, moment in ticks:
+        feed._builder.add_tick(price, moment)
+
+
+def _at(minute: int, second: int = 0) -> datetime:
+    return datetime(2026, 11, 6, 10, minute, second, tzinfo=IST)
+
+
+def test_bar_joined_late_is_excluded_from_indicator_history(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    feed = GiftNiftyFeed("5minute")
+
+    _gift_ticks(
+        feed,
+        (100.0, _at(1, 30)),  # feed joined 90s into the 10:00 bar
+        (101.0, _at(5, 1)),
+        (102.0, _at(10, 1)),
     )
 
-    assert captured == {"af0": 0.03, "af": 0.05, "max_af": 0.3}
-    assert values == [None, 80.0, 85.0]
+    assert [candle["time"] for candle in feed.candles()] == ["2026-11-06T10:05:00+05:30"]
+    stored = {row["start"][11:16]: row["partial"] for row in db.get_gift_candles()}
+    assert stored == {"10:00": gift_nifty.PARTIAL_GAP, "10:05": gift_nifty.PARTIAL_NONE}
+
+
+def test_feed_outage_inside_a_bar_excludes_that_bar_only(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    feed = GiftNiftyFeed("5minute")
+    feed._builder.on_close = feed._on_bar_close
+    feed._builder.add_tick(100.0, _at(0, 1))
+    feed._builder.add_tick(101.0, _at(5, 1))
+    feed._builder.mark_outage()
+    feed._builder.add_tick(102.0, _at(5, 2))  # reconnected, same bar
+    feed._builder.add_tick(103.0, _at(10, 1))
+    feed._builder.add_tick(104.0, _at(15, 1))
+
+    assert [candle["time"][11:16] for candle in feed.candles()] == ["10:00", "10:10"]
+
+
+def test_shutdown_cut_bar_is_dropped_unless_restarted_in_same_bucket(
+    monkeypatch, tmp_path
+) -> None:
+    use_test_database(monkeypatch, tmp_path)
+
+    class FixedDateTime(datetime):
+        current = datetime(2026, 11, 6, 10, 2, 0, tzinfo=IST)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    monkeypatch.setattr(gift_nifty, "datetime", FixedDateTime)
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 0, 3, tzinfo=IST)
+    first = GiftNiftyFeed("5minute")
+    first._handle_ticks(None, [{"last_price": 100.0}])
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 2, 0, tzinfo=IST)
+    first.stop()
+    assert [row["partial"] for row in db.get_gift_candles()] == [gift_nifty.PARTIAL_CUT]
+
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 20, 0, tzinfo=IST)
+    later = GiftNiftyFeed("5minute")
+    assert later.load_persisted() == 0
+    later._handle_ticks(None, [{"last_price": 101.0}])
+    assert later.candles() == []
+
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 2, 30, tzinfo=IST)
+    same_bucket = GiftNiftyFeed("5minute")
+    assert same_bucket.load_persisted() == 1
+    same_bucket._handle_ticks(None, [{"last_price": 102.0}])
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 5, 1, tzinfo=IST)
+    same_bucket._handle_ticks(None, [{"last_price": 103.0}])
+    assert [candle["time"][11:16] for candle in same_bucket.candles()] == ["10:00"]
+
+
+def test_init_db_adds_partial_column_to_existing_candle_table(tmp_path) -> None:
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE gift_candles (start TEXT PRIMARY KEY, open REAL NOT NULL, "
+            "high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, "
+            "volume REAL NOT NULL DEFAULT 0, ticks INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO gift_candles VALUES ('2026-11-06T10:00:00+05:30', 1, 2, 0, 1, 0, 3, 'x')"
+        )
+
+    db.init_db(path)
+
+    assert db.get_gift_candles(path=path)[0]["partial"] == 0
 
 
 def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
