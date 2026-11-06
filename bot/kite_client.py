@@ -18,6 +18,7 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Optional
 
 from config import LIVE, PAPER, settings
+from market_calendar import get_calendar
 
 try:  # The SDK is mandatory for LIVE mode but optional for paper trading.
     from kiteconnect import KiteConnect
@@ -54,26 +55,43 @@ MARKET_CLOSE = (15, 30)
 # Market clock
 # ---------------------------------------------------------------------------
 def market_status(now: Optional[datetime] = None) -> dict[str, Any]:
-    """NSE F&O session: Mon-Fri 09:15-15:30 IST (exchange holidays are not handled)."""
+    """NSE F&O session: Mon-Fri 09:15-15:30 IST, minus exchange holidays.
+
+    The holiday list comes from :mod:`market_calendar`. When no calendar could be
+    loaded the session is reported as unverified rather than assumed open, so a
+    LIVE order is never placed on a date the bot cannot vouch for.
+    """
     now = now or datetime.now(IST)
     open_time = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
     close_time = now.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0)
     is_weekday = now.weekday() < 5
-    is_open = is_weekday and open_time <= now <= close_time
-    if is_open:
-        reason = "Market open"
-    elif not is_weekday:
-        reason = "Weekend - market closed"
+
+    calendar = get_calendar()
+    calendar_known = calendar.available
+    holiday = calendar.holiday_name(now.date())
+
+    if not is_weekday:
+        is_open, reason = False, "Weekend - market closed"
+    elif holiday:
+        is_open, reason = False, f"Holiday - {holiday}"
+    elif not calendar_known:
+        is_open, reason = False, "Session unverified - no NSE holiday calendar available"
     elif now < open_time:
-        reason = "Pre-market - opens 09:15 IST"
+        is_open, reason = False, "Pre-market - opens 09:15 IST"
+    elif now > close_time:
+        is_open, reason = False, "Post-market - closed at 15:30 IST"
     else:
-        reason = "Post-market - closed at 15:30 IST"
+        is_open, reason = True, "Market open"
+
     return {
         "is_open": is_open,
         "now_ist": now.isoformat(timespec="seconds"),
         "session_open": open_time.isoformat(timespec="seconds"),
         "session_close": close_time.isoformat(timespec="seconds"),
         "reason": reason,
+        "holiday": holiday,
+        "calendar_known": calendar_known,
+        "calendar_source": calendar.status()["source"] if calendar_known else None,
     }
 
 
@@ -147,6 +165,8 @@ class KiteClient:
         self._last_prices: dict[str, float] = {}
         self._last_quote_at: Optional[datetime] = None
         self._auth_error: Optional[str] = None
+        self._session_cache: Optional[dict[str, Any]] = None
+        self._session_checked_at = 0.0
         self._init_sdk()
 
     # -- SDK bootstrap ---------------------------------------------------
@@ -211,6 +231,33 @@ class KiteClient:
         if profile.get("ok"):
             return {"authenticated": True, "detail": profile.get("user_id", "")}
         return {"authenticated": False, "detail": profile.get("error", "Unknown error")}
+
+    def session_status(self, max_age: float = 30.0) -> dict[str, Any]:
+        """Cached validity of the Kite session.
+
+        ``profile()`` is a network round-trip, so an order path cannot call it on
+        every signal. The result is cached briefly: long enough to keep order
+        placement fast, short enough that a token expiring mid-session is caught
+        within one engine cycle.
+        """
+        if not self.sdk_ready:
+            return {"valid": False, "state": "unavailable", "error": self._auth_error}
+        with self._lock:
+            cached = self._session_cache
+            checked_at = self._session_checked_at
+        if cached is not None and (time.time() - checked_at) < max_age:
+            return cached
+        status = self.auth_status()
+        result = {
+            "valid": bool(status.get("authenticated")),
+            "state": "valid" if status.get("authenticated") else "expired",
+            "detail": status.get("detail"),
+            "error": None if status.get("authenticated") else status.get("detail"),
+        }
+        with self._lock:
+            self._session_cache = result
+            self._session_checked_at = time.time()
+        return result
 
     # -- Instruments -----------------------------------------------------
     def _load_instruments(self) -> list[dict[str, Any]]:
@@ -512,6 +559,87 @@ class KiteClient:
             return None
         equity = data.get("equity", {}) or {}
         return (equity.get("available") or {}).get("live_balance")
+
+    def required_margin(
+        self,
+        symbol: str,
+        transaction_type: str,
+        quantity: int,
+        price: Optional[float] = None,
+        product: str = "NRML",
+    ) -> Optional[float]:
+        """Exchange margin for one prospective order, or ``None`` when unknown.
+
+        Uses Kite's order-margin API, which accounts for SPAN, exposure and any
+        margin benefit from existing positions. Returning ``None`` rather than a
+        guessed figure is deliberate: the static ``LOT_MARGIN`` setting cannot
+        know SPAN, and a wrong number is worse than an explicit "unknown".
+        """
+        if self.is_paper or not self.sdk_ready:
+            return None
+        order: dict[str, Any] = {
+            "exchange": self.kite.EXCHANGE_NFO,
+            "tradingsymbol": symbol,
+            "transaction_type": transaction_type.upper(),
+            "variety": self.kite.VARIETY_REGULAR,
+            "product": product.upper(),
+            "order_type": "MARKET",
+            "quantity": int(quantity),
+            "readonly": True,
+        }
+        if price:
+            order["price"] = float(price)
+        try:
+            result = self.kite.basket_order_margins([order], consider_positions=True)
+        except TokenException as exc:
+            self._auth_error = f"Access token invalid/expired: {exc}"
+            return None
+        except Exception as exc:
+            log.warning("Margin check failed for %s: %s", symbol, exc)
+            return None
+        if not isinstance(result, dict):
+            return None
+        # The response nests the total; take the most specific figure present.
+        for key in ("total", "final", "orders"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                for inner in ("total", "margin", "span", "exposure"):
+                    if value.get(inner) is not None:
+                        try:
+                            return float(value[inner])
+                        except (TypeError, ValueError):
+                            continue
+            elif value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def net_position(self, symbol: str) -> Optional[int]:
+        """Broker's net quantity for ``symbol``, or ``None`` when unreadable.
+
+        A hard ``None`` (rather than 0) matters: assuming flat when the broker
+        call failed is how a bot ends up doubling a real position.
+        """
+        if self.is_paper:
+            return None
+        try:
+            rows = self.positions()
+        except Exception as exc:
+            log.warning("Position read failed for %s: %s", symbol, exc)
+            return None
+        total = 0
+        found = False
+        for row in rows:
+            if str(row.get("tradingsymbol") or "") != symbol:
+                continue
+            found = True
+            try:
+                total += int(row.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total if found else 0
 
 
 _default_client: Optional[KiteClient] = None

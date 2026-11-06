@@ -22,6 +22,9 @@ const ENDPOINTS = {
   orders:    '/api/orders?limit=500',
   trades:    '/api/trades?limit=500',
   signals:   '/api/signals?limit=100',
+  analytics: '/api/analytics',
+  holidays:  '/api/holidays',
+  readiness: '/api/live/readiness',
   toggle:    '/api/toggle-mode',
   pause:     '/api/pause',
   panic:     '/api/panic',
@@ -42,6 +45,18 @@ const state = {
   serverOffsetMs: 0,
   // Client-side price samples; the API has no tick history endpoint.
   spark: [],
+  // P&L calendar. `days` is the server's per-day rollup, `holidays` the NSE
+  // closure list, and `month` the zero-indexed month currently displayed.
+  days: {},
+  holidays: {},
+  month: null,
+  selectedDay: null,
+  calendarLoadedAt: 0,
+  dayTrades: {},
+  // LIVE pre-flight. Fetched on a slow cadence because the endpoint asks the
+  // broker for margin and position state.
+  readiness: null,
+  readinessCheckedAt: 0,
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -708,6 +723,187 @@ function renderSignals() {
 }
 
 
+/* ── P&L calendar ──────────────────────────────────────────────────── */
+
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** IST calendar date (YYYY-MM-DD) for a timestamp, matching the server rollup. */
+function istDateKey(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+/** Signed P&L at a compact scale, e.g. "+23.8k" / "-4.7k" / "+386". */
+function compactPnl(value) {
+  const n = num(value);
+  if (n === null || n === 0) return '—';
+  const sign = n > 0 ? '+' : '-';
+  const abs = Math.abs(n);
+  if (abs >= 100000) return `${sign}${(abs / 100000).toFixed(1)}L`;
+  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(1)}k`;
+  return `${sign}${Math.round(abs)}`;
+}
+
+/** 1-3 intensity bucket for the heat shading, relative to the month's largest day. */
+function intensityBucket(value, largest) {
+  if (!largest) return 1;
+  const ratio = Math.abs(value) / largest;
+  if (ratio >= 0.66) return 3;
+  if (ratio >= 0.33) return 2;
+  return 1;
+}
+
+function renderCalendar() {
+  const grid = $('cal-grid');
+  if (!grid) return;
+
+  const nowKey = istDateKey();
+  if (!state.month) {
+    const [year, month] = nowKey.split('-').map(Number);
+    state.month = { year, month: month - 1 };
+  }
+  const { year, month } = state.month;
+
+  const first = new Date(Date.UTC(year, month, 1));
+  const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  // Monday-first grid, matching the NSE trading week and the header row.
+  const leading = (first.getUTCDay() + 6) % 7;
+
+  const monthDays = Object.entries(state.days)
+    .filter(([key]) => key.startsWith(`${year}-${String(month + 1).padStart(2, '0')}`));
+  const largest = Math.max(1, ...monthDays.map(([, day]) => Math.abs(num(day.net_pnl) || 0)));
+  const monthNet = monthDays.reduce((sum, [, day]) => sum + (num(day.net_pnl) || 0), 0);
+  const monthTrades = monthDays.reduce((sum, [, day]) => sum + (day.trades || 0), 0);
+  const profitableDays = monthDays.filter(([, day]) => (num(day.net_pnl) || 0) > 0).length;
+
+  setText('cal-caption', `${MONTH_NAMES[month]} ${year} · ${signedInr(monthNet, 0)} · `
+    + `${monthTrades} trade${monthTrades === 1 ? '' : 's'} · ${profitableDays} green day${profitableDays === 1 ? '' : 's'}`);
+
+  const cells = [];
+  for (let i = 0; i < leading; i += 1) cells.push('<div class="cal-cell is-empty"></div>');
+
+  for (let dayNumber = 1; dayNumber <= daysInMonth; dayNumber += 1) {
+    const key = `${year}-${String(month + 1).padStart(2, '0')}-${String(dayNumber).padStart(2, '0')}`;
+    const rollup = state.days[key];
+    const holiday = state.holidays[key];
+    const net = num(rollup?.net_pnl);
+    const weekday = new Date(Date.UTC(year, month, dayNumber)).getUTCDay();
+    const isWeekend = weekday === 0 || weekday === 6;
+
+    const classes = ['cal-cell'];
+    if (key === nowKey) classes.push('is-today');
+    if (key === state.selectedDay) classes.push('is-selected');
+    if (!rollup && (holiday || isWeekend)) classes.push('is-blank');
+    if (holiday) classes.push('cal-holiday');
+    if (net !== null && net !== 0) {
+      classes.push(net > 0 ? 'cal-win' : 'cal-loss');
+      classes.push(`${net > 0 ? 'cal-win' : 'cal-loss'}-${intensityBucket(net, largest)}`);
+    }
+
+    let meta;
+    if (holiday) meta = escapeHtml(holiday);
+    else if (net !== null && net !== 0) {
+      meta = `${rollup.wins}W/${rollup.losses}L · ${rollup.trades} trade${rollup.trades === 1 ? '' : 's'}`;
+    } else if (rollup) meta = `${rollup.trades} trade${rollup.trades === 1 ? '' : 's'} · flat`;
+    else meta = isWeekend ? '' : 'no trades';
+
+    const pnl = net !== null && net !== 0
+      ? `<span class="cal-pnl">${compactPnl(net)}</span>`
+      : '<span class="cal-pnl">—</span>';
+
+    const title = holiday
+      ? `${key} · ${holiday}`
+      : rollup
+        ? `${key} · ${signedInr(net, 0)} · ${rollup.trades} trades`
+        : `${key} · no trades`;
+    const tag = rollup ? 'button' : 'div';
+
+    cells.push(`<${tag} class="${classes.join(' ')}" title="${escapeHtml(title)}"`
+      + `${rollup ? ` type="button" data-cal-day="${key}"` : ''}>`
+      + `<span class="cal-day">${dayNumber}</span>${pnl}`
+      + `<span class="cal-meta">${meta}</span></${tag}>`);
+  }
+
+  // Pad the final week so the grid keeps its 7-column rhythm.
+  while (cells.length % 7 !== 0) cells.push('<div class="cal-cell is-empty"></div>');
+  grid.innerHTML = cells.join('');
+
+  if (!monthDays.length) setText('cal-caption', `${MONTH_NAMES[month]} ${year} · no closed trades`);
+}
+
+/** Per-trade detail for the clicked calendar day. */
+function renderCalendarDay(key) {
+  const panel = $('cal-day-panel');
+  if (!key) {
+    panel.classList.add('hidden');
+    return;
+  }
+  state.selectedDay = key;
+  const rollup = state.days[key];
+  const holiday = state.holidays[key];
+  const trades = (state.dayTrades[key] || []).slice().reverse();
+
+  $('cal-day-title').textContent = key;
+  setText('cal-day-summary', rollup
+    ? `${signedInr(rollup.net_pnl, 0)} · ${rollup.trades} trade${rollup.trades === 1 ? '' : 's'} · ${rollup.wins}W/${rollup.losses}L`
+    : (holiday ? `Exchange holiday — ${holiday}` : 'No closed trades'));
+
+  const body = $('cal-day-body');
+  if (!trades.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="8">${holiday
+      ? `No trading — ${escapeHtml(holiday)}`
+      : 'No closed trades on this day.'}</td></tr>`;
+  } else {
+    body.innerHTML = trades.map((t) => {
+      const move = (num(t.exit_price) - num(t.entry_price)) * (t.direction === 'LONG' ? 1 : -1);
+      return `
+      <tr>
+        <td class="font-mono text-slate-400">${escapeHtml(String(t.exit_time || '').slice(11, 19))}</td>
+        <td><span class="tag ${t.direction === 'LONG' ? 'tag-buy' : 'tag-sell'}">${escapeHtml(t.direction)}</span></td>
+        <td class="num">${t.quantity}</td>
+        <td class="num">${inr(t.entry_price, 2)}</td>
+        <td class="num">${inr(t.exit_price, 2)}</td>
+        <td class="num ${pnlClass(move)}">${signedPoints(move)}</td>
+        <td class="num ${pnlClass(t.net_pnl)}">${signedInr(t.net_pnl)}</td>
+        <td class="text-slate-400">${escapeHtml(t.exit_reason || '—')}</td>
+      </tr>`;
+    }).join('');
+  }
+  panel.classList.remove('hidden');
+}
+
+function shiftCalendarMonth(delta) {
+  const { year, month } = state.month;
+  const next = new Date(Date.UTC(year, month + delta, 1));
+  state.month = { year: next.getUTCFullYear(), month: next.getUTCMonth() };
+  state.selectedDay = null;
+  renderCalendar();
+  renderCalendarDay(null);
+}
+
+/** Load the daily rollup + holiday list that back the calendar. */
+async function loadCalendarData() {
+  const [analytics, holidays] = await Promise.all([
+    api(ENDPOINTS.analytics),
+    api(ENDPOINTS.holidays).catch(() => ({ holidays: {} })),
+  ]);
+  state.days = Object.fromEntries((analytics.days || []).map((day) => [day.date, day]));
+  state.holidays = holidays.holidays || {};
+  state.dayTrades = {};
+  for (const trade of state.trades) {
+    const key = String(trade.exit_time || '').slice(0, 10);
+    if (!key) continue;
+    (state.dayTrades[key] ||= []).push(trade);
+  }
+  state.calendarLoadedAt = Date.now();
+}
+
 function renderTrades() {
   const body = $('trades-body');
   if (!state.trades.length) {
@@ -768,11 +964,30 @@ async function poll() {
     renderOrders();
     renderSignals();
     renderTrades();
+    // The calendar rollup and holiday list change only when a trade settles, so
+    // refetch them on the tab that shows them and slowly elsewhere.
+    if (state.tab === 'analytics' || Date.now() - state.calendarLoadedAt > 60000) {
+      loadCalendarData()
+        .then(() => {
+          renderCalendar();
+          if (state.selectedDay) renderCalendarDay(state.selectedDay);
+        })
+        .catch(() => { /* the tab still shows the ledger */ });
+    }
     // Token health changes rarely; refresh it on a slow cadence instead of
     // adding a request to every 1.5s poll.
     if (!state.kite || Date.now() - (state.kiteCheckedAt || 0) > 20000) {
       state.kiteCheckedAt = Date.now();
       refreshKiteStatus();
+    }
+    // Pre-flight is only meaningful once LIVE is armed, and it costs a broker
+    // round-trip, so it rides the same slow cadence as the token check.
+    if (status.mode === 'LIVE' && Date.now() - state.readinessCheckedAt > 20000) {
+      state.readinessCheckedAt = Date.now();
+      refreshReadiness();
+    } else if (status.mode !== 'LIVE') {
+      state.readiness = null;
+      renderReadiness();
     }
   } catch (error) {
     state.failures += 1;
@@ -886,6 +1101,51 @@ async function refreshKiteStatus() {
     $('kite-note').className = 'header-kite-note text-xs text-bad';
     $('kite-note').title = $('kite-note').textContent;
   }
+}
+
+/** Fetch the LIVE pre-flight report. Failures are non-fatal: the banner just
+ *  keeps its previous state rather than claiming LIVE is safe. */
+async function refreshReadiness() {
+  try {
+    state.readiness = await api(ENDPOINTS.readiness);
+  } catch (error) {
+    state.readiness = { ready: false, checks: [], error: error.message };
+  }
+  renderReadiness();
+}
+
+/** Show the pre-flight banner only when LIVE is armed and something blocks it. */
+function renderReadiness() {
+  const banner = $('live-banner');
+  const report = state.readiness;
+  const show = !!report && !report.ready;
+  banner.classList.toggle('hidden', !show);
+  if (!show) return;
+
+  const blocking = new Set(report.blocking || []);
+  const failed = (report.checks || []).filter((c) => !c.ok);
+  const list = failed.length ? failed : (report.checks || []);
+
+  $('live-banner-title').textContent = report.error
+    ? `LIVE pre-flight unavailable: ${report.error}`
+    : `LIVE blocked by ${blocking.size} check${blocking.size === 1 ? '' : 's'}`;
+
+  const ul = $('live-banner-checks');
+  ul.replaceChildren(...list.map((check) => {
+    const li = document.createElement('li');
+    li.className = `live-check ${check.ok ? 'is-ok' : 'is-bad'}`;
+    const mark = document.createElement('span');
+    mark.className = 'live-check-mark';
+    mark.textContent = check.ok ? '✓' : '✕';
+    const text = document.createElement('span');
+    text.textContent = check.detail;
+    li.append(mark, text);
+    return li;
+  }));
+
+  // Re-login only helps when the session itself is the problem.
+  const needsLogin = blocking.has('kite_session') || blocking.has('credentials');
+  $('btn-kite-relogin').classList.toggle('hidden', !needsLogin);
 }
 
 async function startKiteLogin() {
@@ -1032,6 +1292,7 @@ function switchTab(tab) {
     $(`view-${name}`).classList.toggle('hidden', name !== tab);
   });
   if (tab === 'orders') renderOrders();
+  if (tab === 'analytics') renderCalendar();
 }
 
 /* ── Wiring ────────────────────────────────────────────────────────── */
@@ -1043,6 +1304,7 @@ function init() {
 
   $('btn-mode-toggle').addEventListener('click', applyMode);
   $('btn-kite-login').addEventListener('click', startKiteLogin);
+  $('btn-kite-relogin').addEventListener('click', startKiteLogin);
   $('btn-feed-reconnect').addEventListener('click', reconnectGiftFeed);
   $('btn-kite-submit').addEventListener('click', submitKiteToken);
   $('kite-token').addEventListener('keydown', (e) => {
@@ -1052,6 +1314,22 @@ function init() {
   $('btn-resume').addEventListener('click', togglePause);
   $('btn-panic').addEventListener('click', panic);
   $('btn-orders-csv').addEventListener('click', exportCsv);
+
+  $('cal-prev').addEventListener('click', () => shiftCalendarMonth(-1));
+  $('cal-next').addEventListener('click', () => shiftCalendarMonth(1));
+  $('cal-today').addEventListener('click', () => {
+    state.month = null;
+    state.selectedDay = null;
+    renderCalendar();
+    renderCalendarDay(null);
+  });
+  $('cal-grid').addEventListener('click', (event) => {
+    const cell = event.target.closest('[data-cal-day]');
+    if (!cell) return;
+    const key = cell.dataset.calDay;
+    renderCalendarDay(state.selectedDay === key ? null : key);
+    renderCalendar();
+  });
 
   let searchTimer = null;
   $('orders-search').addEventListener('input', () => {

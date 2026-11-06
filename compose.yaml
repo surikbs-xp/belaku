@@ -13,6 +13,9 @@ services:
       WEBHOOK_PORT: "9000"
       DB_PATH: /data/paper_trading.db
       LOG_FILE: /data/bot.log
+      # Keep the NSE holiday cache on the writable volume: the image is
+      # read_only, so the in-package default path cannot be written.
+      HOLIDAY_CACHE_PATH: /data/nse_holidays.json
     ports:
       - "127.0.0.1:9000:9000"
     volumes:

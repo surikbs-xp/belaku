@@ -50,6 +50,7 @@ from config import LIVE, PAPER, get_execution_mode, set_execution_mode, settings
 from engine import get_engine
 from gift_nifty import GIFT_KEY, get_feed, reset_feed
 from kite_client import future_symbol, get_client, market_status
+from market_calendar import get_calendar
 from order_manager import get_order_manager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -465,6 +466,80 @@ def api_portfolio() -> dict[str, Any]:
         "data_source": metrics["data_source"],
         "market": metrics["market"],
     }
+
+
+def _live_readiness() -> dict[str, Any]:
+    """Everything that must be true before LIVE can be armed, and what is not.
+
+    Surfaced rather than enforced by convention: a silent LIVE block is worse
+    than an explained one, because the trader cannot tell "no signal" from
+    "the bot refused to trade".
+    """
+    client = get_client()
+    manager = get_order_manager()
+    session = client.session_status()
+    calendar = get_calendar()
+    checks: list[dict[str, Any]] = []
+
+    def add(key: str, ok: bool, detail: str, blocking: bool = True) -> None:
+        checks.append({"key": key, "ok": ok, "detail": detail, "blocking": blocking})
+
+    add(
+        "kite_session",
+        bool(session.get("valid")),
+        "Kite session valid" if session.get("valid")
+        else f"Kite session invalid: {session.get('error') or 're-login required'}",
+    )
+    add(
+        "credentials",
+        settings.is_live_configured,
+        "API key, secret and access token present" if settings.is_live_configured
+        else "Set KITE_API_KEY, KITE_API_SECRET and KITE_ACCESS_TOKEN",
+    )
+    add(
+        "holiday_calendar",
+        calendar.available,
+        f"NSE calendar loaded ({calendar.status()['count']} dates)"
+        if calendar.available else "No NSE holiday calendar; session cannot be verified",
+    )
+    add(
+        "not_paused",
+        not manager.paused,
+        "Strategy running" if not manager.paused
+        else f"Strategy paused ({manager.paused_reason or 'PAUSED'})",
+    )
+    sync = manager._live_sync_state() if get_execution_mode() == LIVE else None
+    if sync is not None:
+        add(
+            "position_sync",
+            bool(sync.get("in_sync")),
+            (
+                f"Zerodha {sync['broker']} = ledger {sync['ledger']}"
+                if sync.get("in_sync")
+                else sync.get("error") or f"Zerodha {sync['broker']} != ledger {sync['ledger']}"
+            ),
+        )
+    blocking = [c for c in checks if c["blocking"] and not c["ok"]]
+    return {
+        "ready": not blocking,
+        "checks": checks,
+        "blocking": [c["key"] for c in blocking],
+    }
+
+
+@app.get("/api/live/readiness", tags=["control"])
+def api_live_readiness() -> dict[str, Any]:
+    """Pre-flight report for arming LIVE mode."""
+    return _live_readiness()
+
+
+@app.get("/api/holidays", tags=["analytics"])
+def api_holidays(refresh: bool = Query(False)) -> dict[str, Any]:
+    """NSE trading holidays, for the P&L calendar and session gating."""
+    calendar = get_calendar()
+    if refresh:
+        calendar.refresh(force=True)
+    return {"holidays": calendar.holidays, **calendar.status()}
 
 
 # ---------------------------------------------------------------------------

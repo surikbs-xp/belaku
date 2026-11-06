@@ -224,17 +224,72 @@ class OrderManager:
                 )
         return None
 
+    def _live_sync_state(self) -> Optional[dict[str, Any]]:
+        """Broker-vs-ledger net quantity for the traded contract, when readable.
+
+        This is the authoritative position source for LIVE. A mismatch is not
+        auto-corrected: silently rewriting the ledger could hide a real loss, so
+        it blocks trading until a human reconciles.
+        """
+        if get_execution_mode() != LIVE:
+            return None
+        symbol = self.current_symbol()
+        try:
+            broker = self.client.net_position(symbol)
+        except Exception as exc:
+            return {"symbol": symbol, "broker": None, "ledger": None,
+                    "in_sync": False, "error": f"Could not read Zerodha positions: {exc}"}
+        if broker is None:
+            return {"symbol": symbol, "broker": None, "ledger": None,
+                    "in_sync": False, "error": "Zerodha positions unavailable"}
+        ledger = sum(
+            int(position["quantity"]) * int(position["position_key"])
+            for position in db.get_open_positions(mode=LIVE)
+            if position["symbol"] == symbol
+        )
+        return {
+            "symbol": symbol,
+            "broker": broker,
+            "ledger": ledger,
+            "in_sync": broker == ledger,
+            "error": None,
+        }
+
     def _margin_available(self, mode: str) -> float:
         if mode == LIVE:
             cash = self.client.available_cash()
             return float(cash) if cash is not None else 0.0
         return float(db.get_account()["balance"])
 
+    def _required_margin(
+        self, symbol: str, action: str, quantity: int, mode: str, price: Optional[float]
+    ) -> tuple[float, bool]:
+        """Margin needed for an entry, and whether the figure is authoritative.
+
+        LIVE asks Kite for the real SPAN+exposure requirement. PAPER has no
+        broker to ask, so it uses the ``LOT_MARGIN`` estimate and reports it as
+        an estimate. LIVE falling back to the estimate is flagged too, so the UI
+        can say the guard is a guess rather than imply it is exact.
+        """
+        if mode == LIVE:
+            exact = self.client.required_margin(
+                symbol, action, quantity, price=price, product=settings.product
+            )
+            if exact is not None:
+                return exact, True
+        lots = max(1, quantity // max(1, settings.lot_size))
+        return lots * float(settings.lot_margin), False
+
     # -- pause / resume --------------------------------------------------
     @property
     def paused(self) -> bool:
         """True while new entries are blocked (panic switch, ops hold)."""
         return self._paused
+
+    @property
+    def paused_reason(self) -> str:
+        """Why entries are blocked, for the dashboard and the readiness report."""
+        return self._paused_reason
 
     def pause(self, reason: str = "PAUSED") -> None:
         """Block new BUY/SELL entries. Exits (FLAT/PANIC) stay available."""
@@ -289,6 +344,17 @@ class OrderManager:
 
         with self._lock:
             try:
+                # LIVE must not trade on a dead session: without a valid access
+                # token the GIFT feed stops and the mark loop goes stale, so any
+                # entry would be placed against a frozen price.
+                if mode == LIVE:
+                    health = self.client.session_status()
+                    if not health.get("valid"):
+                        return reject(
+                            "LIVE disabled: Kite session is not valid "
+                            f"({health.get('error') or health.get('state') or 'token expired'}). "
+                            "Re-login from the dashboard."
+                        )
                 sync_error = self._live_position_sync_error()
                 if sync_error:
                     return reject(sync_error)
@@ -382,15 +448,19 @@ class OrderManager:
             order_ids.extend(closed.order_ids)
 
         needed_lots = abs(lots)
-        required_margin = needed_lots * settings.lot_margin
+        required_margin, margin_is_exact = self._required_margin(
+            symbol, action, qty, mode, price
+        )
         available = self._margin_available(mode)
         if available < required_margin:
+            estimate_note = "" if margin_is_exact else " (estimated)"
             return ExecutionResult(
                 False, action, mode, symbol,
                 reason=(
-                    f"Insufficient margin: need Rs {required_margin:,.0f}, "
+                    f"Insufficient margin: need Rs {required_margin:,.0f}{estimate_note}, "
                     f"have Rs {available:,.0f}"
                 ),
+                details={"required_margin": required_margin, "margin_is_exact": margin_is_exact},
             )
 
         fill = apply_slippage(price, action)
