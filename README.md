@@ -1,4 +1,4 @@
-# GIFT Nifty → Nifty Futures execution bot
+# Belaku — GIFT Nifty → Nifty Futures execution bot
 
 Requires Python 3.12 or newer.
 
@@ -217,6 +217,7 @@ visible without tailing logs.
 
 | Setting | Effect |
 |---|---|
+| `BOT_NAME` | dashboard title and browser tab name (default `Belaku`) |
 | `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
 | `STRATEGY_SUPERTRENDS` | the SuperTrend instances as `atr_length:multiplier` pairs (default `11:1,12:2,13:3`) |
