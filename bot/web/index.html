@@ -12,9 +12,9 @@
     theme: {
       extend: {
         colors: {
-          ink:   { 950: '#080b14', 900: '#0d1220', 850: '#121a2c', 800: '#1a2438', 700: '#243049' },
-          edge:  '#1e293b',
-          good:  '#10b981',
+          ink:   { 950: '#05070f', 900: '#0a0f1c', 850: '#0f1626', 800: '#162034', 700: '#1e2a42' },
+          edge:  '#1b2740',
+          good:  '#22c55e',
           bad:   '#f43f5e',
           warn:  '#f59e0b',
           brand: '#38bdf8',
@@ -26,21 +26,22 @@
     },
   };
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=compact-controls-2" />
+<link rel="stylesheet" href="/static/styles.css?v=tradezilla-1" />
+<script src="https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js" defer></script>
 </head>
 
 <body class="bg-ink-950 text-slate-200 antialiased">
-<div class="mx-auto max-w-[1600px] px-4 py-5 lg:px-8">
+<div class="shell">
 
   <!-- ── Header ─────────────────────────────────────────────────────── -->
-  <header class="mb-6 flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-    <div class="flex items-center gap-3">
-      <div class="grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-brand to-indigo-500 text-lg font-bold text-ink-950">S</div>
-      <div>
-        <h1 class="text-xl font-semibold tracking-tight text-white">GIFT Nifty Execution Desk</h1>
-        <p class="text-sm text-slate-400">
+  <header class="appbar">
+    <div class="appbar-brand">
+      <div class="brand-mark">S</div>
+      <div class="brand-copy">
+        <h1 class="brand-title">GIFT Nifty Execution Desk</h1>
+        <p class="brand-sub">
           <span id="hdr-symbol" class="font-mono text-slate-300">—</span>
-          <span class="mx-1.5 text-slate-600">·</span>
+          <span class="brand-dot">·</span>
           <span id="hdr-market">—</span>
         </p>
       </div>
@@ -56,7 +57,7 @@
           </span>
         </button>
         <div class="header-connection">
-          <span id="kite-note" class="header-kite-note text-xs">Checking Kite…</span>
+          <span id="kite-note" class="header-kite-note">Checking Kite…</span>
           <button id="btn-kite-login" class="btn btn-neutral header-control-button" title="Connect or refresh Kite login">Connect</button>
           <button id="btn-feed-reconnect" class="btn btn-neutral header-control-button hidden" title="Reconnect GIFT market data">Reconnect</button>
         </div>
@@ -78,184 +79,191 @@
   </header>
 
   <!-- ── Paused banner ──────────────────────────────────────────────── -->
-  <div id="paused-banner" class="mb-5 hidden items-center justify-between gap-4 rounded-xl border border-warn/40 bg-warn/10 px-4 py-3">
-    <div class="flex items-center gap-3 text-sm">
-      <span class="text-lg">⏸</span>
+  <div id="paused-banner" class="pause-banner hidden">
+    <div class="pause-banner-copy">
+      <span class="pause-banner-icon">⏸</span>
       <div>
-        <p class="font-semibold text-warn">Strategy paused</p>
-        <p class="text-slate-400">New BUY/SELL entries are blocked. Exits still work.</p>
+        <p class="pause-banner-title">Strategy paused</p>
+        <p class="pause-banner-sub">New BUY/SELL entries are blocked. Exits still work.</p>
       </div>
     </div>
-    <button id="btn-resume" class="rounded-lg border border-warn/50 bg-warn/20 px-3 py-1.5 text-sm font-medium text-warn transition hover:bg-warn/30">
-      Resume strategy
-    </button>
+    <button id="btn-resume" class="btn btn-warn">Resume strategy</button>
   </div>
 
   <!-- ── Tabs ───────────────────────────────────────────────────────── -->
-  <nav class="mb-5 flex gap-1 rounded-xl border border-edge bg-ink-900/60 p-1" role="tablist">
+  <nav class="tabs" role="tablist">
     <button class="tab tab-active" data-tab="monitor"   role="tab">Dashboard</button>
     <button class="tab"            data-tab="orders"    role="tab">Orders &amp; signals</button>
-    <button class="tab"            data-tab="analytics" role="tab">Performance &amp; trades</button>
+    <button class="tab"            data-tab="analytics" role="tab">Analytics</button>
+    <button class="tab"            data-tab="journal"   role="tab">Journal</button>
   </nav>
 
   <!-- ── View 1: Dashboard Monitor ──────────────────────────────────── -->
   <section id="view-monitor" class="view">
-    <div class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      <article class="card">
+
+    <!-- Signal hero: the decision, first thing a trader looks at -->
+    <div class="hero-grid">
+
+      <article class="panel panel-signal" id="signal-panel">
+        <div class="panel-head">
+          <p class="metric-label">Current signal</p>
+          <span id="pill-signal" class="pill pill-idle">Warming up</span>
+        </div>
+
+        <div class="signal-body">
+          <div class="signal-glyph" id="signal-glyph" aria-hidden="true">•</div>
+          <div class="signal-copy">
+            <p id="e-signal" class="signal-word">—</p>
+            <p id="e-signal-sub" class="metric-sub">Waiting for candles…</p>
+          </div>
+        </div>
+
+        <div class="warmup-track" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="15" aria-valuenow="0">
+          <div id="warmup-progress" class="warmup-progress"></div>
+        </div>
+        <p class="metric-sub">Bars used for this signal: <span id="e-bars">—</span></p>
+      </article>
+
+      <article class="panel panel-candle">
+        <div class="panel-head">
+          <p class="metric-label">5-minute candle</p>
+          <span id="candle-pill" class="pill pill-idle">—</span>
+        </div>
+        <p id="candle-countdown" class="candle-countdown">—:—</p>
+        <p id="candle-countdown-sub" class="metric-sub">until the next completed candle</p>
+        <div class="candle-meta">
+          <div>
+            <p class="metric-label">Candle open</p>
+            <p id="candle-open" class="metric-sub-inline">—</p>
+          </div>
+          <div>
+            <p class="metric-label">Signal bar</p>
+            <p id="candle-bar" class="metric-sub-inline">—</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel panel-quote">
+        <div class="panel-head">
+          <p class="metric-label">GIFT Nifty · signal source</p>
+        </div>
+        <p id="e-gift-price" class="quote-price">—</p>
+        <p id="e-gift-timestamp" class="metric-sub">Last tick —</p>
+        <div id="gift-spark" class="spark" aria-hidden="true"></div>
+        <p id="e-gift-sub" class="metric-sub">—</p>
+      </article>
+
+      <article class="panel panel-exec">
+        <div class="panel-head">
+          <p class="metric-label">Nifty future · execution</p>
+        </div>
+        <p id="e-exec" class="quote-price quote-price-sm">—</p>
+        <p id="e-exec-sub" class="metric-sub">—</p>
+        <div class="exec-meta">
+          <div>
+            <p class="metric-label">Lots</p>
+            <p id="exec-lots" class="metric-sub-inline">—</p>
+          </div>
+          <div>
+            <p class="metric-label">Product</p>
+            <p id="exec-product" class="metric-sub-inline">—</p>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <!-- Live indicator readout -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">Live indicators</h2>
+        <span id="indicator-source" class="metric-sub">—</span>
+      </div>
+
+      <div class="indicator-grid">
+        <div class="indicator-cell">
+          <p class="metric-label">SuperTrend vote</p>
+          <p id="e-st" class="indicator-value">—</p>
+          <div id="st-votes" class="st-votes" aria-hidden="true"></div>
+          <p id="e-st-sub" class="metric-sub">Lines —</p>
+          <p id="e-st-time" class="metric-sub">Timestamp unavailable</p>
+        </div>
+        <div class="indicator-cell">
+          <p class="metric-label">Parabolic SAR</p>
+          <p id="e-psar" class="indicator-value">—</p>
+          <p id="e-psar-sub" class="metric-sub">Price above / below</p>
+          <p id="e-psar-time" class="metric-sub">Timestamp unavailable</p>
+        </div>
+        <div class="indicator-cell">
+          <p class="metric-label">Engine activity</p>
+          <p id="e-counters" class="indicator-value indicator-value-sm">—</p>
+          <p class="metric-sub">evaluations · signals · sent · held</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Account metrics -->
+    <div class="metric-grid">
+      <article class="panel panel-metric">
         <p class="metric-label">Portfolio value</p>
         <p id="m-equity" class="metric-value">—</p>
         <p id="m-equity-sub" class="metric-sub">—</p>
       </article>
-      <article class="card">
-        <p class="metric-label">Margin available</p>
-        <p id="m-margin" class="metric-value">—</p>
-        <div class="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-ink-700">
-          <div id="m-margin-bar" class="h-full rounded-full bg-brand transition-all duration-500" style="width:0%"></div>
-        </div>
-        <p id="m-margin-sub" class="metric-sub">—</p>
-      </article>
-      <article class="card">
-        <p class="metric-label">Active mode</p>
-        <p id="m-mode" class="metric-value">—</p>
-        <div class="mt-2"><span id="m-mode-pill" class="pill pill-idle">—</span></div>
-      </article>
-      <article class="card">
+      <article class="panel panel-metric">
         <p class="metric-label">Real-time PnL</p>
         <p id="m-pnl" class="metric-value">—</p>
         <p id="m-pnl-sub" class="metric-sub">—</p>
       </article>
+      <article class="panel panel-metric">
+        <p class="metric-label">Margin available</p>
+        <p id="m-margin" class="metric-value">—</p>
+        <div class="meter">
+          <div id="m-margin-bar" class="meter-fill" style="width:0%"></div>
+        </div>
+        <p id="m-margin-sub" class="metric-sub">—</p>
+      </article>
+      <article class="panel panel-metric">
+        <p class="metric-label">Active mode</p>
+        <p id="m-mode" class="metric-value">—</p>
+        <div class="metric-pill-row"><span id="m-mode-pill" class="pill pill-idle">—</span></div>
+      </article>
     </div>
 
-    <div class="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-5">
-      <div class="card-sm"><p class="metric-label">Realised today</p><p id="m-today" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Unrealised</p><p id="m-unreal" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Net realised</p><p id="m-realised" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Win rate</p><p id="m-winrate" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Profit factor</p><p id="m-pf" class="text-lg font-semibold tabular-nums">—</p></div>
+    <div class="metric-strip">
+      <div class="strip-cell"><p class="metric-label">Realised today</p><p id="m-today" class="strip-value">—</p></div>
+      <div class="strip-cell"><p class="metric-label">Unrealised</p><p id="m-unreal" class="strip-value">—</p></div>
+      <div class="strip-cell"><p class="metric-label">Net realised</p><p id="m-realised" class="strip-value">—</p></div>
+      <div class="strip-cell"><p class="metric-label">Win rate</p><p id="m-winrate" class="strip-value">—</p></div>
+      <div class="strip-cell"><p class="metric-label">Profit factor</p><p id="m-pf" class="strip-value">—</p></div>
     </div>
 
-    <div class="mt-4">
-      <div class="card">
-        <div class="mb-3 flex items-center justify-between">
-          <h2 class="section-title">Open positions</h2>
-          <span id="pos-count" class="text-xs text-slate-400">—</span>
-        </div>
-        <div class="table-wrap">
-          <table class="data-table">
-            <thead>
-              <tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">LTP</th><th class="num">PnL</th><th>Mode</th></tr>
-            </thead>
-            <tbody id="positions-body"></tbody>
-          </table>
-        </div>
+    <!-- Positions -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">Open positions</h2>
+        <span id="pos-count" class="metric-sub">—</span>
       </div>
-    </div>
-
-    <div class="card">
-      <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-        <h2 class="section-title">Live values</h2>
-        <span id="pill-signal" class="pill pill-idle">Warming up</span>
-      </div>
-
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <div class="card-sm">
-          <p class="metric-label">Current signal</p>
-          <p id="e-signal" class="mt-1 text-2xl font-bold text-white">—</p>
-          <div class="warmup-track mt-2" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="15" aria-valuenow="0">
-            <div id="warmup-progress" class="warmup-progress"></div>
-          </div>
-          <p id="e-signal-sub" class="metric-sub">Waiting for candles…</p>
-        </div>
-        <div class="card-sm">
-          <p class="metric-label">GIFT Nifty · signal source</p>
-          <p id="e-gift-price" class="mt-1 text-xl font-semibold tabular-nums text-white">—</p>
-          <p id="e-gift-timestamp" class="metric-sub">Last tick —</p>
-          <p id="e-gift-sub" class="metric-sub">—</p>
-        </div>
-        <div class="card-sm">
-          <p class="metric-label">Nifty future · execution</p>
-          <p id="e-exec" class="mt-1 text-lg font-semibold font-mono text-white">—</p>
-          <p id="e-exec-sub" class="metric-sub">—</p>
-        </div>
-      </div>
-
-      <div class="mt-5">
-        <h3 class="section-title mb-2">Latest indicator values</h3>
-        <div class="grid grid-cols-2 gap-3">
-          <div class="card-sm">
-            <p class="metric-label">SuperTrend vote</p>
-            <p id="e-st" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
-            <p id="e-st-time" class="metric-sub">Timestamp unavailable</p>
-            <p id="e-st-sub" class="metric-sub">2 of 3 must agree</p>
-          </div>
-          <div class="card-sm">
-            <p class="metric-label">Parabolic SAR</p>
-            <p id="e-psar" class="mt-1 text-lg font-semibold tabular-nums text-white">—</p>
-            <p id="e-psar-time" class="metric-sub">Timestamp unavailable</p>
-            <p id="e-psar-sub" class="metric-sub">Price above / below</p>
-          </div>
-        </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">LTP</th><th class="num">PnL</th><th class="num">Points</th><th>Mode</th></tr>
+          </thead>
+          <tbody id="positions-body"></tbody>
+        </table>
       </div>
     </div>
 
-    <div class="mt-4 card">
-      <div class="mb-4">
-        <p class="metric-label">Active strategy</p>
-        <h2 class="mt-1 text-xl font-semibold text-white">Surikbs · GIFT Nifty signal</h2>
-        <p class="mt-1 text-sm text-slate-400">
-          Signals are evaluated at each completed 5-minute GIFT candle. Indicator cards show the
-          forming candle when available; orders still use completed-candle signals.
-        </p>
+    <!-- Live rule checks -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">Live rule checks</h2>
+        <span class="metric-sub">SuperTrend 10×1 · 11×2 · 12×3 with PSAR</span>
       </div>
-
-      <div>
-        <div class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-          <h3 class="section-title">Entry rules</h3>
-          <span class="text-xs text-slate-500">No EMA 200 filter</span>
-        </div>
-        <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
-          <section class="strategy-rule strategy-rule-buy">
-            <div class="flex items-center justify-between gap-2">
-              <h4 class="text-base font-bold text-emerald-300">BUY</h4>
-              <span class="text-xs text-slate-400">Both checks required</span>
-            </div>
-            <ul class="strategy-rule-list">
-              <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bullish</li>
-              <li><strong>PSAR:</strong> candle close above Parabolic SAR</li>
-            </ul>
-          </section>
-          <section class="strategy-rule strategy-rule-sell">
-            <div class="flex items-center justify-between gap-2">
-              <h4 class="text-base font-bold text-rose-300">SELL</h4>
-              <span class="text-xs text-slate-400">Both checks required</span>
-            </div>
-            <ul class="strategy-rule-list">
-              <li><strong>Trend:</strong> at least 2 of 3 SuperTrends bearish</li>
-              <li><strong>PSAR:</strong> candle close below Parabolic SAR</li>
-            </ul>
-          </section>
-        </div>
-        <p class="mt-2 text-xs text-slate-500">
-          SuperTrends use Pine's ATR length × multiplier settings 10×1, 11×2, and 12×3.
-          SuperTrend and PSAR values use actual feed candles; 12 closed candles are required
-          before strategy signals can run.
-        </p>
+      <div id="conditions" class="condition-grid">
+        <p class="condition-empty">Collecting closed candles before evaluating the rules.</p>
       </div>
-
-      <div class="mt-5">
-        <div class="flex flex-wrap items-baseline justify-between gap-2">
-          <h3 class="section-title">Live rule checks</h3>
-          <p id="e-counters" class="text-xs text-slate-500">—</p>
-        </div>
-        <div id="conditions" class="mt-2 grid grid-cols-1 gap-3 lg:grid-cols-2">
-          <p class="text-sm text-amber-300">Collecting closed candles before evaluating the rules.</p>
-        </div>
-      </div>
-
-      <p class="mt-4 border-t border-edge pt-3 text-xs leading-5 text-slate-500">
-        A signal fires on the first closed candle where both checks agree. The bot does not repeat entries
-        while that condition remains true. Exits are on an opposite signal or manual; there is no stop-loss
-        or profit target. The Pine script's custom SuperTrend/divergence visuals are not entry filters.
+      <p class="panel-footnote">
+        A signal fires on the first closed candle where both checks agree, and is not repeated while the
+        condition holds. Exits are on an opposite signal or manual — there is no stop-loss or profit target.
       </p>
     </div>
 
@@ -263,15 +271,15 @@
 
   <!-- ── View 2: Order Logs ─────────────────────────────────────────── -->
   <section id="view-orders" class="view hidden">
-    <div class="card">
-      <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <div class="panel">
+      <div class="panel-head panel-head-wrap">
         <div>
           <h2 class="section-title">Order book</h2>
-          <p id="orders-caption" class="text-xs text-slate-400">—</p>
+          <p id="orders-caption" class="metric-sub">—</p>
         </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <input id="orders-search" type="search" placeholder="Search symbol, status, order id…" class="field w-64" />
-          <select id="orders-mode" class="field w-32">
+        <div class="toolbar">
+          <input id="orders-search" type="search" placeholder="Search symbol, status, order id…" class="field field-search" />
+          <select id="orders-mode" class="field field-compact">
             <option value="">All modes</option>
             <option value="PAPER">Paper</option>
             <option value="LIVE">Live</option>
@@ -280,7 +288,7 @@
         </div>
       </div>
 
-      <div class="table-wrap max-h-[65vh]">
+      <div class="table-wrap table-tall">
         <table class="data-table">
           <thead>
             <tr>
@@ -293,13 +301,12 @@
       </div>
     </div>
 
-    <div class="card mt-4">
-      <h2 class="section-title mb-3">Engine signals</h2>
-      <p class="mb-3 text-xs text-slate-400">
-        Every st.pine evaluation that produced an action, and why it was placed,
-        blocked or deferred.
-      </p>
-      <div class="table-wrap max-h-[35vh]">
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">Engine signals</h2>
+        <span class="metric-sub">Every evaluation that produced an action, and why it was placed or held</span>
+      </div>
+      <div class="table-wrap table-mid">
         <table class="data-table">
           <thead><tr><th>Timestamp</th><th>Action</th><th>Placed</th><th>Reason</th><th>Detail</th></tr></thead>
           <tbody id="signals-body"></tbody>
@@ -308,22 +315,128 @@
     </div>
   </section>
 
-  <!-- ── View 3: Performance ────────────────────────────────────────── -->
+  <!-- ── View 3: Analytics ──────────────────────────────────────────── -->
   <section id="view-analytics" class="view hidden">
-    <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
-      <div class="card-sm"><p class="metric-label">Net profit</p><p id="a-net" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Total return</p><p id="a-return" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Max drawdown</p><p id="a-dd" class="text-lg font-semibold tabular-nums">—</p></div>
-      <div class="card-sm"><p class="metric-label">Trades</p><p id="a-trades" class="text-lg font-semibold tabular-nums">—</p></div>
+
+    <!-- Headline KPIs -->
+    <div class="kpi-grid">
+      <div class="panel panel-metric">
+        <p class="metric-label">Net P&amp;L</p>
+        <p id="a-net" class="metric-value">—</p>
+        <p id="a-net-sub" class="metric-sub">—</p>
+      </div>
+      <div class="panel panel-metric">
+        <p class="metric-label">Win rate</p>
+        <p id="a-winrate" class="metric-value">—</p>
+        <p id="a-winrate-sub" class="metric-sub">—</p>
+      </div>
+      <div class="panel panel-metric">
+        <p class="metric-label">Profit factor</p>
+        <p id="a-pf" class="metric-value">—</p>
+        <p id="a-pf-sub" class="metric-sub">—</p>
+      </div>
+      <div class="panel panel-metric">
+        <p class="metric-label">Expectancy</p>
+        <p id="a-expectancy" class="metric-value">—</p>
+        <p id="a-expectancy-sub" class="metric-sub">—</p>
+      </div>
+      <div class="panel panel-metric">
+        <p class="metric-label">Max drawdown</p>
+        <p id="a-dd" class="metric-value">—</p>
+        <p id="a-dd-sub" class="metric-sub">—</p>
+      </div>
+      <div class="panel panel-metric">
+        <p class="metric-label">Trades</p>
+        <p id="a-trades" class="metric-value">—</p>
+        <p id="a-trades-sub" class="metric-sub">—</p>
+      </div>
     </div>
 
-    <div class="card mt-4">
-      <h2 class="section-title mb-3">Trade ledger</h2>
-      <div class="table-wrap max-h-[45vh]">
+    <!-- Equity curve + drawdown -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">Equity curve</h2>
+        <span id="equity-source" class="metric-sub">—</span>
+      </div>
+      <div class="chart-wrap">
+        <div id="equity-chart" class="chart"></div>
+        <p id="equity-empty" class="chart-empty hidden">No equity history yet — it builds as positions are marked.</p>
+      </div>
+    </div>
+
+    <!-- Daily P&L + streaks -->
+    <div class="split-grid">
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">Daily P&amp;L</h2>
+          <span id="daily-caption" class="metric-sub">—</span>
+        </div>
+        <div class="chart-wrap chart-wrap-sm">
+          <div id="daily-chart" class="chart"></div>
+          <p id="daily-empty" class="chart-empty hidden">No settled days yet.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">Streaks &amp; risk</h2>
+        </div>
+        <div class="stat-list">
+          <div class="stat-row"><span>Current streak</span><strong id="s-streak">—</strong></div>
+          <div class="stat-row"><span>Longest win streak</span><strong id="s-maxwin">—</strong></div>
+          <div class="stat-row"><span>Longest loss streak</span><strong id="s-maxloss">—</strong></div>
+          <div class="stat-row"><span>Largest win</span><strong id="s-bigwin">—</strong></div>
+          <div class="stat-row"><span>Largest loss</span><strong id="s-bigloss">—</strong></div>
+          <div class="stat-row"><span>Average win</span><strong id="s-avgwin">—</strong></div>
+          <div class="stat-row"><span>Average loss</span><strong id="s-avgloss">—</strong></div>
+          <div class="stat-row"><span>Average hold</span><strong id="s-hold">—</strong></div>
+          <div class="stat-row"><span>Average move</span><strong id="s-points">—</strong></div>
+          <div class="stat-row"><span>Total fees</span><strong id="s-fees">—</strong></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Breakdowns -->
+    <div class="split-grid split-grid-3">
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">By direction</h2>
+        </div>
+        <div id="breakdown-direction" class="breakdown"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">By weekday</h2>
+        </div>
+        <div id="breakdown-weekday" class="breakdown"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">By hour (IST)</h2>
+        </div>
+        <div id="breakdown-hour" class="breakdown"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">By exit reason</h2>
+        <span class="metric-sub">How each position actually ended</span>
+      </div>
+      <div id="breakdown-exit" class="breakdown"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">Trade ledger</h2>
+        <span class="metric-sub">Settled round-trips with fees</span>
+      </div>
+      <div class="table-wrap table-tall">
         <table class="data-table">
           <thead>
             <tr><th>Closed</th><th>Symbol</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
-                <th class="num">Exit</th><th class="num">Gross</th><th class="num">Fees</th><th class="num">Net</th><th>Reason</th></tr>
+                <th class="num">Exit</th><th class="num">Points</th><th class="num">Gross</th><th class="num">Fees</th>
+                <th class="num">Net</th><th>Reason</th><th>Journal</th></tr>
           </thead>
           <tbody id="trades-body"></tbody>
         </table>
@@ -331,27 +444,96 @@
     </div>
   </section>
 
+  <!-- ── View 4: Journal ────────────────────────────────────────────── -->
+  <section id="view-journal" class="view hidden">
+    <div class="journal-layout">
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">Settled trades</h2>
+          <span id="journal-caption" class="metric-sub">—</span>
+        </div>
+        <div class="toolbar journal-toolbar">
+          <input id="journal-search" type="search" placeholder="Search symbol, setup, tags…" class="field field-search" />
+          <button id="btn-journal-unannotated" class="btn btn-neutral" type="button">Unannotated only</button>
+        </div>
+        <div id="journal-list" class="journal-list">
+          <p class="condition-empty">No settled trades yet — the journal opens up after the first round-trip closes.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="section-title">Trade note</h2>
+          <span id="journal-editor-state" class="metric-sub">Nothing selected</span>
+        </div>
+
+        <div id="journal-editor-empty" class="journal-editor-empty">
+          <p>Select a trade to add notes.</p>
+          <p class="metric-sub">Journal entries live in their own table — writing or deleting one never changes the trade ledger or any metric.</p>
+        </div>
+
+        <form id="journal-form" class="journal-form hidden">
+          <div id="journal-trade-summary" class="journal-trade-summary"></div>
+
+          <label class="field-group">
+            <span class="field-label">Setup</span>
+            <input id="journal-setup" class="field" list="setup-options" placeholder="e.g. SuperTrend flip at PSAR" maxlength="200" />
+            <datalist id="setup-options"></datalist>
+          </label>
+
+          <label class="field-group">
+            <span class="field-label">Tags <em>comma separated</em></span>
+            <input id="journal-tags" class="field" placeholder="trend, breakout, patience" maxlength="400" />
+          </label>
+
+          <div class="field-group">
+            <span class="field-label">Execution rating</span>
+            <div id="journal-rating" class="rating" role="radiogroup" aria-label="Execution rating"></div>
+          </div>
+
+          <label class="field-group">
+            <span class="field-label">Notes</span>
+            <textarea id="journal-note" class="field field-area" rows="5" placeholder="What did you see? What did you do? What would you repeat?" maxlength="4000"></textarea>
+          </label>
+
+          <label class="field-group">
+            <span class="field-label">Mistakes</span>
+            <textarea id="journal-mistakes" class="field field-area" rows="3" placeholder="What would you do differently?" maxlength="1000"></textarea>
+          </label>
+
+          <div class="journal-actions">
+            <button type="submit" id="journal-save" class="btn btn-primary">Save note</button>
+            <button type="button" id="journal-clear" class="btn btn-neutral">Clear</button>
+            <button type="button" id="journal-delete" class="btn btn-danger-outline">Delete</button>
+          </div>
+          <p id="journal-status" class="journal-status"></p>
+        </form>
+      </div>
+    </div>
+  </section>
+
   <!-- ── Footer ─────────────────────────────────────────────────────── -->
-  <footer class="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+  <footer class="appfoot">
     <span id="footer-left">Connecting…</span>
     <span id="footer-right">—</span>
   </footer>
 </div>
 
 <!-- ── Confirm dialog ───────────────────────────────────────────────── -->
-<div id="modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/70 p-4">
-  <div class="w-full max-w-md rounded-2xl border border-edge bg-ink-900 p-6 shadow-2xl">
-    <h3 id="modal-title" class="text-lg font-semibold text-white">Confirm</h3>
-    <p id="modal-body" class="mt-2 text-sm text-slate-400"></p>
-    <div class="mt-5 flex justify-end gap-2">
+<div id="modal" class="modal-backdrop hidden">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title" class="modal-title">Confirm</h3>
+    <p id="modal-body" class="modal-body"></p>
+    <div class="modal-actions">
       <button id="modal-cancel" class="btn btn-neutral">Cancel</button>
       <button id="modal-ok" class="btn btn-danger">Confirm</button>
     </div>
   </div>
 </div>
 
-<div id="toast" class="pointer-events-none fixed bottom-6 right-6 z-50 hidden max-w-sm rounded-xl border px-4 py-3 text-sm shadow-xl"></div>
+<div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=indicator-timestamps-1" defer></script>
+<script src="/static/app.js?v=trader-1" defer></script>
 </body>
 </html>

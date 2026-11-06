@@ -121,6 +121,20 @@ CREATE TABLE IF NOT EXISTS gift_candles (
     partial               INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_gift_candles_start ON gift_candles (start DESC);
+
+-- Trader journal. One row per closed trade, keyed by trade id, holding the
+-- discretionary context a ledger can't derive: why the trade was taken, how it
+-- felt, what to repeat. Kept separate from `trades` so the ledger stays
+-- machine-written and the journal stays human-written.
+CREATE TABLE IF NOT EXISTS trade_notes (
+    trade_id              INTEGER PRIMARY KEY,
+    note                  TEXT NOT NULL DEFAULT '',
+    setup                 TEXT NOT NULL DEFAULT '',
+    tags                  TEXT NOT NULL DEFAULT '',
+    rating                INTEGER,
+    mistakes              TEXT NOT NULL DEFAULT '',
+    updated_at            TEXT NOT NULL
+);
 """
 
 
@@ -517,6 +531,237 @@ def get_trades(limit: int = 1000, path: Optional[str] = None) -> list[dict[str, 
 
 def get_signals(limit: int = 100, path: Optional[str] = None) -> list[dict[str, Any]]:
     return _fetch_all("SELECT * FROM signals ORDER BY id DESC LIMIT ?", [limit], path)
+
+
+# ---------------------------------------------------------------------------
+# Trade journal
+# ---------------------------------------------------------------------------
+JOURNAL_COLUMNS = ("note", "setup", "tags", "rating", "mistakes")
+
+
+def get_trade_note(trade_id: int, path: Optional[str] = None) -> Optional[dict[str, Any]]:
+    rows = _fetch_all("SELECT * FROM trade_notes WHERE trade_id = ?", [trade_id], path)
+    return rows[0] if rows else None
+
+
+def get_trade_notes(path: Optional[str] = None) -> dict[int, dict[str, Any]]:
+    """All journal entries keyed by trade id, for annotating a trade list."""
+    rows = _fetch_all("SELECT * FROM trade_notes", [], path)
+    return {int(row["trade_id"]): row for row in rows}
+
+
+def save_trade_note(
+    trade_id: int, path: Optional[str] = None, **fields: Any
+) -> dict[str, Any]:
+    """Upsert a journal entry. Unknown/blank fields fall back to their defaults."""
+    values: dict[str, Any] = {column: fields.get(column) for column in JOURNAL_COLUMNS}
+    rating = values.get("rating")
+    if rating in ("", None):
+        values["rating"] = None
+    else:
+        rating = int(rating)
+        if not 1 <= rating <= 5:
+            raise ValueError("rating must be between 1 and 5")
+        values["rating"] = rating
+    for column in ("note", "setup", "tags", "mistakes"):
+        raw = values.get(column)
+        values[column] = "" if raw is None else str(raw).strip()
+
+    init_db(path)
+    with session(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_notes (trade_id, note, setup, tags, rating, mistakes, updated_at)
+            VALUES (:trade_id, :note, :setup, :tags, :rating, :mistakes, :updated_at)
+            ON CONFLICT(trade_id) DO UPDATE SET
+                note = excluded.note,
+                setup = excluded.setup,
+                tags = excluded.tags,
+                rating = excluded.rating,
+                mistakes = excluded.mistakes,
+                updated_at = excluded.updated_at
+            """,
+            {"trade_id": trade_id, **values, "updated_at": iso()},
+        )
+    return get_trade_note(trade_id, path) or {}
+
+
+def delete_trade_note(trade_id: int, path: Optional[str] = None) -> bool:
+    init_db(path)
+    with session(path) as conn:
+        cursor = conn.execute("DELETE FROM trade_notes WHERE trade_id = ?", [trade_id])
+    return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Trade analytics
+# ---------------------------------------------------------------------------
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=IST)
+
+
+def _trade_points(trade: dict[str, Any]) -> float:
+    """Raw index-point move, signed by direction. PnL is this times quantity."""
+    move = float(trade["exit_price"]) - float(trade["entry_price"])
+    return move if str(trade["direction"]).upper() == "LONG" else -move
+
+
+def _hold_minutes(trade: dict[str, Any]) -> Optional[float]:
+    entry, exit_ = _parse_ts(trade.get("entry_time")), _parse_ts(trade.get("exit_time"))
+    if not entry or not exit_:
+        return None
+    return (exit_ - entry).total_seconds() / 60.0
+
+
+def _bucket_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    wins = [t for t in rows if float(t["net_pnl"]) > 0]
+    losses = [t for t in rows if float(t["net_pnl"]) < 0]
+    gross_win = sum(float(t["net_pnl"]) for t in wins)
+    gross_loss = abs(sum(float(t["net_pnl"]) for t in losses))
+    return {
+        "trades": len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "net_pnl": sum(float(t["net_pnl"]) for t in rows),
+        "gross_pnl": sum(float(t["gross_pnl"]) for t in rows),
+        "fees": sum(float(t["fees"]) for t in rows),
+        "points": sum(_trade_points(t) for t in rows),
+        "win_rate": (len(wins) / len(rows) * 100.0) if rows else 0.0,
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0
+        else (float("inf") if gross_win > 0 else 0.0),
+    }
+
+
+def get_trade_analytics(
+    mode: Optional[str] = None,
+    limit: int = 5000,
+    path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Trade statistics a trader reviews after the close.
+
+    Every figure is derived from the ledger only. The strategy has no stop-loss,
+    so there is no risk denominator and therefore no R-multiple: performance is
+    expressed in rupees and in raw index points.
+    """
+    trades = list(reversed(get_trades(limit=limit, path=path)))  # chronological
+    if mode:
+        trades = [t for t in trades if (t.get("mode") or "").upper() == mode]
+
+    summary = _bucket_summary(trades)
+    wins = [t for t in trades if float(t["net_pnl"]) > 0]
+    losses = [t for t in trades if float(t["net_pnl"]) < 0]
+    holds = [m for m in (_hold_minutes(t) for t in trades) if m is not None]
+
+    summary.update({
+        "gross_win": sum(float(t["net_pnl"]) for t in wins),
+        "gross_loss": sum(float(t["net_pnl"]) for t in losses),
+        "largest_win": max((float(t["net_pnl"]) for t in wins), default=0.0),
+        "largest_loss": min((float(t["net_pnl"]) for t in losses), default=0.0),
+        "avg_win": (sum(float(t["net_pnl"]) for t in wins) / len(wins)) if wins else 0.0,
+        "avg_loss": (sum(float(t["net_pnl"]) for t in losses) / len(losses)) if losses else 0.0,
+        "avg_hold_minutes": (sum(holds) / len(holds)) if holds else 0.0,
+        "expectancy": (sum(float(t["net_pnl"]) for t in trades) / len(trades)) if trades else 0.0,
+        "breakeven": len(trades) - len(wins) - len(losses),
+        "avg_points": (sum(_trade_points(t) for t in trades) / len(trades)) if trades else 0.0,
+    })
+
+    # Streaks: a trader cares about the longest run and the run they are on now.
+    max_win = max_loss = win_run = loss_run = 0
+    for trade in trades:
+        pnl = float(trade["net_pnl"])
+        if pnl > 0:
+            win_run, loss_run = win_run + 1, 0
+        elif pnl < 0:
+            loss_run, win_run = loss_run + 1, 0
+        else:
+            win_run = loss_run = 0
+        max_win, max_loss = max(max_win, win_run), max(max_loss, loss_run)
+    current_run = 0
+    current_kind = "none"
+    for trade in reversed(trades):
+        pnl = float(trade["net_pnl"])
+        kind = "win" if pnl > 0 else "loss" if pnl < 0 else "flat"
+        if current_kind == "none" and kind in ("win", "loss"):
+            current_kind, current_run = kind, 1
+        elif kind == current_kind:
+            current_run += 1
+        else:
+            break
+
+    # Daily buckets + running equity + drawdown.
+    daily: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        day = str(trade.get("exit_time") or "")[:10] or "unknown"
+        daily.setdefault(day, []).append(trade)
+
+    running = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    days: list[dict[str, Any]] = []
+    for day in sorted(daily):
+        rows = daily[day]
+        bucket = _bucket_summary(rows)
+        running += bucket["net_pnl"]
+        peak = max(peak, running)
+        max_dd = min(max_dd, running - peak)
+        days.append({
+            "date": day,
+            **bucket,
+            "cumulative": running,
+            "drawdown": running - peak,
+        })
+
+    by_weekday: dict[int, list[dict[str, Any]]] = {}
+    by_hour: dict[int, list[dict[str, Any]]] = {}
+    for trade in trades:
+        moment = _parse_ts(trade.get("entry_time") or trade.get("exit_time"))
+        if not moment:
+            continue
+        by_weekday.setdefault(moment.weekday(), []).append(trade)
+        by_hour.setdefault(moment.hour, []).append(trade)
+
+    by_direction = {
+        side: _bucket_summary([t for t in trades if str(t["direction"]).upper() == side])
+        for side in ("LONG", "SHORT")
+    }
+    exit_reasons: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        exit_reasons.setdefault(str(trade.get("exit_reason") or "unknown"), []).append(trade)
+
+    return {
+        "mode": mode,
+        "summary": summary,
+        "streaks": {
+            "current_kind": current_kind,
+            "current_run": current_run,
+            "max_win": max_win,
+            "max_loss": max_loss,
+        },
+        "days": days,
+        "by_weekday": [
+            {"weekday": WEEKDAY_NAMES[index], "index": index, **_bucket_summary(by_weekday[index])}
+            for index in range(7) if index in by_weekday
+        ],
+        "by_hour": [
+            {"hour": hour, **_bucket_summary(by_hour[hour])} for hour in sorted(by_hour)
+        ],
+        "by_direction": by_direction,
+        "by_exit_reason": [
+            {"reason": reason, **_bucket_summary(rows)}
+            for reason, rows in sorted(exit_reasons.items())
+        ],
+        "max_drawdown_pct": (max_dd / peak * 100.0) if peak > 0 else 0.0,
+        "max_drawdown": max_dd,
+    }
 
 
 # ---------------------------------------------------------------------------

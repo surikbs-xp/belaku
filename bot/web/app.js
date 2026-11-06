@@ -11,6 +11,10 @@
 'use strict';
 
 const POLL_MS = 1500;
+/** Countdown refresh. Independent of POLL_MS so the seconds hand stays smooth. */
+const TICK_MS = 250;
+/** Samples kept for the client-side sparkline (last ~40 polls). */
+const SPARK_POINTS = 40;
 const ENDPOINTS = {
   status:    '/api/status',
   portfolio: '/api/portfolio',
@@ -18,6 +22,9 @@ const ENDPOINTS = {
   orders:    '/api/orders?limit=500',
   trades:    '/api/trades?limit=500',
   signals:   '/api/signals?limit=100',
+  equity:    '/api/equity?limit=2000',
+  analytics: '/api/analytics',
+  journal:   '/api/journal?limit=500',
   toggle:    '/api/toggle-mode',
   pause:     '/api/pause',
   panic:     '/api/panic',
@@ -32,6 +39,21 @@ const state = {
   lastSync: null,
   busy: false,
   modeConfirming: false,
+  // Candle countdown: the bar boundary comes from the server's bucket start, so
+  // a skewed client clock cannot show the wrong time-to-close.
+  candleBoundaryMs: null,
+  serverOffsetMs: 0,
+  // Client-side price samples; the API has no tick history endpoint.
+  spark: [],
+  // Analytics + journal state. These load on a slower cadence than the 1.5s
+  // monitor poll because none of it changes tick-to-tick.
+  analytics: null,
+  journal: [],
+  journalLoadedAt: 0,
+  selectedTradeId: null,
+  journalRating: null,
+  journalUnannotatedOnly: false,
+  charts: {},
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -104,6 +126,29 @@ function giftTimestamp(value, label) {
   return formatted ? `${label} ${formatted} IST` : `${label} —`;
 }
 
+/** Clock time only (HH:MM IST) — denser than the full date for bar labels. */
+function istClock(value) {
+  if (!value) return null;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return null;
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(timestamp);
+}
+
+/** Fixed-decimal number for indicator levels; em dash when missing. */
+function level(value, decimals = 2) {
+  const n = num(value);
+  if (n === null) return '—';
+  return n.toLocaleString('en-IN', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -137,7 +182,7 @@ function setPill(id, text, variant) {
 function toast(message, kind = 'info') {
   const el = $('toast');
   el.textContent = message;
-  el.className = `pointer-events-none fixed bottom-6 right-6 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm shadow-xl toast-${kind}`;
+  el.className = `toast toast-${kind}`;
   el.classList.remove('hidden');
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => el.classList.add('hidden'), 5000);
@@ -175,7 +220,6 @@ function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
 
     const close = (result) => {
       modal.classList.add('hidden');
-      modal.classList.remove('flex');
       ok.removeEventListener('click', onOk);
       $('modal-cancel').removeEventListener('click', onCancel);
       document.removeEventListener('keydown', onKey);
@@ -189,7 +233,6 @@ function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
     $('modal-cancel').addEventListener('click', onCancel);
     document.addEventListener('keydown', onKey);
     modal.classList.remove('hidden');
-    modal.classList.add('flex');
   });
 }
 
@@ -248,6 +291,21 @@ function renderStatus(status) {
     + `GIFT ${feed.bars ?? 0} bars · ${eng.signals_fired ?? 0} signals · ${eng.orders_sent ?? 0} orders`;
   $('footer-right').textContent =
     `Sync ${state.lastSync ? state.lastSync.toLocaleTimeString() : '—'} · ${state.failures ? `${state.failures} failed poll(s)` : 'healthy'}`;
+
+  renderExecutionMeta(status);
+}
+
+/** Static execution facts a trader checks before trusting a fill. */
+function renderExecutionMeta(status) {
+  const config = status.config || {};
+  const symbol = status.symbol || {};
+  const feed = (status.engine || {}).feed || {};
+  setText('exec-lots', `${config.default_lots ?? '—'} lot`);
+  setText('exec-product', `${config.order_type || '—'} · ${config.product || '—'}`);
+  $('exec-product').title = symbol.next && symbol.next !== symbol.current
+    ? `Rolls to ${symbol.next} on expiry`
+    : '';
+  setText('indicator-source', `GIFT ${feed.interval || '—'} · ${feed.bars ?? 0} bars · source ${feed.history_source || '—'}`);
 }
 
 /**
@@ -310,6 +368,15 @@ function renderEngine(eng, market) {
   }
   setPill('pill-signal', `Signal · ${signalText}`, signalClass);
 
+  // Accent the whole hero panel off the signal so the route reads at a glance.
+  const signalPanel = $('signal-panel');
+  signalPanel.classList.remove('is-bull', 'is-bear', 'is-flat', 'is-warm');
+  signalPanel.classList.add(
+    !ready ? 'is-warm' : signal === 'BULL' ? 'is-bull' : signal === 'BEAR' ? 'is-bear' : 'is-flat',
+  );
+  $('signal-glyph').textContent =
+    !ready ? '…' : signal === 'BULL' ? '▲' : signal === 'BEAR' ? '▼' : '•';
+
   setText('e-signal', ready ? signal : 'WARMING UP',
     ready ? pnlClass(signal === 'BULL' ? 1 : signal === 'BEAR' ? -1 : 0) : 'flat');
   setText(
@@ -318,6 +385,8 @@ function renderEngine(eng, market) {
       ? (eng.last_detail || 'Conditions evaluated on the latest completed candle.')
       : `Collecting closed candles · ${Math.max(0, warmupNeeded - warmupHave)} more to calculate indicators`,
   );
+  setText('e-bars', ready ? `${warmupHave} closed` : `${warmupHave} / ${warmupNeeded}`);
+
   const hasLivePrice = feed.last_price !== null && feed.last_price !== undefined;
   const signalSourcePrice = hasLivePrice ? feed.last_price : feed.last_candle_close;
   const signalSourceAt = hasLivePrice ? feed.last_tick_at : feed.last_candle_at;
@@ -328,13 +397,16 @@ function renderEngine(eng, market) {
     signalSourceAt,
     hasLivePrice ? 'Last tick' : 'Last candle close',
   ));
-  setText('e-gift-sub', `${feed.bars ?? 0} bars · ${feed.ticks ?? 0} ticks · ${feed.interval || '—'}`);
+  setText('e-gift-sub', `${feed.bars ?? 0} bars · ${feed.ticks ?? 0} ticks`);
   setText('e-exec', eng.execution_symbol || '—');
   setText('e-exec-sub', market.is_open
     ? (eng.mode === 'PAPER' ? 'PAPER — simulated at market price' : 'NSE F&O open — orders live')
     : (eng.mode === 'PAPER'
       ? 'PAPER — completed GIFT close used after hours'
       : `orders held · ${market.reason || 'closed'}`));
+
+  renderCandle(eng, feed, ready, warmupHave);
+  renderSpark(signalSourcePrice);
 
   const box = $('conditions');
   const displayedBarAt = eng.current_values
@@ -379,33 +451,123 @@ function renderEngine(eng, market) {
   }
 
   if (hasIndicatorValues) {
-    const format = (value, digits = 2) => num(value) === null ? '—' : Number(value).toLocaleString('en-IN', {
-      minimumFractionDigits: digits,
-      maximumFractionDigits: digits,
-    });
     const psarConditions = eng.current_values
       ? eng.current_conditions || conditions
       : indicatorConditions;
-    setText('e-psar', format(values.psar));
+    setText('e-psar', level(values.psar));
     setText('e-psar-sub', psarConditions.buy_psar
       ? 'Price above · BUY condition passes'
       : psarConditions.sell_psar ? 'Price below · SELL condition passes' : 'BUY above · SELL below');
-    setText('e-st', `${values.supertrend_bull}/3 bullish · ${values.supertrend_bear}/3 bearish`);
-    setText(
-      'e-st-sub',
-      `Lines ${format(values.st_10_1)} · ${format(values.st_11_2)} · ${format(values.st_12_3)}`,
-    );
+    setText('e-st', `${values.supertrend_bull ?? 0}/3 bullish`);
+    setText('e-st-sub', `Lines ${level(values.st_10_1)} · ${level(values.st_11_2)} · ${level(values.st_12_3)}`);
+    renderVotes(values.supertrend_bull, values.supertrend_bear);
   } else {
     ['e-psar', 'e-st'].forEach((id) => setText(id, '—'));
+    renderVotes(null, null);
   }
 
   setText('e-counters',
     `${eng.evaluations ?? 0} evals · ${eng.signals_fired ?? 0} signals · `
-    + `${eng.orders_sent ?? 0} sent · ${eng.orders_blocked ?? 0} blocked · ${eng.deferred ?? 0} deferred`);
+    + `${eng.orders_sent ?? 0} sent · ${(eng.orders_blocked ?? 0) + (eng.deferred ?? 0)} held`);
 
   if (eng.last_error) {
     setActionStatus(`Engine: ${eng.last_error}`, 'err');
   }
+}
+
+/** Three-segment bar showing the live 2-of-3 SuperTrend split. */
+function renderVotes(bull, bear) {
+  const host = $('st-votes');
+  if (!host) return;
+  const up = num(bull) || 0;
+  const down = num(bear) || 0;
+  if (!up && !down) {
+    host.innerHTML = '';
+    return;
+  }
+  const segments = [
+    ...Array(up).fill('bull'),
+    ...Array(down).fill('bear'),
+  ];
+  while (segments.length < 3) segments.push('');
+  host.innerHTML = segments
+    .slice(0, 3)
+    .map((state) => `<span class="st-vote ${state}"></span>`)
+    .join('');
+}
+
+/**
+ * Candle countdown. The server's bucket start (`current_bar_at`) anchors the
+ * boundary, so the client clock only has to measure elapsed time — a skewed
+ * clock or a different timezone cannot shift the countdown.
+ */
+function renderCandle(eng, feed, ready, warmupHave) {
+  const intervalSeconds = num(feed.interval_seconds) || 300;
+  const barAt = eng.current_bar_at || eng.previous_bar_at || eng.last_bar_at;
+  const boundary = istClock(barAt);
+
+  if (boundary) {
+    const [hours, minutes] = boundary.split(':').map(Number);
+    const nowIst = new Date(Date.now() + state.serverOffsetMs);
+    const nowParts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    }).formatToParts(nowIst);
+    const get = (type) => Number(nowParts.find((p) => p.type === type)?.value || 0);
+    const elapsed = (get('hour') * 3600 + get('minute') * 60 + get('second'))
+      - (hours * 3600 + minutes * 60);
+    const remaining = Math.max(0, intervalSeconds - ((elapsed + intervalSeconds) % intervalSeconds));
+    state.candleBoundaryMs = remaining;
+  } else {
+    state.candleBoundaryMs = null;
+  }
+
+  setText('candle-open', boundary ? `${boundary} IST` : '—');
+  setText('candle-bar', eng.previous_bar_at ? `${istClock(eng.previous_bar_at)} IST` : '—');
+  setPill(
+    'candle-pill',
+    !ready ? 'Warming up' : eng.current_bar_in_progress ? 'Forming' : 'Closed',
+    !ready ? 'idle' : eng.current_bar_in_progress ? 'paper' : 'live',
+  );
+  tickCountdown();
+}
+
+/** Repaint only the countdown text; called on TICK_MS, not on every poll. */
+function tickCountdown() {
+  const el = $('candle-countdown');
+  if (!el) return;
+  const remaining = state.candleBoundaryMs;
+  if (remaining === null) {
+    el.textContent = '—:—';
+    el.classList.remove('imminent');
+    return;
+  }
+  el.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+  el.classList.toggle('imminent', remaining <= 30);
+}
+
+/** Client-side sparkline of recent polls; the API exposes no tick history. */
+function renderSpark(price) {
+  const value = num(price);
+  if (value !== null) {
+    const last = state.spark[state.spark.length - 1];
+    if (last !== value) state.spark.push(value);
+    if (state.spark.length > SPARK_POINTS) state.spark.shift();
+  }
+
+  const host = $('gift-spark');
+  if (state.spark.length < 2) {
+    host.innerHTML = '<span class="spark-empty">Building price trail…</span>';
+    return;
+  }
+  const min = Math.min(...state.spark);
+  const max = Math.max(...state.spark);
+  const span = max - min || 1;
+  host.innerHTML = state.spark.map((sample, index) => {
+    const height = 12 + ((sample - min) / span) * 88;
+    const previous = index === 0 ? sample : state.spark[index - 1];
+    const trend = sample > previous ? 'up' : sample < previous ? 'down' : '';
+    return `<span class="spark-bar ${trend}" style="height:${height.toFixed(1)}%"></span>`;
+  }).join('');
 }
 
 function renderPortfolio(portfolio) {
@@ -437,12 +599,6 @@ function renderPortfolio(portfolio) {
   setText('m-realised', signedInr(portfolio.realized_total), pnlClass(portfolio.realized_total));
   setText('m-winrate', `${portfolio.win_rate}%`);
   setText('m-pf', portfolio.profit_factor === null ? '∞' : portfolio.profit_factor);
-
-  setText('a-net', signedInr(portfolio.total_pnl), pnlClass(portfolio.total_pnl));
-  setText('a-return', `${portfolio.total_return_pct >= 0 ? '+' : ''}${portfolio.total_return_pct}%`,
-    pnlClass(portfolio.total_return_pct));
-  setText('a-dd', `${portfolio.max_drawdown_pct}%`, pnlClass(portfolio.max_drawdown_pct));
-  setText('a-trades', portfolio.total_trades);
 }
 
 function renderPositions(payload) {
@@ -452,10 +608,17 @@ function renderPositions(payload) {
 
   const body = $('positions-body');
   if (!open.length) {
-    body.innerHTML = '<tr class="empty-row"><td colspan="7">Flat — no open positions.</td></tr>';
+    body.innerHTML = '<tr class="empty-row"><td colspan="8">Flat — no open positions.</td></tr>';
     return;
   }
-  body.innerHTML = open.map((p) => `
+  body.innerHTML = open.map((p) => {
+    // Points is the raw price move; PnL is that move times quantity and lot
+    // direction. Traders size off points, so show both.
+    const entry = num(p.entry_price);
+    const mark = num(p.mark_price);
+    const move = entry === null || mark === null ? null : mark - entry;
+    const points = move === null ? null : move * (p.side === 'LONG' ? 1 : -1);
+    return `
     <tr>
       <td class="font-mono">${escapeHtml(p.symbol)}</td>
       <td><span class="tag ${p.side === 'LONG' ? 'tag-buy' : 'tag-sell'}">${escapeHtml(p.side)}</span></td>
@@ -463,8 +626,10 @@ function renderPositions(payload) {
       <td class="num">${inr(p.entry_price, 2)}</td>
       <td class="num">${inr(p.mark_price, 2)}</td>
       <td class="num ${pnlClass(p.unrealized_pnl)}">${signedInr(p.unrealized_pnl)}</td>
+      <td class="num ${pnlClass(points)}">${points === null ? '—' : `${points >= 0 ? '+' : ''}${level(points)}`}</td>
       <td><span class="tag tag-muted">${escapeHtml(p.mode)}</span></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 /* ── Orders + signals ──────────────────────────────────────────────── */
@@ -532,13 +697,224 @@ function renderSignals() {
   }).join('');
 }
 
+/* ── Analytics ─────────────────────────────────────────────────────── */
+
+/** Ratio/KPI formatters shared by the analytics panel. */
+function ratio(value) {
+  const n = num(value);
+  if (n === null) return '—';
+  if (!Number.isFinite(n)) return '∞';
+  return n.toFixed(2);
+}
+
+function pct(value, decimals = 1) {
+  const n = num(value);
+  if (n === null) return '—';
+  return `${n.toFixed(decimals)}%`;
+}
+
+function points(value) {
+  const n = num(value);
+  if (n === null) return '—';
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`;
+}
+
+function hours(minutes) {
+  const n = num(minutes);
+  if (n === null || n === 0) return '—';
+  if (n < 60) return `${Math.round(n)}m`;
+  const h = Math.floor(n / 60);
+  const m = Math.round(n % 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+function renderAnalytics(data) {
+  state.analytics = data;
+  const s = data.summary || {};
+  const streaks = data.streaks || {};
+
+  setText('a-net', signedInr(s.net_pnl), pnlClass(s.net_pnl));
+  setText('a-net-sub', `${signedInr(s.gross_pnl)} gross · ${signedInr(-(s.fees || 0))} fees`);
+  setText('a-winrate', s.trades ? pct(s.win_rate) : '—');
+  setText('a-winrate-sub', `${s.wins ?? 0}W · ${s.losses ?? 0}L · ${s.breakeven ?? 0}BE`);
+  setText('a-pf', s.trades ? ratio(s.profit_factor) : '—');
+  setText('a-pf-sub', `${signedInr(s.gross_win)} won · ${signedInr(-(s.gross_loss || 0))} lost`);
+  setText('a-expectancy', s.trades ? signedInr(s.expectancy) : '—');
+  setText('a-expectancy-sub', `per trade · ${points(s.avg_points)} pts avg`);
+  setText('a-dd', data.max_drawdown ? signedInr(data.max_drawdown) : '—', data.max_drawdown ? 'neg' : 'flat');
+  setText('a-dd-sub', `${pct(data.max_drawdown_pct)} of peak`);
+  setText('a-trades', s.trades ?? 0);
+  setText('a-trades-sub', `avg hold ${hours(s.avg_hold_minutes)}`);
+
+  setText('s-streak', streaks.current_kind === 'none'
+    ? '—'
+    : `${streaks.current_run} ${streaks.current_kind}${streaks.current_run === 1 ? '' : 'es'}`,
+    streaks.current_kind === 'win' ? 'pos' : streaks.current_kind === 'loss' ? 'neg' : 'flat');
+  setText('s-maxwin', streaks.max_win ?? '—');
+  setText('s-maxloss', streaks.max_loss ?? '—');
+  setText('s-bigwin', signedInr(s.largest_win), 'pos');
+  setText('s-bigloss', signedInr(s.largest_loss), 'neg');
+  setText('s-avgwin', signedInr(s.avg_win), 'pos');
+  setText('s-avgloss', signedInr(s.avg_loss), 'neg');
+  setText('s-hold', hours(s.avg_hold_minutes));
+  setText('s-points', points(s.avg_points));
+  setText('s-fees', inr(s.fees));
+
+  renderBreakdown('breakdown-direction', (data.by_direction
+    ? Object.entries(data.by_direction).map(([label, bucket]) => ({ label, bucket }))
+    : []));
+  renderBreakdown('breakdown-weekday',
+    (data.by_weekday || []).map((row) => ({ label: row.weekday, bucket: row })));
+  renderBreakdown('breakdown-hour',
+    (data.by_hour || []).map((row) => ({ label: `${String(row.hour).padStart(2, '0')}:00`, bucket: row })));
+  renderBreakdown('breakdown-exit',
+    (data.by_exit_reason || []).map((row) => ({ label: row.reason, bucket: row })));
+
+  renderDailyChart(data.days || []);
+}
+
+/** Horizontal bar per bucket, scaled to the largest absolute P&L. */
+function renderBreakdown(id, rows) {
+  const host = $(id);
+  if (!host) return;
+  if (!rows.length) {
+    host.innerHTML = '<p class="breakdown-empty">No data yet.</p>';
+    return;
+  }
+  const scale = Math.max(...rows.map((row) => Math.abs(num(row.bucket.net_pnl) || 0)), 1);
+  host.innerHTML = rows.map(({ label, bucket }) => {
+    const net = num(bucket.net_pnl) || 0;
+    const width = Math.max(2, (Math.abs(net) / scale) * 100);
+    const kind = net > 0 ? 'pos' : net < 0 ? 'neg' : 'flat';
+    return `
+      <div class="breakdown-row">
+        <span class="breakdown-label">${escapeHtml(label)}</span>
+        <span class="breakdown-track"><span class="breakdown-fill ${kind}" style="width:${width.toFixed(1)}%"></span></span>
+        <span class="breakdown-meta ${pnlClass(net)}">${signedInr(net, 0)} · ${bucket.wins}W/${bucket.losses}L</span>
+      </div>`;
+  }).join('');
+}
+
+function renderDailyChart(days) {
+  const host = $('daily-chart');
+  const empty = $('daily-empty');
+  if (!host) return;
+  const usable = days.filter((day) => day.date && day.date !== 'unknown');
+  setText('daily-caption', usable.length
+    ? `${usable.length} day${usable.length === 1 ? '' : 's'}`
+    : '—');
+
+  if (!usable.length) {
+    host.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+  const max = Math.max(...usable.map((day) => Math.abs(day.net_pnl)), 1);
+  host.innerHTML = usable.map((day) => {
+    const height = Math.max(4, (Math.abs(day.net_pnl) / max) * 100);
+    const kind = day.net_pnl >= 0 ? 'pos' : 'neg';
+    return `
+      <div class="daily-bar-wrap" title="${escapeHtml(day.date)} · ${signedInr(day.net_pnl, 0)} · ${day.trades} trades">
+        <div class="daily-bar daily-bar-${kind}" style="height:${height.toFixed(1)}%"></div>
+        <span class="daily-bar-label">${escapeHtml(day.date.slice(5))}</span>
+      </div>`;
+  }).join('');
+}
+
+/**
+ * Equity curve via TradingView Lightweight Charts.
+ *
+ * Two failure modes are handled explicitly because both corrupted the chart
+ * permanently in testing:
+ *   * the library requires strictly ascending, unique timestamps, and the
+ *     equity table can contain duplicate seconds;
+ *   * a chart created while its tab is hidden has no measurable container and
+ *     ends up throwing on every redraw, so it is only ever built on screen.
+ *
+ * The library is also optional: if the CDN is blocked, the KPIs and ledger
+ * still work and the chart degrades to a notice.
+ */
+function renderEquityChart(points) {
+  const host = $('equity-chart');
+  const empty = $('equity-empty');
+  if (!host) return;
+
+  const byTime = new Map();
+  for (const point of points || []) {
+    const time = Math.floor(new Date(point.ts).getTime() / 1000);
+    const value = num(point.equity);
+    if (Number.isFinite(time) && value !== null) byTime.set(time, { time, value });
+  }
+  const series = [...byTime.values()].sort((a, b) => a.time - b.time);
+
+  if (!series.length) {
+    empty.classList.remove('hidden');
+    return;
+  }
+
+  const lib = window.LightweightCharts;
+  if (!lib) {
+    host.innerHTML = '<p class="chart-empty">Chart library unavailable — see the ledger below.</p>';
+    return;
+  }
+  // Creating a chart needs a laid-out container; updating an existing one does not.
+  if (!state.charts.equity && (!host.clientWidth || !host.clientHeight)) return;
+
+  empty.classList.add('hidden');
+
+  try {
+    if (!state.charts.equity) {
+      state.charts.equity = lib.createChart(host, {
+        autoSize: true,
+        layout: { background: { color: 'transparent' }, textColor: '#8fa0b8', fontSize: 11 },
+        grid: {
+          vertLines: { color: 'rgba(27,39,64,0.5)' },
+          horzLines: { color: 'rgba(27,39,64,0.5)' },
+        },
+        rightPriceScale: { borderColor: '#1b2740' },
+        timeScale: { borderColor: '#1b2740', timeVisible: true, secondsVisible: false },
+        crosshair: { mode: 0 },
+      });
+    }
+    if (!state.charts.equitySeries) {
+      state.charts.equitySeries = state.charts.equity.addSeries(lib.AreaSeries, {
+        lineColor: '#38bdf8',
+        topColor: 'rgba(56,189,248,0.35)',
+        bottomColor: 'rgba(56,189,248,0.02)',
+        lineWidth: 2,
+        priceLineVisible: false,
+      });
+    }
+    state.charts.equitySeries.setData(series);
+    state.charts.equity.timeScale().fitContent();
+    setText('equity-source', `${state.analytics?.equity_source || 'equity curve'} · ${series.length} points`);
+  } catch (error) {
+    // Tear the broken instance down and keep the rest of the tab usable.
+    try { state.charts.equity?.remove(); } catch { /* already gone */ }
+    state.charts.equity = null;
+    state.charts.equitySeries = null;
+    host.innerHTML = `<p class="chart-empty">Equity chart unavailable (${escapeHtml(error.message)}) — see the ledger below.</p>`;
+  }
+}
+
 function renderTrades() {
   const body = $('trades-body');
   if (!state.trades.length) {
-    body.innerHTML = '<tr class="empty-row"><td colspan="10">No settled trades yet.</td></tr>';
+    body.innerHTML = '<tr class="empty-row"><td colspan="12">No settled trades yet.</td></tr>';
     return;
   }
-  body.innerHTML = state.trades.map((t) => `
+  const notes = state.notesById || {};
+  body.innerHTML = state.trades.map((t) => {
+    const move = num(t.exit_price) !== null && num(t.entry_price) !== null
+      ? (num(t.exit_price) - num(t.entry_price)) * (t.direction === 'LONG' ? 1 : -1)
+      : null;
+    const note = notes[String(t.id)];
+    const hasNote = !!note;
+    const label = hasNote
+      ? [note.setup, note.tags].filter(Boolean).join(' · ') || 'note'
+      : 'add note';
+    return `
     <tr>
       <td class="font-mono text-slate-400">${escapeHtml((t.exit_time || '').replace('T', ' '))}</td>
       <td class="font-mono">${escapeHtml(t.symbol)}</td>
@@ -546,11 +922,199 @@ function renderTrades() {
       <td class="num">${t.quantity}</td>
       <td class="num">${inr(t.entry_price, 2)}</td>
       <td class="num">${inr(t.exit_price, 2)}</td>
+      <td class="num ${pnlClass(move)}">${move === null ? '—' : points(move)}</td>
       <td class="num ${pnlClass(t.gross_pnl)}">${signedInr(t.gross_pnl)}</td>
       <td class="num text-slate-400">${inr(t.fees, 2)}</td>
       <td class="num ${pnlClass(t.net_pnl)}">${signedInr(t.net_pnl)}</td>
       <td class="text-slate-400">${escapeHtml(t.exit_reason || '—')}</td>
-    </tr>`).join('');
+      <td><button type="button" class="journal-chip ${hasNote ? 'has-note' : ''}"
+            data-journal-trade="${t.id}"
+            title="${escapeHtml(hasNote ? (note.note || 'Journal entry saved') : 'Add a journal entry')}">
+            ${hasNote ? '★' : '+'} ${escapeHtml(label)}
+          </button></td>
+    </tr>`;
+  }).join('');
+}
+
+/* ── Journal ───────────────────────────────────────────────────────── */
+
+/** Rebuild the setup datalist from notes already written, newest first. */
+function refreshSetupOptions() {
+  const setups = [...new Set(
+    state.journal.map((entry) => entry.note && entry.note.setup).filter(Boolean),
+  )].sort();
+  $('setup-options').innerHTML = setups
+    .map((setup) => `<option value="${escapeHtml(setup)}"></option>`)
+    .join('');
+}
+
+function renderJournal() {
+  const host = $('journal-list');
+  const needle = $('journal-search').value.trim().toLowerCase();
+  const annotated = state.journal.filter((entry) => entry.note).length;
+  setText('journal-caption',
+    `${state.journal.length} trades · ${annotated} annotated`);
+
+  refreshSetupOptions();
+
+  const rows = state.journal.filter((entry) => {
+    const trade = entry.trade || {};
+    const note = entry.note;
+    if (state.journalUnannotatedOnly && note) return false;
+    if (!needle) return true;
+    const haystack = [
+      trade.symbol, trade.direction, trade.exit_reason,
+      note && note.setup, note && note.tags, note && note.note, note && note.mistakes,
+    ].join(' ').toLowerCase();
+    return haystack.includes(needle);
+  });
+
+  if (!rows.length) {
+    host.innerHTML = `<p class="condition-empty">${state.journal.length
+      ? 'No trades match this filter.'
+      : 'No settled trades yet — the journal opens up after the first round-trip closes.'}</p>`;
+    return;
+  }
+
+  host.innerHTML = rows.map((entry) => {
+    const trade = entry.trade || {};
+    const note = entry.note;
+    const kind = num(trade.net_pnl) > 0 ? 'tag-buy' : num(trade.net_pnl) < 0 ? 'tag-sell' : 'tag-muted';
+    const stars = note && note.rating ? '★'.repeat(note.rating) : '';
+    const setup = (note && note.setup) || '';
+    const tags = (note && note.tags) || '';
+    const noteText = (note && note.note) || '';
+    return `
+      <button type="button" class="journal-item ${state.selectedTradeId === trade.id ? 'is-selected' : ''}"
+              data-journal-select="${trade.id}">
+        <span>
+          <span class="tag ${kind}">${escapeHtml(trade.direction || '—')}</span>
+        </span>
+        <span class="journal-item-main">
+          <span class="journal-item-head">
+            <strong>${escapeHtml((trade.exit_time || '').slice(0, 16).replace('T', ' '))}</strong>
+            <span class="tag ${num(trade.net_pnl) > 0 ? 'tag-buy' : 'tag-sell'}">${signedInr(trade.net_pnl)}</span>
+            <span class="metric-sub">${points((num(trade.exit_price) - num(trade.entry_price)) * (trade.direction === 'LONG' ? 1 : -1))} pts</span>
+          </span>
+          <span class="journal-item-sub">${escapeHtml(
+            [setup, tags, noteText].filter(Boolean).join(' · ') || 'No note yet',
+          )}</span>
+        </span>
+        <span class="journal-item-flags">
+          ${stars ? `<span class="journal-flag">${escapeHtml(stars)}</span>` : ''}
+          <span class="journal-flag ${note ? 'is-annotated' : ''}">${note ? 'noted' : 'blank'}</span>
+        </span>
+      </button>`;
+  }).join('');
+}
+
+function openJournalEditor(tradeId) {
+  const entry = state.journal.find((row) => (row.trade || {}).id === tradeId);
+  if (!entry) return;
+  state.selectedTradeId = tradeId;
+  const trade = entry.trade || {};
+  const note = entry.note || {};
+
+  $('journal-editor-empty').classList.add('hidden');
+  $('journal-form').classList.remove('hidden');
+
+  const move = (num(trade.exit_price) - num(trade.entry_price)) * (trade.direction === 'LONG' ? 1 : -1);
+  $('journal-trade-summary').innerHTML = `
+    <div><p class="metric-label">Direction</p><p class="metric-sub-inline">${escapeHtml(trade.direction || '—')}</p></div>
+    <div><p class="metric-label">Net P&amp;L</p><p class="metric-sub-inline ${pnlClass(trade.net_pnl)}">${signedInr(trade.net_pnl)}</p></div>
+    <div><p class="metric-label">Move</p><p class="metric-sub-inline ${pnlClass(move)}">${points(move)} pts</p></div>
+    <div><p class="metric-label">Closed</p><p class="metric-sub-inline">${escapeHtml((trade.exit_time || '').slice(0, 16).replace('T', ' '))}</p></div>`;
+
+  $('journal-setup').value = note.setup || '';
+  $('journal-tags').value = note.tags || '';
+  $('journal-note').value = note.note || '';
+  $('journal-mistakes').value = note.mistakes || '';
+  setJournalRating(note.rating || null);
+  setJournalStatus(note.trade_id ? `Saved ${note.updated_at || ''}` : 'No note yet', note.trade_id ? 'ok' : '');
+  renderJournal();
+}
+
+function setJournalRating(value) {
+  state.journalRating = num(value);
+  $('journal-rating').innerHTML = [1, 2, 3, 4, 5].map((star) => `
+    <button type="button" class="rating-star ${state.journalRating >= star ? 'is-on' : ''}"
+            data-rating="${star}" role="radio"
+            aria-checked="${state.journalRating === star}"
+            aria-label="${star} of 5">${star}</button>`).join('');
+}
+
+function setJournalStatus(message, kind) {
+  const el = $('journal-status');
+  el.textContent = message;
+  el.className = `journal-status ${kind === 'ok' ? 'pos' : kind === 'err' ? 'neg' : ''}`;
+}
+
+async function saveJournal(event) {
+  event.preventDefault();
+  if (!state.selectedTradeId) return;
+  setJournalStatus('Saving…');
+  try {
+    const result = await api(`/api/journal/${state.selectedTradeId}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        note: $('journal-note').value,
+        setup: $('journal-setup').value,
+        tags: $('journal-tags').value,
+        rating: state.journalRating || null,
+        mistakes: $('journal-mistakes').value,
+      }),
+    });
+    setJournalStatus(`Saved ${result.note?.updated_at || ''}`, 'ok');
+    toast('Journal note saved', 'ok');
+    await loadJournal();
+    renderTrades();
+    openJournalEditor(state.selectedTradeId);
+  } catch (error) {
+    setJournalStatus(error.message, 'err');
+    toast(`Could not save note: ${error.message}`, 'err');
+  }
+}
+
+async function clearJournalEntry() {
+  if (!state.selectedTradeId) return;
+  const confirmed = await confirmDialog({
+    title: 'Delete this journal note?',
+    body: 'The trade itself is untouched — only your written note is removed.',
+    okLabel: 'Delete note',
+  });
+  if (!confirmed) return;
+  try {
+    await api(`/api/journal/${state.selectedTradeId}`, { method: 'DELETE' });
+    toast('Journal note deleted', 'ok');
+    await loadJournal();
+    renderTrades();
+    openJournalEditor(state.selectedTradeId);
+  } catch (error) {
+    setJournalStatus(error.message, 'err');
+  }
+}
+
+async function loadJournal() {
+  const data = await api(ENDPOINTS.journal);
+  state.journal = data.entries || [];
+  state.journalLoadedAt = Date.now();
+  state.notesById = Object.fromEntries(
+    state.journal.filter((entry) => entry.note)
+      .map((entry) => [String((entry.trade || {}).id), entry.note]),
+  );
+  renderJournal();
+}
+
+/** Trade KPIs + equity curve. Cheap enough to refetch on a slow cadence. */
+async function loadAnalytics() {
+  const [analytics, equity] = await Promise.all([
+    api(ENDPOINTS.analytics),
+    api(ENDPOINTS.equity),
+  ]);
+  state.analyticsLoadedAt = Date.now();
+  renderAnalytics(analytics);
+  if (equity.source) analytics.equity_source = equity.source;
+  renderEquityChart(equity.points || []);
 }
 
 /* ── Polling ───────────────────────────────────────────────────────── */
@@ -573,6 +1137,12 @@ async function poll() {
     state.lastSync = new Date();
     state.failures = 0;
 
+    // Track server clock drift so the countdown can trust it.
+    const serverTime = status.server_time ? new Date(status.server_time) : null;
+    if (serverTime && !Number.isNaN(serverTime.getTime())) {
+      state.serverOffsetMs = serverTime.getTime() - Date.now();
+    }
+
     renderStatus(status);
     renderPortfolio(portfolio);
     renderPositions(positions);
@@ -584,6 +1154,16 @@ async function poll() {
     if (!state.kite || Date.now() - (state.kiteCheckedAt || 0) > 20000) {
       state.kiteCheckedAt = Date.now();
       refreshKiteStatus();
+    }
+    // Analytics and the journal only change when a trade settles, so load them
+    // on the tab that shows them and refresh slowly in the background. Failures
+    // here must not break the monitor poll, hence the catch.
+    const slowLoad = [];
+    if (state.tab === 'analytics') slowLoad.push(loadAnalytics());
+    else if (Date.now() - (state.analyticsLoadedAt || 0) > 30000) slowLoad.push(loadAnalytics());
+    if (state.tab === 'journal' && Date.now() - state.journalLoadedAt > 15000) slowLoad.push(loadJournal());
+    if (slowLoad.length) {
+      Promise.allSettled(slowLoad).catch(() => { /* reported per-loader */ });
     }
   } catch (error) {
     state.failures += 1;
@@ -839,10 +1419,16 @@ function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((btn) => {
     btn.classList.toggle('tab-active', btn.dataset.tab === tab);
   });
-  ['monitor', 'orders', 'analytics'].forEach((name) => {
+  ['monitor', 'orders', 'analytics', 'journal'].forEach((name) => {
     $(`view-${name}`).classList.toggle('hidden', name !== tab);
   });
   if (tab === 'orders') renderOrders();
+  if (tab === 'analytics') {
+    loadAnalytics().catch((error) => toast(`Analytics unavailable: ${error.message}`, 'err'));
+  }
+  if (tab === 'journal') {
+    loadJournal().catch((error) => toast(`Journal unavailable: ${error.message}`, 'err'));
+  }
 }
 
 /* ── Wiring ────────────────────────────────────────────────────────── */
@@ -864,6 +1450,47 @@ function init() {
   $('btn-panic').addEventListener('click', panic);
   $('btn-orders-csv').addEventListener('click', exportCsv);
 
+  // Journal: delegation keeps the list markup replaceable without rebinding.
+  $('journal-list').addEventListener('click', (event) => {
+    const item = event.target.closest('[data-journal-select]');
+    if (item) openJournalEditor(Number(item.dataset.journalSelect));
+  });
+  $('trades-body').addEventListener('click', (event) => {
+    const chip = event.target.closest('[data-journal-trade]');
+    if (!chip) return;
+    switchTab('journal');
+    loadJournal()
+      .then(() => openJournalEditor(Number(chip.dataset.journalTrade)))
+      .catch((error) => toast(`Journal unavailable: ${error.message}`, 'err'));
+  });
+  $('journal-form').addEventListener('submit', saveJournal);
+  $('journal-delete').addEventListener('click', clearJournalEntry);
+  $('journal-clear').addEventListener('click', () => {
+    $('journal-setup').value = '';
+    $('journal-tags').value = '';
+    $('journal-note').value = '';
+    $('journal-mistakes').value = '';
+    setJournalRating(null);
+    setJournalStatus('Cleared — save to persist');
+  });
+  $('journal-rating').addEventListener('click', (event) => {
+    const star = event.target.closest('[data-rating]');
+    if (!star) return;
+    const value = Number(star.dataset.rating);
+    setJournalRating(state.journalRating === value ? null : value);
+  });
+  let journalTimer = null;
+  $('journal-search').addEventListener('input', () => {
+    clearTimeout(journalTimer);
+    journalTimer = setTimeout(renderJournal, 120);
+  });
+  $('btn-journal-unannotated').addEventListener('click', () => {
+    state.journalUnannotatedOnly = !state.journalUnannotatedOnly;
+    $('btn-journal-unannotated').classList.toggle('btn-primary', state.journalUnannotatedOnly);
+    $('btn-journal-unannotated').classList.toggle('btn-neutral', !state.journalUnannotatedOnly);
+    renderJournal();
+  });
+
   let searchTimer = null;
   $('orders-search').addEventListener('input', () => {
     clearTimeout(searchTimer);
@@ -876,15 +1503,18 @@ function init() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       clearInterval(state.timer);
+      clearInterval(state.tickTimer);
     } else {
       poll();
       state.timer = setInterval(poll, POLL_MS);
+      state.tickTimer = setInterval(tickCountdown, TICK_MS);
     }
   });
 
   switchTab('monitor');
   poll();
   state.timer = setInterval(poll, POLL_MS);
+  state.tickTimer = setInterval(tickCountdown, TICK_MS);
 }
 
 document.addEventListener('DOMContentLoaded', init);
