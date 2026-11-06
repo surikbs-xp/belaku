@@ -67,6 +67,8 @@ class Settings:
     # where the dashboard and JSON API listen.
     webhook_host: str = _env("WEBHOOK_HOST", "127.0.0.1")
     webhook_port: int = _env_int("WEBHOOK_PORT", 9000)
+    # Shown as the browser tab title and the dashboard header.
+    bot_name: str = _env("BOT_NAME", "Belaku")
 
     # --- Execution --------------------------------------------------------
     execution_mode: str = _env("EXECUTION_MODE", PAPER).upper()

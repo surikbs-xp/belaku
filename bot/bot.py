@@ -336,6 +336,7 @@ def api_status() -> dict[str, Any]:
     return {
         "mode": get_execution_mode(),
         "modes": [PAPER, LIVE],
+        "bot_name": settings.bot_name,
         "live_configured": settings.is_live_configured,
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "started_at": STARTED_ISO,
@@ -851,7 +852,7 @@ def _callback_page(ok: bool, title: str, detail: str, extra: str = "") -> HTMLRe
         f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
+<title>{settings.bot_name} · {title}</title>
 <style>
   body {{ margin:0; min-height:100vh; display:grid; place-items:center;
          background:#080b14; color:#e2e8f0;

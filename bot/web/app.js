@@ -1,5 +1,5 @@
 /**
- * GIFT Nifty Execution Desk - frontend engine.
+ * Belaku - frontend engine.
  *
  * Polls the FastAPI JSON endpoints on a fixed interval and patches the DOM in
  * place (no page reloads, no framework). Destructive actions (mode switch to
@@ -60,6 +60,8 @@ const state = {
   // Strategy configuration from /api/status, so the vote bar and labels follow
   // STRATEGY_SUPERTRENDS instead of hardcoded periods.
   strategyConfig: null,
+  // Bot name from /api/status (BOT_NAME); drives the tab title and header.
+  botName: null,
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -251,8 +253,22 @@ function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
 
 /* ── Header + monitor ──────────────────────────────────────────────── */
 
+/**
+ * Bot name from the server (BOT_NAME). Applied to the tab title and the header
+ * so a rename needs no frontend edit; the brand mark takes its first letter.
+ */
+function applyBotName(name) {
+  const label = String(name || '').trim();
+  if (!label || label === state.botName) return;
+  state.botName = label;
+  document.title = label;
+  setText('brand-title', label);
+  setText('brand-mark', label.charAt(0).toUpperCase());
+}
+
 function renderStatus(status) {
   const mode = status.mode;
+  applyBotName(status.bot_name);
   const market = status.market || {};
   setPill('pill-market', market.is_open ? 'Market open' : 'Market closed', market.is_open ? 'live' : 'idle');
   $('pill-market').title = market.reason || 'Market status unavailable';
@@ -476,15 +492,14 @@ function renderEngine(eng, market) {
       ? values.supertrend_config
       : (state.strategyConfig?.supertrends || []);
     const stTotal = Number(values.supertrend_total) || stConfig.length || 3;
-    const stLines = stConfig.length
-      ? stConfig.map((item) => level(values[item.key])).join(' · ')
-      : '—';
     setText('e-psar', level(values.psar));
     setText('e-psar-sub', psarConditions.buy_psar
       ? 'Price above · BUY condition passes'
       : psarConditions.sell_psar ? 'Price below · SELL condition passes' : 'BUY above · SELL below');
     setText('e-st', `${values.supertrend_bull ?? 0}/${stTotal} bullish`);
-    setText('e-st-sub', `Lines ${stLines}`);
+    setText('e-st-sub', stConfig.length
+      ? stConfig.map((item) => `${item.length}×${Number(item.multiplier)}`).join(' · ')
+      : '—');
     renderVotes('st-votes', values.supertrend_bull, values.supertrend_bear, stTotal);
     renderVoteLegend('st-legend', stConfig, values);
     // PSAR is a single binary check: close above SAR is bullish.
@@ -533,8 +548,9 @@ function renderVotes(id, bull, bear, segments) {
 }
 
 /**
- * Caption under the vote bar naming each SuperTrend instance, so a trader can
- * tell which period voted which way instead of reading one merged bar.
+ * Value caption under the vote bar: the SuperTrend line for each instance, so
+ * the number sits directly beneath the segment that voted it. The period and
+ * multiplier move to the sub-line instead of repeating here.
  */
 function renderVoteLegend(id, config, values) {
   const host = $(id);
@@ -547,7 +563,7 @@ function renderVoteLegend(id, config, values) {
     const direction = num(item.direction);
     const kind = direction === null || direction === 0 ? '' : direction < 0 ? 'bull' : 'bear';
     const label = `${item.length}×${Number(item.multiplier)}`;
-    return `<span class="${kind}" title="${label} · line ${level(values[item.key])}">${label}</span>`;
+    return `<span class="${kind}" title="${label} · ${direction < 0 ? 'bullish' : direction > 0 ? 'bearish' : 'flat'}">${level(values[item.key])}</span>`;
   }).join('');
 }
 
