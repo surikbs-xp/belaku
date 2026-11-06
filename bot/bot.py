@@ -228,6 +228,16 @@ class PanicRequest(BaseModel):
     reason: str = Field(default="PANIC", description="Audit label")
 
 
+class JournalRequest(BaseModel):
+    """Discretionary notes attached to a settled trade."""
+
+    note: str = Field(default="", max_length=4000, description="What happened, in your words")
+    setup: str = Field(default="", max_length=200, description="Named setup or pattern")
+    tags: str = Field(default="", max_length=400, description="Comma-separated labels")
+    rating: Optional[int] = Field(default=None, description="Execution quality 1-5")
+    mistakes: str = Field(default="", max_length=1000, description="What to avoid next time")
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -562,6 +572,60 @@ def api_signals(limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
     """Signal audit trail: every engine decision, accepted or blocked."""
     rows = db.get_signals(limit=limit)
     return {"signals": rows, "count": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# Analytics + journal
+# ---------------------------------------------------------------------------
+@app.get("/api/analytics", tags=["analytics"])
+def api_analytics(
+    mode: Optional[str] = Query(None, pattern="^(PAPER|LIVE)$"),
+    limit: int = Query(5000, ge=1, le=20000),
+) -> dict[str, Any]:
+    """Post-close trade statistics: KPIs, streaks, daily curve and breakdowns."""
+    return db.get_trade_analytics(mode=mode or get_execution_mode(), limit=limit)
+
+
+@app.get("/api/journal", tags=["journal"])
+def api_journal(
+    mode: Optional[str] = Query(None, pattern="^(PAPER|LIVE)$"),
+    limit: int = Query(500, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Settled trades merged with their journal annotations."""
+    selected = mode or get_execution_mode()
+    trades = [t for t in db.get_trades(limit=limit) if (t.get("mode") or "").upper() == selected]
+    notes = db.get_trade_notes()
+    return {
+        "mode": selected,
+        "entries": [{"trade": trade, "note": notes.get(int(trade["id"]))} for trade in trades],
+        "count": len(trades),
+        "annotated": sum(1 for trade in trades if int(trade["id"]) in notes),
+    }
+
+
+@app.put("/api/journal/{trade_id}", tags=["journal"])
+def api_save_journal(trade_id: int, request: JournalRequest) -> dict[str, Any]:
+    """Create or update the journal entry attached to a settled trade."""
+    if trade_id not in {int(t["id"]) for t in db.get_trades(limit=10000)}:
+        raise HTTPException(status_code=404, detail=f"Trade {trade_id} not found")
+    try:
+        saved = db.save_trade_note(
+            trade_id,
+            note=request.note,
+            setup=request.setup,
+            tags=request.tags,
+            rating=request.rating,
+            mistakes=request.mistakes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "note": saved}
+
+
+@app.delete("/api/journal/{trade_id}", tags=["journal"])
+def api_delete_journal(trade_id: int) -> dict[str, Any]:
+    """Remove a journal entry. The trade ledger itself is never touched."""
+    return {"ok": db.delete_trade_note(trade_id)}
 
 
 # ---------------------------------------------------------------------------
