@@ -24,6 +24,9 @@ evaluate the strategy without a token.
 | `BOT_NAME` | `Belaku` | Browser tab title and header |
 | `WEBHOOK_HOST` | `127.0.0.1` | Bind address. Keep on loopback. |
 | `WEBHOOK_PORT` | `9000` | |
+| `ALLOWED_HOSTS` | `127.0.0.1,localhost,[::1],testserver` | Host header allow-list. Only widen this for a real proxy. |
+| `ALLOWED_ORIGINS` | *(empty)* | Extra cross-origin callers, comma separated. Empty = same-origin only. |
+| `ENABLE_API_DOCS` | `0` | Set `1` to serve `/docs` and `/openapi.json` again |
 | `LOG_FILE` | `bot/logs/bot.log` | Docker: `/data/bot.log` |
 | `LOG_LEVEL` | `INFO` | Minimum level written. Also the floor the Logs tab can query. |
 | `UVICORN_ACCESS_LOG` | `0` | Set `1` to log every request |
@@ -35,9 +38,19 @@ last 512 KB of it — so a long-running bot cannot make the dashboard slow.
 Anyone who can reach `/api/panic` or `/api/toggle-mode` can move real money.
 Keep it on loopback, or put it behind an authenticating reverse proxy.
 
-This includes `/api/logs`, which tail-reads `LOG_FILE`. Credential-shaped
-strings are masked before the response is built, but the log is still a
-diagnostic stream you would not want on a public URL.
+Three controls reduce (but do not remove) the exposure:
+
+- **Cross-site POSTs are rejected.** `Origin` must match the Host allow-list;
+  a page on another site gets `403`. Requests with no `Origin` (curl, the
+  container healthcheck) still pass.
+- **`Host` is allow-listed**, which blocks DNS rebinding — where a malicious
+  hostname resolves to your bot and the browser then treats it as same-origin.
+- **`/docs` is off**, so the control surface is not enumerated for a stranger.
+
+None of these are authentication. If the port is ever reachable from outside
+your machine, anyone who can send a request can panic the account.
+
+`/api/logs` also tail-reads `LOG_FILE`, so keep it on loopback too.
 :::
 
 

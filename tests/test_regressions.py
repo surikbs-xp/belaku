@@ -159,6 +159,183 @@ def test_logs_endpoint_validates_the_level(monkeypatch, tmp_path) -> None:
     assert only_errors["lines"] == ["2026-11-07 09:15:01,002 ERROR bot: feed dropped"]
 
 
+def test_log_search_cannot_confirm_a_secret_that_was_redacted(monkeypatch, tmp_path) -> None:
+    """Redaction must happen before the search filter, not after.
+
+    Otherwise ?search= becomes a byte-by-byte oracle: the secret is masked in
+    the response, but its presence is still confirmable from the match count.
+    """
+    log_file = tmp_path / "bot.log"
+    log_file.write_text(
+        "2026-11-07 09:15:00,001 INFO bot: Authorization: token ABCKEY:SUPERSECRETVALUE\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_app, "LOG_FILE", log_file)
+
+    hit = bot_app.read_log_tail(search="SUPERSECRET")
+    miss = bot_app.read_log_tail(search="WRONGVALUE")
+
+    # The oracle is closed: neither the real prefix nor a wrong guess matches.
+    assert hit["count"] == 0
+    assert miss["count"] == 0
+
+    # And the secret never appears in the unfiltered tail either.
+    blob = "\n".join(bot_app.read_log_tail()["lines"])
+    assert "SUPERSECRETVALUE" not in blob
+    assert "ABCKEY" not in blob
+
+
+def test_log_redaction_covers_sdk_shapes() -> None:
+    """The Kite SDK emits these forms; the key/value pattern alone misses them."""
+    cases = {
+        "Authorization: token vwajai1234:62VGx3secret": ["vwajai1234", "62VGx3secret"],
+        "kite.set_access_token(62VGx3secret)": ["62VGx3secret"],
+        "TokenException: Invalid token: 62VGx3secret": ["62VGx3secret"],
+        "api_secret xs1s3hsecret": ["xs1s3hsecret"],
+        "request_token=abc123&status=success": ["abc123"],
+    }
+    for line, secrets in cases.items():
+        redacted = bot_app._redact_secrets(line)
+        for secret in secrets:
+            assert secret not in redacted, f"{secret!r} survived in {redacted!r}"
+        assert "***" in redacted, f"nothing masked in {redacted!r}"
+
+
+def test_sdk_loggers_are_capped_so_a_debug_session_cannot_leak_the_token() -> None:
+    """LOG_LEVEL=DEBUG must not put the Authorization header into the log."""
+    root = logging.getLogger()
+    existing = list(root.handlers)
+    original = root.level
+    try:
+        bot_app._configure_logging()
+        for name in ("kiteconnect", "urllib3", "httpx", "httpcore"):
+            assert logging.getLogger(name).level >= logging.WARNING
+    finally:
+        for handler in list(root.handlers):
+            if handler not in existing:
+                root.removeHandler(handler)
+                handler.close()
+        root.setLevel(original)
+
+
+def test_cross_site_post_is_blocked_but_same_origin_is_allowed(monkeypatch, tmp_path) -> None:
+    """A page on another site must not be able to drive the control endpoints."""
+    use_test_database(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+
+    client = TestClient(bot_app.app)
+
+    # A malicious page: rejected before the handler can act.
+    blocked = client.post(
+        "/api/pause",
+        json={"paused": True, "reason": "csrf"},
+        headers={"Origin": "https://evil.com", "Host": "127.0.0.1:9000"},
+    )
+    assert blocked.status_code == 403
+    assert "Cross-site" in blocked.json()["detail"]
+
+    # The same call from the dashboard itself still works.
+    allowed = client.post(
+        "/api/pause",
+        json={"paused": True, "reason": "manual"},
+        headers={"Origin": "http://127.0.0.1:9000", "Host": "127.0.0.1:9000"},
+    )
+    assert allowed.status_code == 200
+
+    # A non-browser caller (no Origin) is unaffected: curl, healthcheck, tests.
+    no_origin = client.post(
+        "/api/pause",
+        json={"paused": False, "reason": "manual"},
+        headers={"Host": "127.0.0.1:9000"},
+    )
+    assert no_origin.status_code == 200
+
+
+def test_health_stays_reachable_without_an_origin_header() -> None:
+    """The container healthcheck must keep working after the CSRF guard."""
+    from fastapi.testclient import TestClient
+
+    response = TestClient(bot_app.app).get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+def test_spoofed_host_is_rejected() -> None:
+    """DNS rebinding: a browser treats http://evil.com as same-origin when it
+    resolves to the bot, so a Host allow-list is the only thing that stops it."""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(bot_app.app)
+    assert client.get("/api/status", headers={"Host": "evil.com"}).status_code == 400
+    assert client.get("/api/status", headers={"Host": "127.0.0.1:9000"}).status_code == 200
+
+
+def test_security_headers_are_present() -> None:
+    from fastapi.testclient import TestClient
+
+    headers = TestClient(bot_app.app).get("/api/health").headers
+    assert headers["X-Frame-Options"] == "DENY"
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    csp = headers["Content-Security-Policy"]
+    assert "frame-ancestors 'none'" in csp
+    assert "default-src 'self'" in csp
+
+
+def test_callback_page_escapes_the_status_parameter() -> None:
+    """`status` comes straight off the query string into an HTML page that runs
+    same-origin with the dashboard, so it must be escaped, not interpolated."""
+    from fastapi.testclient import TestClient
+
+    payload = "<script>alert(document.domain)</script>"
+    response = TestClient(bot_app.app).get(
+        "/zerodha/callback", params={"status": payload}
+    )
+
+    assert response.status_code == 200
+    assert "<script>alert(document.domain)</script>" not in response.text
+    assert "&lt;script&gt;" in response.text
+
+
+def test_callback_page_escapes_broker_error_text(monkeypatch) -> None:
+    """Broker error text is attacker-influenceable too (it echoes the request)."""
+    from fastapi.testclient import TestClient
+
+    def boom(_token: str) -> dict:
+        raise kite_auth.KiteAuthError("<img src=x onerror=alert(1)>bad token")
+
+    monkeypatch.setattr(kite_auth, "exchange_request_token", boom)
+    response = TestClient(bot_app.app).get(
+        "/zerodha/callback", params={"request_token": "x"}
+    )
+
+    assert response.status_code == 200
+    assert "<img src=x" not in response.text
+    assert "&lt;img src=x" in response.text
+
+
+def test_panic_and_pause_reject_a_reason_that_could_forge_a_log_line() -> None:
+    """`reason` is logged verbatim, so a newline would inject a fake record."""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(bot_app.app)
+    forged = "x\n2026-11-07 10:00:00,000 CRITICAL bot: FAKE LINE INJECTED"
+
+    assert client.post("/api/pause", json={"paused": True, "reason": forged}).status_code == 422
+    assert client.post("/api/panic", json={"confirm": True, "reason": forged}).status_code == 422
+    # A normal label still passes.
+    assert client.post("/api/pause", json={"paused": True, "reason": "MANUAL"}).status_code == 200
+    client.post("/api/pause", json={"paused": False, "reason": "MANUAL"})
+
+
+def test_api_docs_are_disabled_by_default() -> None:
+    from fastapi.testclient import TestClient
+
+    client = TestClient(bot_app.app)
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
 def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
     candles = [
         {

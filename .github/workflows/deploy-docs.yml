@@ -8,11 +8,10 @@ on:
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
 
-# Clone the repo and publish to Pages via OIDC.
+# Only the clone is needed at workflow scope; `pages` and `id-token` are granted
+# to the deploy job alone, so a compromised build step cannot publish.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Let an in-flight deploy finish; queue at most one more.
 concurrency:
@@ -59,6 +58,9 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

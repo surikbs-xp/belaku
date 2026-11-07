@@ -29,7 +29,8 @@ docker compose logs -f bot
 ```
 
 The image is hardened: `read_only: true`, `cap_drop: ALL`,
-`no-new-privileges`. That means **everything writable must be on a volume**:
+`no-new-privileges`, and it runs as an unprivileged user (`belaku`, uid 10001)
+rather than root. That means **everything writable must be on a volume**:
 
 | Path | Volume | Why |
 |---|---|---|
@@ -40,6 +41,51 @@ The image is hardened: `read_only: true`, `cap_drop: ALL`,
 
 `compose.yaml` sets `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` to point at
 `/data` for exactly this reason.
+
+:::danger[Upgrading from a root-running image — read this first]
+The container now runs as uid 10001. Docker sets a volume's ownership only when
+it **creates** the volume, so a `belaku_bot-data` volume made by an earlier image
+is still root-owned, and the unprivileged process cannot write `/data/bot.log`:
+
+```
+PermissionError: [Errno 13] Permission denied: '/data/bot.log'
+```
+
+The bot will crash-loop until this is fixed. Pick one:
+
+```bash
+# A. Recreate the volume — SIMPLEST, BUT DELETES THE DATABASE AND LOGS
+docker compose down -v
+docker compose up -d --build
+
+# B. Keep the data: chown the volume once from the host, then it is owned
+#    correctly for every future start
+docker run --rm -v belaku_bot-data:/data alpine chown -R 10001:10001 /data
+docker compose up -d --build
+```
+
+Option B is the one to use on a bot with real trade history.
+
+Note that the container **cannot** repair this itself. `cap_drop: ALL` removes
+`CAP_SETUID`/`CAP_SETGID` (so a root process cannot switch user) and
+`CAP_DAC_OVERRIDE` (so it cannot write into a directory owned by another uid).
+Being the right user from the start is the only workable arrangement, which is
+why there is a `USER` directive instead of a chown-then-drop-privileges
+entrypoint.
+:::
+
+
+:::note[The bind-mounted `.env` must be readable by uid 10001]
+The container no longer runs as root, so `./bot/.env` has to be readable by the
+container user. In practice that means either owning the file as uid 10001
+(then `chmod 600` is right) or leaving it group/world-readable (`chmod 644`),
+which is the usual situation on a desktop where the file is owned by your own
+user account.
+
+The token write-back (`kite_auth` persists a fresh token into `.env`) also needs
+write access. If `.env` is not writable the bot still runs — it just keeps the
+token in memory for that process only, which the callback page reports.
+:::
 
 ### Rebuilding after a code change
 

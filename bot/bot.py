@@ -26,6 +26,8 @@ serialises execution behind its own lock.
 
 from __future__ import annotations
 
+import fnmatch
+import html
 import json
 import logging
 import os
@@ -38,12 +40,13 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import database as db
 import kite_auth
@@ -77,6 +80,13 @@ def _configure_logging() -> None:
     root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # The Kite SDK logs the Authorization header (api_key:access_token) at DEBUG,
+    # which would put a credential into LOG_FILE — where /api/logs would then
+    # serve it. Cap the SDK regardless of the operator's LOG_LEVEL so a
+    # debugging session cannot leak the token.
+    for noisy in ("kiteconnect", "urllib3", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     if not root.handlers:
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
@@ -108,23 +118,43 @@ _LOG_LINE_RE = re.compile(
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _LOG_LEVEL_RANK = {name: rank for rank, name in enumerate(LOG_LEVELS)}
 
-# Credentials are written to .env, never logged, but a future log line or a
-# caught exception could echo one. The dashboard is unauthenticated, so mask
-# anything that looks like a secret before it leaves the process.
-_SECRET_RE = re.compile(
-    r"(?P<key>"
-    r"kite_api_secret|kite_access_token|api_secret|access_token|request_token"
-    r"|webhook_secret|password|authorization|api_key"
-    r")(?P<sep>['\"]?\s*[=:]\s*['\"]?)(?P<value>\S+)",
-    re.IGNORECASE,
-)
-
 # Only the tail of the active file is read, so a 5 MB log costs one seek.
 _LOG_TAIL_BYTES = 512 * 1024
 
+# Credentials are written to .env, never logged, but a future log line or a
+# caught exception could echo one. The dashboard is unauthenticated, so mask
+# anything that looks like a secret before it leaves the process.
+#
+# Two layers, because a key/value pattern alone is not enough: the Kite SDK
+# logs `Authorization: token <api_key>:<access_token>` at DEBUG, where the
+# secret is the *second* half of a colon pair with no label of its own.
+# `Authorization: token <api_key>:<access_token>` — the secret is the *second*
+# half of a colon pair with no label of its own, so the whole header value is
+# masked. This must run first: a key/value pattern would consume the literal
+# word "token" and leave the credentials behind.
+_AUTH_HEADER_RE = re.compile(r"(?P<key>\bauthorization\b\s*[:=]\s*).*$", re.IGNORECASE)
+_SECRET_KEY_RE = re.compile(
+    r"(?P<key>"
+    r"kite_api_secret|kite_access_token|kite_api_key|api_secret|access_token"
+    r"|request_token|webhook_secret|password|api_key"
+    r")(?P<sep>['\"]?\s*[=:]\s*['\"]?|\s+)(?P<value>[^\s,;'\"]+)",
+    re.IGNORECASE,
+)
+# `set_access_token(<token>)`, `TokenException: Invalid token: <token>`.
+_SECRET_BARE_RE = re.compile(
+    r"(?P<setter>\bset_access_token\s*\(\s*['\"]?)(?P<value>[\w.:-]+)"
+    r"|(?P<invalid>\bInvalid\s+token\s*:\s*)(?P<value2>[\w.:-]+)",
+    re.IGNORECASE,
+)
+
 
 def _redact_secrets(line: str) -> str:
-    return _SECRET_RE.sub(lambda m: f"{m.group('key')}{m.group('sep')}***", line)
+    line = _AUTH_HEADER_RE.sub(lambda m: f"{m.group('key')}***", line)
+    line = _SECRET_KEY_RE.sub(lambda m: f"{m.group('key')}{m.group('sep')}***", line)
+    return _SECRET_BARE_RE.sub(
+        lambda m: f"{m.group('setter') or m.group('invalid')}***",
+        line,
+    )
 
 
 def _read_tail(path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> list[str]:
@@ -184,6 +214,11 @@ def read_log_tail(
     selected: list[str] = []
     keep_continuation = False
     for line in lines:
+        # Redact first, then filter. Testing the raw line would let a caller
+        # confirm a secret's presence with ?search= even though the returned
+        # text is masked — a byte-by-byte oracle over anything that reaches the
+        # log. Masking before the substring test closes it.
+        line = _redact_secrets(line)
         match = _LOG_LINE_RE.match(line)
         if match:
             keep_continuation = threshold is None or _LOG_LEVEL_RANK[match["level"]] >= threshold
@@ -195,7 +230,7 @@ def read_log_tail(
             continue
         if needle and needle not in line.lower():
             continue
-        selected.append(_redact_secrets(line))
+        selected.append(line)
 
     payload["lines"] = selected[-limit:] if limit else selected
     payload["count"] = len(payload["lines"])
@@ -331,7 +366,15 @@ class ModeRequest(BaseModel):
 
 class PauseRequest(BaseModel):
     paused: bool = Field(..., description="true blocks new BUY/SELL entries")
-    reason: str = Field(default="MANUAL", description="Audit label")
+    # Constrained to a single safe line: `reason` is logged verbatim, so a
+    # newline would let a caller forge a second, convincing log record in the
+    # operator's audit trail.
+    reason: str = Field(
+        default="MANUAL",
+        max_length=200,
+        pattern=r"^[\w \-.:/@()\[\]]*$",
+        description="Audit label",
+    )
 
 
 class PanicRequest(BaseModel):
@@ -339,7 +382,12 @@ class PanicRequest(BaseModel):
         default=False,
         description="Must be true; the client shows a confirm dialog first.",
     )
-    reason: str = Field(default="PANIC", description="Audit label")
+    reason: str = Field(
+        default="PANIC",
+        max_length=200,
+        pattern=r"^[\w \-.:/@()\[\]]*$",
+        description="Audit label",
+    )
 
 
 class JournalRequest(BaseModel):
@@ -400,6 +448,60 @@ async def lifespan(app: FastAPI):
         log.info("Bot stopped")
 
 
+# ---------------------------------------------------------------------------
+# Request security
+# ---------------------------------------------------------------------------
+# The dashboard has no session auth, so a request's identity comes entirely from
+# what the browser asserts: the Host header (which a DNS-rebinding attack
+# controls) and the Origin header (a script cannot forge it). Both are checked.
+def allowed_hosts() -> list[str]:
+    """Host header allow-list, parsed from ``ALLOWED_HOSTS``."""
+    hosts = [h.strip() for h in settings.allowed_hosts.split(",") if h.strip()]
+    return hosts or ["127.0.0.1", "localhost", "[::1]"]
+
+
+def allowed_origins() -> list[str]:
+    """Extra cross-origin callers, parsed from ``ALLOWED_ORIGINS``."""
+    return [o.strip().rstrip("/") for o in settings.allowed_origins.split(",") if o.strip()]
+
+
+# ``Origin`` is the browser's own statement of page provenance, so unlike Host
+# it cannot be forged by script — only omitted (in which case Host covers us).
+_ORIGIN_OK_CACHE: dict[str, bool] = {}
+
+
+def _origin_allowed(origin: str, host: str) -> bool:
+    """True when ``origin`` is the same site as ``host``, or explicitly allowed.
+
+    Same-site is compared by *host*, not scheme or port: a page on
+    ``http://127.0.0.1:9000`` calling ``http://127.0.0.1:9000`` is same-origin,
+    and the port can differ behind a proxy without becoming a different site.
+    """
+    if not origin:
+        return True
+    allowed = set(allowed_hosts()) | set(allowed_origins())
+    if origin in allowed:
+        return True
+    cached = _ORIGIN_OK_CACHE.get(origin)
+    if cached is not None:
+        return cached
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    origin_host = (parsed.hostname or "").lower()
+    host_only = (urlsplit(f"//{host}").hostname or host or "").lower()
+    verdict = bool(origin_host) and (
+        origin_host == host_only or origin_host in {h.lower() for h in allowed_hosts()}
+    )
+    _ORIGIN_OK_CACHE[origin] = verdict
+    return verdict
+
+
+# Endpoints that must answer without an Origin check. Health is polled by the
+# container healthcheck (no Origin) and reveals nothing worth protecting.
+_CSRF_EXEMPT: tuple[str, ...] = ("/api/health",)
+
 app = FastAPI(
     title="GIFT Nifty Execution Bot",
     version="3.0.0",
@@ -408,15 +510,72 @@ app = FastAPI(
         "Nifty futures execution, JSON API and dashboard."
     ),
     lifespan=lifespan,
+    # The schema enumerates every control endpoint, including the one that
+    # squares off live positions. Nothing needs it while running, so it is off
+    # unless explicitly re-enabled (useful when developing against the API).
+    docs_url="/docs" if os.getenv("ENABLE_API_DOCS", "0") in {"1", "true", "yes"} else None,
+    redoc_url=None,
+    openapi_url="/openapi.json"
+    if os.getenv("ENABLE_API_DOCS", "0") in {"1", "true", "yes"}
+    else None,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next: Any) -> Any:
+    """Reject cross-site requests and add defensive response headers.
+
+    Three separate controls, because each covers a hole the others do not:
+
+    * **TrustedHost** (registered separately) blocks DNS-rebinding, where the
+      browser treats ``http://evil.com`` as same-origin because it resolves to
+      the bot.
+    * **Origin check** blocks a request made *by* a page on another site. It
+      applies to state-changing methods only, so a static dashboard load is
+      never rejected.
+    * **Response headers** stop the dashboard being framed and constrain what
+      an injected string could load.
+
+    A request with no ``Origin`` at all (curl, the container healthcheck) is
+    allowed: a browser always sends one on a cross-site POST, so its absence
+    means the caller is not a browser acting for another page.
+    """
+    origin = request.headers.get("origin") or ""
+    host = request.headers.get("host") or ""
+    if (
+        request.method not in ("GET", "HEAD", "OPTIONS")
+        and not any(fnmatch.fnmatch(request.url.path, p) for p in _CSRF_EXEMPT)
+        and not _origin_allowed(origin, host)
+    ):
+        log.warning("Blocked cross-site %s %s from origin=%r", request.method, request.url.path, origin)
+        return JSONResponse(
+            {"detail": "Cross-site request blocked"}, status_code=403
+        )
+
+    response = await call_next(request)
+    # No inline script/style is used by the dashboard (styles.css and app.js are
+    # separate files, and Tailwind is configured through its own config object),
+    # so a strict CSP costs nothing. The CDN is still needed for Tailwind itself.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'; "
+        "form-action 'none'"
+    )
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+# Registered after the decorator so it wraps the app *outside* security_middleware
+# (Starlette applies the last-added middleware first), rejecting a spoofed Host
+# before any other middleware or route sees the request.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 
 
 # ---------------------------------------------------------------------------
@@ -969,15 +1128,24 @@ def api_kite_feed_reconnect() -> dict[str, Any]:
     return {"ok": feed["start_requested"], "feed": feed}
 
 
-def _callback_page(ok: bool, title: str, detail: str, extra: str = "") -> HTMLResponse:
-    """Human-readable result for the browser that just came back from Zerodha."""
+def _callback_page(
+    ok: bool, title: str, detail: str, extra: str = "", code: str = ""
+) -> HTMLResponse:
+    """Human-readable result for the browser that just came back from Zerodha.
+
+    Every value here is potentially attacker-influenced — ``status`` comes off
+    the query string and ``detail``/``code`` can carry broker error text — so
+    all of them are HTML-escaped. ``code`` is the single slot rendered inside a
+    ``<code>`` chip, and it is escaped too rather than accepted as markup: this
+    page runs same-origin with the dashboard and its control endpoints.
+    """
     colour = "#10b981" if ok else "#f43f5e"
     icon = "✅" if ok else "⚠️"
     return HTMLResponse(
         f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{settings.bot_name} · {title}</title>
+<title>{html.escape(settings.bot_name)} · {html.escape(title)}</title>
 <style>
   body {{ margin:0; min-height:100vh; display:grid; place-items:center;
          background:#080b14; color:#e2e8f0;
@@ -993,9 +1161,9 @@ def _callback_page(ok: bool, title: str, detail: str, extra: str = "") -> HTMLRe
        color:#0d1220; font-weight:600; text-decoration:none; }}
   .extra {{ margin-top:1rem; font-size:.85rem; color:#7c8aa5; }}
 </style></head><body><div class="card">
-  <h1>{icon} {title}</h1>
-  <p>{detail}</p>
-  {f'<p class="extra">{extra}</p>' if extra else ''}
+  <h1>{icon} {html.escape(title)}</h1>
+  <p>{html.escape(detail)} {f'<code>{html.escape(code)}</code>' if code else ''}</p>
+  {f'<p class="extra">{html.escape(extra)}</p>' if extra else ''}
   <a href="/">Open the dashboard</a>
 </div></body></html>"""
     )
@@ -1015,13 +1183,14 @@ def kite_callback(
         return _callback_page(
             False,
             "Kite login did not complete",
-            "Zerodha did not return a <code>request_token</code>"
-            + (f" (status={status})" if status else "")
+            "Zerodha did not return a"
+            + (f" (status={status})" if status else "")  # escaped by _callback_page
             + ".",
             "Usually this means the app's Redirect URL does not match "
-            f"<code>{kite_auth.callback_url()}</code> exactly. Check it in the "
+            f"{kite_auth.callback_url()} exactly. Check it in the "
             "Kite developer console, or paste the request_token manually on the "
             "dashboard.",
+            code="request_token",
         )
 
     try:
@@ -1030,9 +1199,10 @@ def kite_callback(
         return _callback_page(
             False,
             "Token exchange failed",
-            f"<code>{exc}</code>",
+            "The exchange was rejected:",
             "request_tokens are single-use and short-lived. Start the login "
             "again from the dashboard.",
+            code=str(exc),
         )
 
     feed = _start_gift_feed()
