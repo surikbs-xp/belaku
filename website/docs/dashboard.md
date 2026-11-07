@@ -91,6 +91,20 @@ The frontend is unauthenticated and binds to `WEBHOOK_HOST` (default
 proxy before exposing it — anyone who can reach `/api/panic` or
 `/api/toggle-mode` can move real money.
 
+What the server does enforce, so a stray page or a rebinding hostname cannot
+drive it:
+
+| Control | Effect |
+|---|---|
+| `TrustedHostMiddleware` | A `Host` outside `ALLOWED_HOSTS` gets `400` (DNS rebinding) |
+| Origin check on writes | A cross-site `POST`/`PUT`/`DELETE` gets `403` (CSRF) |
+| `Content-Security-Policy` | `default-src 'self'`, `frame-ancestors 'none'`, `form-action 'none'` |
+| `X-Frame-Options: DENY` | The confirm dialog cannot be clickjacked |
+| `/docs` disabled | The control surface is not enumerated |
+
+These are hardening, not authentication — see
+[Configuration](/configuration) for the honest version of that caveat.
+
 ## Asset caching
 
 `index.html` links assets with a version query:

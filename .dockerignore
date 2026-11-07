@@ -12,3 +12,7 @@ data
 .env
 .env.*
 bot/.env
+# Runtime state: the operator's log file and holiday cache live here and must
+# not be baked into a published image.
+bot/logs
+bot/data

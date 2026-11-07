@@ -32,11 +32,25 @@ Kite credentials are **required, not optional**. The GIFT Nifty feed runs on
 2. Set `KITE_API_KEY` and `KITE_API_SECRET` in `bot/.env`
 3. Register the Redirect URL as `http://127.0.0.1:9000/zerodha/callback`
 
-:::warning[`bot/.env` is tracked in git]
-This file is currently committed, which means any credentials in it are in
-the repository history. Move it out of version control and rotate the keys
-before treating this as production. `.gitignore` already excludes `*.env*s`
-— the file was added before that rule.
+:::danger[`bot/.env` was committed — treat those credentials as leaked]
+An earlier commit added `bot/.env` to the repository, so its values are in the
+git history **and the repository is public**. Deleting the file later does not
+remove it from history: it is still readable in every commit that touched it.
+
+If you have ever committed a real `bot/.env`:
+
+1. **Rotate now** — regenerate the API secret in the
+   [Kite developer console](https://developers.kite.trade). This invalidates the
+   old secret immediately, which is the only step that actually stops an
+   attacker.
+2. Re-authenticate to invalidate the leaked access token.
+3. Optionally purge history (`git filter-repo --path bot/.env --invert-paths`)
+   and force-push — but rotation is mandatory regardless, because the old value
+   has already been public and may be cached or forked.
+
+`.gitignore` excludes `.env` and `*.env*s`, and only `.env.example` is tracked
+now. Add a pre-commit secret scanner and enable GitHub push protection so this
+cannot recur.
 :::
 
 

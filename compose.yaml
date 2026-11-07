@@ -16,6 +16,10 @@ services:
       # Keep the NSE holiday cache on the writable volume: the image is
       # read_only, so the in-package default path cannot be written.
       HOLIDAY_CACHE_PATH: /data/nse_holidays.json
+    # No `user:` here on purpose. The image's entrypoint repairs the ownership of
+    # a /data volume left root-owned by an older image, then drops privileges to
+    # uid 10001 with setpriv — so the bot process is never root, but an existing
+    # deployment does not have to delete its trading database to upgrade.
     ports:
       - "127.0.0.1:9000:9000"
     volumes:

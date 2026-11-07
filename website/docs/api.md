@@ -25,9 +25,13 @@ previous verdicts, the feed state, and the resolved strategy configuration.
 costs one seek rather than a full parse. `level` is a **minimum** severity —
 `WARNING` also returns `ERROR` and `CRITICAL` — and a traceback stays attached
 to the entry it explains instead of being filtered out as unparsed noise.
-Anything matching `access_token=`, `api_secret=`, `request_token=`, `password=`
-and friends is masked to `***` before it leaves the process, because the
-dashboard is unauthenticated.
+
+Anything matching `access_token=`, `api_secret=`, `request_token=`,
+`password=`, or the SDK's `Authorization: token <key>:<token>` header is masked
+to `***` **before** the search filter runs, so `?search=` cannot be used to
+confirm a secret that the response itself hides. The Kite SDK's own loggers are
+additionally pinned to `WARNING`, because at `DEBUG` it prints the
+`Authorization` header.
 
 ## Portfolio
 
@@ -79,12 +83,17 @@ no longer shows them. Kept because they are still served.
 
 ## Guards
 
-Two are enforced server-side, not just in the UI:
+Enforced server-side, not just in the UI:
 
 - Switching to `LIVE` requires `confirm=true` **and** complete Kite credentials.
 - `/api/panic` requires `confirm=true`.
+- A state-changing request (`POST`/`PUT`/`DELETE`) whose `Origin` is not the
+  bot itself gets `403`.
+- A `Host` outside `ALLOWED_HOSTS` gets `400`.
+- `reason` on `/api/pause` and `/api/panic` is restricted to a single safe line.
+- `/docs` and `/openapi.json` are `404` unless `ENABLE_API_DOCS=1`.
 
-Both return `4xx` otherwise.
+Violations return `4xx`.
 
 ## Example
 
