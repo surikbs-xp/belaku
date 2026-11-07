@@ -1410,6 +1410,10 @@ function renderLogs() {
   const viewport = $('logs-viewport');
   const lines = state.logsRaw;
 
+  // Keep the rendered class in step with the checkbox — it starts checked, but
+  // the class is applied here rather than in the HTML so the two cannot drift.
+  viewport.classList.toggle('is-wrapped', $('logs-wrap').checked);
+
   if (!lines.length) {
     viewport.innerHTML = '<p class="log-empty">No log lines match the current filter.</p>';
     return;

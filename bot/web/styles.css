@@ -267,7 +267,11 @@ body {
   background: linear-gradient(135deg, #38bdf8, #818cf8);
 }
 
+/* Grid items default to `min-width: auto`, which lets an unbreakable line (the
+   log viewer with Wrap off, an <input> in a toolbar) expand its panel instead of
+   scrolling inside it — and that blows out the whole page. Children opt out. */
 .view { display: grid; gap: 0.7rem; }
+.view > * { min-width: 0; }
 
 /* ── Hero: signal, candle, quote, execution ────────────────────────── */
 .hero-grid {
@@ -1087,14 +1091,34 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
   line-height: 1.5;
 }
 
-/* Wrapping makes tracebacks readable; off by default to keep columns aligned. */
-.log-viewport.is-wrapped .log-line { white-space: pre-wrap; word-break: break-word; }
+/* Wrapping makes tracebacks and indicator payloads readable; it is the
+   default. Unchecking it keeps columns aligned for scanning levels quickly. */
+.log-viewport.is-wrapped .log-line {
+  white-space: pre-wrap;
+  /* `anywhere`, not `break-word`: it also shrinks the intrinsic min-content
+     size, which is what lets a long unbroken JSON payload wrap inside flex. */
+  overflow-wrap: anywhere;
+}
 
 .log-line {
   display: flex;
   gap: 0.5rem;
   white-space: pre;
   color: var(--ink-1);
+}
+
+/* Flexible so it can shrink and wrap; the other columns stay at content width.
+   `overflow-wrap` is left to the wrapped state so that unchecking Wrap really
+   does produce one long scrollable line. */
+.log-message { flex: 1 1 auto; min-width: 0; }
+
+/* Fixed columns must not shrink, or `overflow-wrap: anywhere` breaks the
+   timestamp and level one character per line before the message gives way. */
+.log-ts,
+.log-level,
+.log-logger {
+  flex: none;
+  white-space: nowrap;
 }
 
 /* Traceback frames and other unparsed lines continue the line above. */

@@ -48,7 +48,9 @@ red so a bad night is scannable rather than readable).
 - **Search** filters the already-tailed lines by substring.
 - **Follow** sticks to the newest line and unchecks itself when you scroll up,
   so a refresh does not yank the view away from what you are reading.
-- **Wrap** re-flows long lines; off by default so columns stay aligned.
+- **Wrap** re-flows long lines so a 600-character JSON indicator payload is
+  readable instead of one endless scroll. On by default; uncheck it to keep
+  columns aligned when scanning levels.
 - **Copy** / **Download** take the currently filtered tail.
 
 Credentials are masked server-side (`access_token=***`) before the lines are
@@ -94,8 +96,8 @@ proxy before exposing it — anyone who can reach `/api/panic` or
 `index.html` links assets with a version query:
 
 ```html
-<link rel="stylesheet" href="/static/styles.css?v=trader-7" />
-<script src="/static/app.js?v=trader-7" defer></script>
+<link rel="stylesheet" href="/static/styles.css?v=trader-8" />
+<script src="/static/app.js?v=trader-8" defer></script>
 ```
 
 :::warning[Bump the version when you change CSS or JS]
