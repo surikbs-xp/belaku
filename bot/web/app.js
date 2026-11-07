@@ -11,6 +11,8 @@
 'use strict';
 
 const POLL_MS = 1500;
+/** Ledger rows (orders/trades/signals/positions) change only on a write. */
+const LEDGER_MS = 5000;
 /** Countdown refresh. Independent of POLL_MS so the seconds hand stays smooth. */
 const TICK_MS = 250;
 /** Samples kept for the client-side sparkline (last ~40 polls). */
@@ -62,6 +64,8 @@ const state = {
   strategyConfig: null,
   // Bot name from /api/status (BOT_NAME); drives the tab title and header.
   botName: null,
+  // When the ledger rows were last fetched (see LEDGER_MS).
+  ledgerLoadedAt: 0,
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -986,21 +990,36 @@ function renderTrades() {
 
 /* ── Polling ───────────────────────────────────────────────────────── */
 
+/**
+ * Ledger rows: positions, orders, trades and signals. These only change when the
+ * bot writes a row, so they are fetched on LEDGER_MS rather than every poll.
+ */
+async function loadLedger() {
+  const [positions, orders, trades, signals] = await Promise.all([
+    api(ENDPOINTS.positions),
+    api(ENDPOINTS.orders),
+    api(ENDPOINTS.trades),
+    api(ENDPOINTS.signals),
+  ]);
+  state.orders = orders.orders || [];
+  state.signals = signals.signals || [];
+  state.trades = trades.trades || [];
+  renderPositions(positions);
+  renderOrders();
+  renderSignals();
+  renderTrades();
+}
+
 async function poll() {
   if (state.busy) return;
   try {
-    const [status, portfolio, positions, orders, trades, signals] = await Promise.all([
+    // Fast lane: only what changes tick-by-tick. The ledger endpoints are
+    // fetched on a slower cadence below, so a poll is 2 requests instead of 6.
+    const [status, portfolio] = await Promise.all([
       api(ENDPOINTS.status),
       api(ENDPOINTS.portfolio),
-      api(ENDPOINTS.positions),
-      api(ENDPOINTS.orders),
-      api(ENDPOINTS.trades),
-      api(ENDPOINTS.signals),
     ]);
 
-    state.orders = orders.orders || [];
-    state.signals = signals.signals || [];
-    state.trades = trades.trades || [];
     state.lastSync = new Date();
     state.failures = 0;
 
@@ -1012,10 +1031,13 @@ async function poll() {
 
     renderStatus(status);
     renderPortfolio(portfolio);
-    renderPositions(positions);
-    renderOrders();
-    renderSignals();
-    renderTrades();
+
+    // Ledger rows only change when an order or trade is written, so they ride a
+    // slower cadence. The first poll always loads them.
+    if (Date.now() - (state.ledgerLoadedAt || 0) > LEDGER_MS) {
+      state.ledgerLoadedAt = Date.now();
+      loadLedger().catch(() => { /* keep the last good rows */ });
+    }
     // The calendar rollup and holiday list change only when a trade settles, so
     // refetch them on the tab that shows them and slowly elsewhere.
     if (state.tab === 'analytics' || Date.now() - state.calendarLoadedAt > 60000) {

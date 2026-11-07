@@ -104,6 +104,8 @@ class StrategyEngine:
         self._thread: Optional[threading.Thread] = None
         self._last_signal = strategy.NEUTRAL
         self._last_bar_at: Optional[str] = None
+        # Memoised dashboard verdicts, keyed by (bar timestamp, candle count).
+        self._verdict_cache: dict[str, tuple[tuple[str, int], strategy.StrategyVerdict]] = {}
 
     def _opposes_open_paper_position(self, signal: str) -> bool:
         if get_execution_mode() != PAPER or signal not in {strategy.BULL, strategy.BEAR}:
@@ -358,6 +360,33 @@ class StrategyEngine:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
+    def _cached_verdict(
+        self,
+        slot: str,
+        candles: list[dict[str, Any]],
+        bar_at: Optional[str],
+    ) -> Optional[strategy.StrategyVerdict]:
+        """Evaluate ``candles`` once per bar, reusing the result across polls.
+
+        Keyed on the bar timestamp plus the candle count, so a new bar or a
+        backfilled history invalidates it. Returns ``None`` while the series is
+        still too short to evaluate.
+        """
+        if bar_at is None or len(candles) < required_bars():
+            return None
+        key = (bar_at, len(candles))
+        with self._lock:
+            cached = self._verdict_cache.get(slot)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+        try:
+            verdict = strategy.evaluate(candles, strategy_params())
+        except strategy.InsufficientData:
+            return None
+        with self._lock:
+            self._verdict_cache[slot] = (key, verdict)
+        return verdict
+
     def status(self) -> dict[str, Any]:
         feed = get_feed()
         try:
@@ -365,39 +394,26 @@ class StrategyEngine:
         except Exception as exc:  # pragma: no cover - network
             log.warning("GIFT Nifty history refresh failed: %s", exc)
         candles, current_bar_in_progress = feed.candle_snapshot()
-        current_values: Optional[dict[str, Any]] = None
-        current_conditions: Optional[dict[str, bool]] = None
-        previous_values: Optional[dict[str, Any]] = None
-        previous_conditions: Optional[dict[str, bool]] = None
         closed_candles = candles[:-1] if current_bar_in_progress else candles
         previous_bar_at = closed_candles[-1]["time"] if closed_candles else None
         current_bar_at = candles[-1]["time"] if candles else None
-        if len(candles) >= required_bars():
-            try:
-                current_verdict = strategy.evaluate(candles, strategy_params())
-            except strategy.InsufficientData:
-                pass
-            else:
-                current_values = current_verdict.values
-                current_conditions = current_verdict.conditions
-        if len(closed_candles) >= required_bars():
-            try:
-                previous_verdict = strategy.evaluate(closed_candles, strategy_params())
-            except strategy.InsufficientData:
-                pass
-            else:
-                previous_values = previous_verdict.values
-                previous_conditions = previous_verdict.conditions
+
+        # The dashboard polls this every 1.5s but the inputs only change when a
+        # bar closes, so the verdicts are memoised on the bar timestamp. This
+        # turns a poll into a dict lookup instead of two full indicator passes.
+        current_verdict = self._cached_verdict("current", candles, current_bar_at)
+        previous_verdict = self._cached_verdict("previous", closed_candles, previous_bar_at)
+
         market = market_status()
         with self._lock:
             payload = self.state.to_dict()
         payload["feed"] = feed.status()
-        payload["current_values"] = current_values
-        payload["current_conditions"] = current_conditions
+        payload["current_values"] = current_verdict.values if current_verdict else None
+        payload["current_conditions"] = current_verdict.conditions if current_verdict else None
         payload["current_bar_at"] = current_bar_at
         payload["current_bar_in_progress"] = current_bar_in_progress
-        payload["previous_values"] = previous_values
-        payload["previous_conditions"] = previous_conditions
+        payload["previous_values"] = previous_verdict.values if previous_verdict else None
+        payload["previous_conditions"] = previous_verdict.conditions if previous_verdict else None
         payload["previous_bar_at"] = previous_bar_at
         payload["market"] = market
         payload["execution_symbol"] = get_order_manager().current_symbol()

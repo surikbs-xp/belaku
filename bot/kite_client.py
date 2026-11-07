@@ -50,6 +50,13 @@ EXPIRY_WEEKDAY = 1  # Tuesday: NSE's monthly F&O expiry day since Sep 2025
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
+# Dashboard reads that hit the Kite API. The UI polls every 1.5s, so these are
+# cached to keep a poll free of network I/O. Order paths pass max_age=0 where a
+# fresh answer matters.
+PROFILE_CACHE_SECONDS = 15.0
+MARGINS_CACHE_SECONDS = 10.0
+QUOTE_CACHE_SECONDS = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Market clock
@@ -167,12 +174,27 @@ class KiteClient:
         self._auth_error: Optional[str] = None
         self._session_cache: Optional[dict[str, Any]] = None
         self._session_checked_at = 0.0
+        # Dashboard reads (profile, margins) are network round-trips that the
+        # UI polls every 1.5s. Cache them briefly so a poll costs no I/O.
+        self._profile_cache: Optional[dict[str, Any]] = None
+        self._profile_checked_at = 0.0
+        self._margins_cache: Optional[dict[str, Any]] = None
+        self._margins_checked_at = 0.0
+        self._quote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._init_sdk()
 
     # -- SDK bootstrap ---------------------------------------------------
     def _init_sdk(self) -> None:
         self._kite = None
         self._auth_error = None
+        # A new SDK/token invalidates every cached broker answer.
+        self._profile_cache = None
+        self._profile_checked_at = 0.0
+        self._margins_cache = None
+        self._margins_checked_at = 0.0
+        self._quote_cache = {}
+        self._session_cache = None
+        self._session_checked_at = 0.0
         if not SDK_AVAILABLE:
             self._auth_error = "kiteconnect SDK not installed"
             return
@@ -204,18 +226,43 @@ class KiteClient:
     def login_url(self) -> Optional[str]:
         return self.kite.login_url() if self.sdk_ready else None
 
-    def profile(self) -> dict[str, Any]:
-        """Return the live Kite profile, or a synthetic one when unauthenticated."""
+    def profile(self, max_age: float = PROFILE_CACHE_SECONDS) -> dict[str, Any]:
+        """Return the live Kite profile, or a synthetic one when unauthenticated.
+
+        ``kite.profile()`` is a network round-trip and the dashboard polls it
+        every 1.5s, so the result is cached for ``max_age`` seconds. Pass
+        ``max_age=0`` to force a fresh check (used after a token change).
+        """
+        if self.sdk_ready and max_age > 0:
+            with self._lock:
+                cached = self._profile_cache
+                checked_at = self._profile_checked_at
+            if cached is not None and (time.time() - checked_at) < max_age:
+                return cached
+
+        result: dict[str, Any]
         if self.sdk_ready:
             try:
                 data = self.kite.profile()
-                return {"ok": True, "mode": self.mode, **data}
+                result = {"ok": True, "mode": self.mode, **data}
             except TokenException as exc:
                 self._auth_error = f"Access token invalid/expired: {exc}"
+                result = self._profile_failure()
             except (KiteException, NetworkException) as exc:
                 self._auth_error = f"Kite API error: {exc}"
+                result = self._profile_failure()
             except Exception as exc:
                 self._auth_error = f"Unexpected auth error: {exc}"
+                result = self._profile_failure()
+        else:
+            result = self._profile_failure()
+
+        with self._lock:
+            self._profile_cache = result
+            self._profile_checked_at = time.time()
+        return result
+
+    def _profile_failure(self) -> dict[str, Any]:
         return {
             "ok": False,
             "mode": self.mode,
@@ -329,10 +376,20 @@ class KiteClient:
         return None
 
     # -- Market data -----------------------------------------------------
-    def get_quote(self, symbol: str) -> Optional[dict[str, Any]]:
-        """Live LTP/OHLC for ``symbol``; ``None`` when unavailable."""
+    def get_quote(self, symbol: str, max_age: float = QUOTE_CACHE_SECONDS) -> Optional[dict[str, Any]]:
+        """Live LTP/OHLC for ``symbol``; ``None`` when unavailable.
+
+        Cached for ``max_age`` seconds so the mark loop and the dashboard share
+        one round-trip instead of each issuing its own. Pass ``max_age=0`` when
+        an order needs the freshest price.
+        """
         if not self.sdk_ready:
             return None
+        if max_age > 0:
+            with self._lock:
+                cached = self._quote_cache.get(symbol)
+            if cached is not None and (time.time() - cached[0]) < max_age:
+                return cached[1]
         key = f"NFO:{symbol}"
         data: dict[str, Any] = {}
         for attempt in range(3):
@@ -355,7 +412,7 @@ class KiteClient:
         self._last_prices[symbol] = price
         self._last_quote_at = datetime.now(IST)
         ohlc = payload.get("ohlc", {}) or {}
-        return {
+        quote = {
             "symbol": symbol,
             "last_price": price,
             "open": ohlc.get("open"),
@@ -366,6 +423,9 @@ class KiteClient:
             "timestamp": payload.get("last_trade_time") or payload.get("timestamp"),
             "source": "KITE",
         }
+        with self._lock:
+            self._quote_cache[symbol] = (time.time(), quote)
+        return quote
 
     def historical_data(
         self,
@@ -401,8 +461,8 @@ class KiteClient:
                 time.sleep(0.2 * (attempt + 1))
         return []
 
-    def get_ltp(self, symbol: str) -> Optional[float]:
-        quote = self.get_quote(symbol)
+    def get_ltp(self, symbol: str, max_age: float = QUOTE_CACHE_SECONDS) -> Optional[float]:
+        quote = self.get_quote(symbol, max_age=max_age)
         if quote:
             return quote["last_price"]
         return self._last_prices.get(symbol)
@@ -422,14 +482,25 @@ class KiteClient:
         return "KITE" if self._last_quote_at is not None else "CACHE"
 
     # -- Trading ---------------------------------------------------------
-    def margins(self) -> Optional[dict[str, Any]]:
+    def margins(self, max_age: float = MARGINS_CACHE_SECONDS) -> Optional[dict[str, Any]]:
+        """Account margins, cached briefly because the dashboard polls them."""
         if not self.sdk_ready:
             return None
+        if max_age > 0:
+            with self._lock:
+                cached = self._margins_cache
+                checked_at = self._margins_checked_at
+            if cached is not None and (time.time() - checked_at) < max_age:
+                return cached
         try:
-            return self.kite.margins()
+            data = self.kite.margins()
         except Exception as exc:
             log.warning("Margins lookup failed: %s", exc)
             return None
+        with self._lock:
+            self._margins_cache = data
+            self._margins_checked_at = time.time()
+        return data
 
     def place_order(
         self,

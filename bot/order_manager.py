@@ -143,7 +143,8 @@ class OrderManager:
             except (TypeError, ValueError):
                 return None
             return price if price > 0 else None
-        ltp = self.client.get_ltp(symbol)
+        # An order needs the freshest price, so bypass the quote cache here.
+        ltp = self.client.get_ltp(symbol, max_age=0)
         if ltp:
             return float(ltp)
         if allow_payload_price:
