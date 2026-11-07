@@ -463,6 +463,36 @@ def get_equity_curve(
     return list(reversed(rows))
 
 
+def get_equity_summary(path: Optional[str] = None) -> dict[str, Any]:
+    """First sample and max drawdown without loading the whole curve.
+
+    ``get_performance_metrics`` runs on every mark tick and only needs the
+    opening sample plus the peak-to-trough drawdown. Reading 5000 rows to derive
+    two numbers dominated the tick, so the drawdown is computed in SQL.
+    """
+    with session(path) as conn:
+        first = conn.execute(
+            "SELECT equity FROM equity_curve ORDER BY ts, id LIMIT 1"
+        ).fetchone()
+        # Running peak per row, then the worst value/peak-1 across the curve.
+        row = conn.execute(
+            """
+            WITH ordered AS (
+                SELECT equity,
+                       MAX(equity) OVER (ORDER BY ts, id ROWS UNBOUNDED PRECEDING) AS peak
+                FROM equity_curve
+            )
+            SELECT MIN(CASE WHEN peak > 0 THEN equity / peak - 1.0 END) AS worst
+            FROM ordered
+            """
+        ).fetchone()
+    worst = row["worst"] if row is not None else None
+    return {
+        "first_equity": float(first["equity"]) if first is not None else None,
+        "max_drawdown_pct": (float(worst) * 100.0) if worst is not None else 0.0,
+    }
+
+
 def clear_equity_curve(path: Optional[str] = None) -> None:
     with session(path) as conn:
         conn.execute("DELETE FROM equity_curve")
@@ -792,10 +822,8 @@ def get_performance_metrics(
         trade_params.append(mode)
     trade_query += " ORDER BY exit_time"
     trades = _fetch_all(trade_query, trade_params, path)
-    equity = (
-        [float(r["equity"]) for r in get_equity_curve(path=path)]
-        if mode in (None, "PAPER")
-        else []
+    summary = (
+        get_equity_summary(path=path) if mode in (None, "PAPER") else None
     )
 
     wins = [t for t in trades if t["net_pnl"] > 0]
@@ -821,7 +849,13 @@ def get_performance_metrics(
         mark = (prices or {}).get(pos["symbol"]) or pos["last_price"] or pos["entry_price"]
         unrealized += (mark - pos["entry_price"]) * pos["quantity"] * pos["position_key"]
 
-    start_equity = float(equity[0]) if equity else account["initial_balance"]
+    # The oldest equity sample. Previously this was the first row of the last
+    # 5000 samples, which silently drifted once the curve grew past that window.
+    start_equity = (
+        summary["first_equity"]
+        if summary and summary["first_equity"] is not None
+        else account["initial_balance"]
+    )
     current_equity = float(account["balance"]) + unrealized
     total_return = (
         (current_equity / account["initial_balance"] - 1.0) * 100.0
@@ -841,7 +875,7 @@ def get_performance_metrics(
         "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0,
         "avg_win": (gross_win / len(wins)) if wins else 0.0,
         "avg_loss": (-gross_loss / len(losses)) if losses else 0.0,
-        "max_drawdown_pct": _max_drawdown(equity) if equity else 0.0,
+        "max_drawdown_pct": summary["max_drawdown_pct"] if summary else 0.0,
         "start_equity": start_equity,
         "total_return_pct": total_return,
     }

@@ -1311,3 +1311,49 @@ def test_engine_status_reuses_the_verdict_until_a_new_bar(monkeypatch) -> None:
 
     # Two slots (current + previous), each evaluated once for the same bar.
     assert len(evaluations) == 2
+
+
+def test_history_fetch_backs_off_after_a_failure(monkeypatch) -> None:
+    attempts: list[int] = []
+
+    class FakeClient:
+        def historical_data(self, **_kwargs):
+            attempts.append(1)
+            return []
+
+    monkeypatch.setattr(gift_nifty, "get_client", lambda: FakeClient())
+    feed = GiftNiftyFeed("5minute")
+    feed.token = 291849
+
+    feed.refresh_history(force=True)
+    assert len(attempts) == 1
+    assert feed._history_failures == 1
+
+    # A non-forced refresh inside the backoff window must not hit the API.
+    feed.refresh_history()
+    assert len(attempts) == 1
+
+    # force=True is an explicit operator action and always retries.
+    feed.refresh_history(force=True)
+    assert len(attempts) == 2
+    assert feed._history_failures == 2
+
+
+def test_failed_quote_is_cached_so_a_dead_token_is_not_retried() -> None:
+    calls: list[int] = []
+
+    def boom(_keys):
+        calls.append(1)
+        raise kite_client.TokenException("token expired")
+
+    client = KiteClient(api_key="key", access_token="token")
+    client._kite = SimpleNamespace(quote=boom)
+
+    for _ in range(5):
+        assert client.get_ltp("NIFTY26KFUT") is None
+
+    # One attempt, then the failure is served from cache.
+    assert len(calls) == 1
+    # An order still forces a fresh attempt.
+    assert client.get_ltp("NIFTY26KFUT", max_age=0) is None
+    assert len(calls) == 2

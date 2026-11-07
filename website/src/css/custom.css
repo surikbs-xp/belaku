@@ -1,0 +1,188 @@
+/* Belaku docs theme — dark, matching the dashboard. */
+
+:root {
+  --ifm-color-primary: #38bdf8;
+  --ifm-color-primary-dark: #22b0ee;
+  --ifm-color-primary-darker: #16a9e9;
+  --ifm-color-primary-darkest: #128bbf;
+  --ifm-color-primary-light: #54c6f9;
+  --ifm-color-primary-lighter: #62cbfa;
+  --ifm-color-primary-lightest: #8ed9fb;
+
+  --ifm-background-color: #05070d;
+  --ifm-background-surface-color: #0b1018;
+  --ifm-navbar-background-color: rgba(5, 7, 13, 0.85);
+  --ifm-footer-background-color: #05070d;
+
+  --ifm-font-family-base: ui-sans-serif, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --ifm-font-family-monospace: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --ifm-code-font-size: 92%;
+  --ifm-heading-font-weight: 750;
+  --ifm-toc-border-color: #1b2433;
+  --ifm-hr-border-color: #1b2433;
+  --ifm-table-border-color: #1b2433;
+  --ifm-global-radius: 0.6rem;
+}
+
+[data-theme='dark'] {
+  --ifm-background-color: #05070d;
+  --ifm-background-surface-color: #0b1018;
+  --ifm-color-content: #e6edf7;
+  --ifm-color-content-secondary: #8b9bb4;
+  --ifm-heading-color: #ffffff;
+  --ifm-link-color: #38bdf8;
+  --ifm-link-hover-color: #8ed9fb;
+  --docusaurus-highlighted-code-line-bg: rgba(56, 189, 248, 0.12);
+}
+
+/* The navbar is translucent over the dark page. */
+.navbar {
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid #1b2433;
+  box-shadow: none;
+}
+
+.navbar__title {
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+
+.navbar__link {
+  font-weight: 550;
+}
+
+/* Sidebar: quieter than the content, matching the dashboard's hierarchy. */
+.menu__link {
+  font-size: 0.9rem;
+  border-radius: 0.4rem;
+}
+
+.menu__link--active:not(.menu__link--sublist) {
+  background: rgba(56, 189, 248, 0.1);
+  color: #38bdf8;
+}
+
+.theme-doc-sidebar-container {
+  border-right: 1px solid #1b2433 !important;
+}
+
+/* Headings: tighter tracking, like the landing page. */
+.markdown h1:first-child {
+  font-size: 2.1rem;
+  letter-spacing: -0.025em;
+}
+
+.markdown > h2 {
+  margin-top: 2.6rem;
+  padding-top: 1.4rem;
+  border-top: 1px solid #1b2433;
+  letter-spacing: -0.02em;
+}
+
+.markdown > h3 {
+  margin-top: 2rem;
+  letter-spacing: -0.015em;
+}
+
+/* Tables: the docs lean on them heavily. */
+.markdown table {
+  display: table;
+  width: 100%;
+  font-size: 0.88rem;
+}
+
+.markdown table th {
+  background: #0f1520;
+  border-bottom: 1px solid #1b2433;
+  font-weight: 650;
+}
+
+.markdown table td,
+.markdown table th {
+  padding: 0.55rem 0.8rem;
+}
+
+.markdown table tr:nth-child(2n) {
+  background: rgba(15, 21, 32, 0.5);
+}
+
+/* Inline code: readable against the dark panel. */
+.markdown code {
+  background: #0f1520;
+  border: 1px solid #1b2433;
+  border-radius: 0.35rem;
+  padding: 0.12rem 0.35rem;
+  color: #cbd5e1;
+}
+
+.markdown pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+/* Code blocks: match the landing page's panel. */
+.theme-code-block {
+  border: 1px solid #1b2433;
+  border-radius: 0.7rem;
+  box-shadow: none;
+}
+
+/* Admonitions: keep the accent but drop the heavy fill. */
+.theme-admonition {
+  border-radius: 0.7rem;
+  border-width: 1px;
+  box-shadow: none;
+}
+
+/* Footer. */
+.footer {
+  border-top: 1px solid #1b2433;
+}
+
+.footer__title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8b9bb4;
+}
+
+.footer__link-item {
+  font-size: 0.88rem;
+}
+
+.footer__copyright {
+  font-size: 0.82rem;
+  color: #8b9bb4;
+}
+
+/* Mermaid diagrams sit on the panel colour, not pure black. */
+.docusaurus-mermaid-container {
+  background: #0b1018;
+  border: 1px solid #1b2433;
+  border-radius: 0.7rem;
+  padding: 1rem;
+}
+
+/* Pagination cards. */
+.pagination-nav__link {
+  border: 1px solid #1b2433;
+  border-radius: 0.7rem;
+  background: #0b1018;
+}
+
+.pagination-nav__link:hover {
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.pagination-nav__sublabel {
+  color: #8b9bb4;
+  font-size: 0.75rem;
+}
+
+.pagination-nav__label {
+  font-size: 0.92rem;
+  font-weight: 650;
+}
