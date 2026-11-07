@@ -221,6 +221,16 @@ class CandleBuilder:
             del self.closed[:-self.max_history]
 
 
+def _reactor_running() -> bool:
+    """Whether Twisted's reactor is running. It is process-global and one-shot."""
+    try:
+        from twisted.internet import reactor
+
+        return bool(reactor.running)
+    except Exception:  # pragma: no cover - SDK without Twisted
+        return False
+
+
 class GiftNiftyFeed:
     """Owns the GIFT Nifty tick subscription and the candle series.
 
@@ -644,7 +654,20 @@ class GiftNiftyFeed:
 
             def _run() -> None:
                 try:
-                    ticker.connect(threaded=False)
+                    # threaded=True, not False. The SDK runs Twisted's reactor
+                    # inside this thread either way, but with the default it
+                    # also calls reactor.run() with signal handlers enabled:
+                    #
+                    #   ValueError: signal only works in main thread
+                    #     of the main interpreter
+                    #
+                    # which is raised from Twisted's _signals.install() and
+                    # aborts the feed before the websocket ever opens. The SDK's
+                    # threaded path exists precisely to suppress that
+                    # ("Signals are not allowed in non main thread by twisted
+                    # so suppress it") — it sets installSignalHandlers=False and
+                    # runs the reactor on its own daemon thread.
+                    ticker.connect(threaded=True)
                 except Exception as exc:  # pragma: no cover - network
                     self.error = f"ticker thread died: {exc}"
                     self.connected = False
@@ -669,6 +692,13 @@ class GiftNiftyFeed:
                 self._ticker.close()
         except Exception:
             pass
+        # Deliberately NOT calling ticker.stop() here. Twisted's reactor is
+        # process-global and one-shot: stopping it raises
+        # ReactorNotRestartable on the next connect(), permanently killing the
+        # feed for the life of the process. close() shuts the websocket and the
+        # SDK's retry loop; leaving the reactor itself running is what lets
+        # start() after a token refresh, or the dashboard's Reconnect button,
+        # actually work.
         with self._lock:
             self._builder.on_close = self._on_bar_close
             self._builder.flush()
@@ -676,6 +706,30 @@ class GiftNiftyFeed:
             self._thread.join(timeout=timeout)
         self.connected = False
         log.info("GIFT Nifty feed stopped")
+
+    def _ticker_running(self) -> bool:
+        """Whether the ticker is live, rather than whether our thread is.
+
+        Two things make the wrapper thread the wrong signal. ``threaded=True``
+        hands the reactor to a thread the SDK owns, so ``connect()`` returns and
+        our thread exits while the feed is perfectly healthy. And on a *restart*
+        the SDK finds the reactor already running and starts no new thread at
+        all. The reactor is therefore the real liveness signal, with the SDK
+        thread and then the wrapper thread as fallbacks.
+
+        ``_stop`` is checked first because the reactor outlives an explicit
+        ``stop()``: it is process-global and one-shot, so it keeps running after
+        we close the websocket, and the reactor alone would report a feed we
+        deliberately shut down as live.
+        """
+        if self._stop.is_set():
+            return False
+        sdk_thread = getattr(self._ticker, "websocket_thread", None)
+        if sdk_thread is not None and sdk_thread.is_alive():
+            return True
+        if _reactor_running():
+            return True
+        return bool(self._thread and self._thread.is_alive())
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -693,8 +747,14 @@ class GiftNiftyFeed:
                 "symbol": GIFT_KEY,
                 "token": self.token,
                 "connected": self.connected,
-                "running": bool(self._thread and self._thread.is_alive()),
-                "starting": bool(self._thread and self._thread.is_alive() and not self.connected),
+                # Liveness is the SDK's reactor, not the wrapper thread:
+                # connect() returns as soon as it hands the reactor off, so
+                # `self._thread.is_alive()` goes False almost immediately while
+                # the feed is perfectly healthy. Reporting that as "not running"
+                # made the dashboard show a stale "Reconnecting…" state for a
+                # feed that was ticking fine. See _ticker_running().
+                "running": self._ticker_running(),
+                "starting": self._ticker_running() and not self.connected,
                 "interval": self.interval,
                 "interval_seconds": self.seconds,
                 "volume_basis": VOLUME_BASIS,

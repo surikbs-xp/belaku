@@ -1132,6 +1132,55 @@ def test_feed_uses_runtime_client_token(monkeypatch) -> None:
     assert received == [("key", "fresh-token")]
 
 
+def test_feed_reports_running_when_reactor_is_reused(monkeypatch) -> None:
+    """A restart reuses the running reactor and creates no websocket_thread.
+
+    The SDK only starts its own thread when ``reactor.running`` is False, so on
+    the second connect() a fresh KiteTicker has no ``websocket_thread`` at all
+    and the wrapper thread has already exited. Liveness has to come from the
+    reactor, or the dashboard reports a healthy feed as stopped.
+    """
+    monkeypatch.setattr(gift_nifty, "_reactor_running", lambda: True)
+
+    feed = GiftNiftyFeed("1minute")
+    feed._ticker = SimpleNamespace()  # no websocket_thread, as after a restart
+    feed._thread = None
+    feed.connected = True
+
+    status = feed.status()
+    assert status["running"]
+    assert not status["starting"]
+
+
+def test_feed_reports_stopped_after_explicit_stop(monkeypatch) -> None:
+    """The reactor outlives stop(), so it alone must not imply a live feed."""
+    monkeypatch.setattr(gift_nifty, "_reactor_running", lambda: True)
+
+    feed = GiftNiftyFeed("1minute")
+    feed._ticker = SimpleNamespace()
+    feed.stop()
+
+    status = feed.status()
+    assert not status["running"]
+    assert not status["starting"]
+
+
+def test_feed_reports_stopped_when_reactor_is_down(monkeypatch) -> None:
+    monkeypatch.setattr(gift_nifty, "_reactor_running", lambda: False)
+
+    feed = GiftNiftyFeed("1minute")
+    feed._ticker = SimpleNamespace()
+    feed._thread = None
+
+    assert not feed.status()["running"]
+
+
+def test_reactor_running_is_false_without_twisted(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "twisted.internet", None)
+
+    assert gift_nifty._reactor_running() is False
+
+
 def test_runtime_token_arms_live_configuration(monkeypatch) -> None:
     settings = Settings(api_key="key", api_secret="secret", access_token="")
     monkeypatch.setenv("KITE_ACCESS_TOKEN", "fresh-token")
