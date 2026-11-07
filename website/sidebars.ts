@@ -31,7 +31,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Development',
       collapsed: false,
-      items: ['testing', 'performance'],
+      items: ['testing', 'performance', 'docs-site'],
     },
   ],
 };

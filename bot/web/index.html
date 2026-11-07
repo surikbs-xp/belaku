@@ -26,7 +26,7 @@
     },
   };
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=trader-6" />
+<link rel="stylesheet" href="/static/styles.css?v=trader-7" />
 </head>
 
 <body class="bg-ink-950 text-slate-200 antialiased">
@@ -104,6 +104,7 @@
     <button class="tab tab-active" data-tab="monitor"   role="tab">Dashboard</button>
     <button class="tab"            data-tab="orders"    role="tab">Orders &amp; signals</button>
     <button class="tab"            data-tab="analytics" role="tab">Performance &amp; trades</button>
+    <button class="tab"            data-tab="logs"      role="tab">Logs</button>
   </nav>
 
   <!-- ── View 1: Dashboard Monitor ──────────────────────────────────── -->
@@ -396,6 +397,50 @@
     </div>
   </section>
 
+  <!-- ── View 4: Logs ───────────────────────────────────────────────── -->
+  <section id="view-logs" class="view hidden">
+    <div class="panel">
+      <div class="panel-head panel-head-wrap">
+        <div>
+          <h2 class="section-title">Engine log</h2>
+          <p id="logs-caption" class="metric-sub">—</p>
+        </div>
+        <div class="toolbar">
+          <select id="logs-level" class="field field-compact" aria-label="Minimum log level">
+            <option value="">All levels</option>
+            <option value="DEBUG">Debug +</option>
+            <option value="INFO">Info +</option>
+            <option value="WARNING">Warning +</option>
+            <option value="ERROR">Error +</option>
+            <option value="CRITICAL">Critical only</option>
+          </select>
+          <input id="logs-search" type="search" placeholder="Search message, logger, symbol…" class="field field-search" />
+          <label class="log-check">
+            <input id="logs-follow" type="checkbox" checked />
+            <span>Follow</span>
+          </label>
+          <label class="log-check">
+            <input id="logs-wrap" type="checkbox" />
+            <span>Wrap</span>
+          </label>
+          <button id="btn-logs-copy" class="btn btn-neutral">Copy</button>
+          <button id="btn-logs-download" class="btn btn-neutral">Download</button>
+        </div>
+      </div>
+
+      <div id="logs-viewport" class="log-viewport">
+        <p class="log-empty">Loading log…</p>
+      </div>
+
+      <p class="panel-footnote">
+        Tail of <span id="logs-path" class="font-mono">—</span>. The last
+        <span id="logs-window">—</span> of the file is read on each refresh, so the
+        newest lines always win. Access logs stay off unless
+        <span class="font-mono">UVICORN_ACCESS_LOG=1</span>.
+      </p>
+    </div>
+  </section>
+
   <!-- ── Footer ─────────────────────────────────────────────────────── -->
   <footer class="appfoot">
     <span id="footer-left">Connecting…</span>
@@ -417,6 +462,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=trader-6" defer></script>
+<script src="/static/app.js?v=trader-7" defer></script>
 </body>
 </html>

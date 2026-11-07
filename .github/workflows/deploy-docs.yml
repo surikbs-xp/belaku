@@ -8,6 +8,7 @@ on:
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
 
+# Clone the repo and publish to Pages via OIDC.
 permissions:
   contents: read
   pages: write
@@ -20,16 +21,21 @@ concurrency:
 
 jobs:
   build:
-    runs-on: self-hosted
+    # GitHub-hosted, not self-hosted. A self-hosted runner runs on whatever
+    # machine you registered, so a docs build would be tied to the trading box
+    # being awake — and `deploy-pages` needs `pages: write` plus an OIDC token,
+    # which the default GITHUB_TOKEN only gets on GitHub-hosted runners for
+    # public repositories. Pin node to the version the site builds on.
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: website
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: '24'
           cache: npm
           cache-dependency-path: website/package-lock.json
 
@@ -39,18 +45,23 @@ jobs:
       - name: Build
         run: npm run build
 
-      - uses: actions/configure-pages@v5
+      # `enablement: true` lets a first run turn Pages on instead of failing
+      # with "Get Pages site failed". It needs a token with `pages: write`
+      # (the default GITHUB_TOKEN on a public repo is enough).
+      - uses: actions/configure-pages@v6
+        with:
+          enablement: true
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: website/build
 
   deploy:
     needs: build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

@@ -1056,3 +1056,65 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
 .live-check.is-ok .live-check-mark { color: var(--good); }
 .live-check.is-bad .live-check-mark { color: var(--bad); }
 .live-check.is-bad { color: #fecdd3; }
+
+/* ── Log viewer ────────────────────────────────────────────────────── */
+.log-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  font-size: 0.76rem;
+  color: var(--ink-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.log-check input {
+  width: 0.85rem;
+  height: 0.85rem;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+
+.log-viewport {
+  max-height: 64vh;
+  overflow: auto;
+  border-radius: 0.55rem;
+  border: 1px solid var(--edge);
+  background: rgba(5, 7, 15, 0.72);
+  padding: 0.5rem 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+/* Wrapping makes tracebacks readable; off by default to keep columns aligned. */
+.log-viewport.is-wrapped .log-line { white-space: pre-wrap; word-break: break-word; }
+
+.log-line {
+  display: flex;
+  gap: 0.5rem;
+  white-space: pre;
+  color: var(--ink-1);
+}
+
+/* Traceback frames and other unparsed lines continue the line above. */
+.log-line.is-continuation {
+  padding-left: 1.2rem;
+  color: var(--ink-3);
+}
+
+.log-ts { color: var(--ink-3); }
+.log-logger { color: #7dd3fc; }
+.log-level { font-weight: 700; }
+.log-level-INFO { color: #7dd3fc; }
+.log-level-DEBUG { color: var(--ink-3); }
+.log-level-WARNING { color: var(--warn); }
+.log-level-ERROR,
+.log-level-CRITICAL { color: var(--bad); }
+.log-line.has-error { background: rgba(244, 63, 94, 0.07); }
+
+.log-empty {
+  padding: 1.4rem;
+  text-align: center;
+  color: var(--ink-3);
+}

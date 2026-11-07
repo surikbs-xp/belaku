@@ -2,6 +2,7 @@
 __pycache__
 .pytest_cache/
 .venv/
+.env
 
 # Real credentials. Note `*.env` does NOT match `.env.example`, so the
 # template stays committable while actual secrets stay out of git.

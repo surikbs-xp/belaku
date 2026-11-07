@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import webbrowser
@@ -95,6 +96,110 @@ def _configure_logging() -> None:
         )
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
+
+
+# ---------------------------------------------------------------------------
+# Log tail (served to the dashboard's Logs tab)
+# ---------------------------------------------------------------------------
+# Matches the formatter's "%(asctime)s %(levelname)s %(name)s: %(message)s".
+_LOG_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T][\d:,.]+\s+(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\s"
+)
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_LOG_LEVEL_RANK = {name: rank for rank, name in enumerate(LOG_LEVELS)}
+
+# Credentials are written to .env, never logged, but a future log line or a
+# caught exception could echo one. The dashboard is unauthenticated, so mask
+# anything that looks like a secret before it leaves the process.
+_SECRET_RE = re.compile(
+    r"(?P<key>"
+    r"kite_api_secret|kite_access_token|api_secret|access_token|request_token"
+    r"|webhook_secret|password|authorization|api_key"
+    r")(?P<sep>['\"]?\s*[=:]\s*['\"]?)(?P<value>\S+)",
+    re.IGNORECASE,
+)
+
+# Only the tail of the active file is read, so a 5 MB log costs one seek.
+_LOG_TAIL_BYTES = 512 * 1024
+
+
+def _redact_secrets(line: str) -> str:
+    return _SECRET_RE.sub(lambda m: f"{m.group('key')}{m.group('sep')}***", line)
+
+
+def _read_tail(path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> list[str]:
+    """Last lines of ``path``, reading at most ``max_bytes`` from the end."""
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > max_bytes:
+            handle.seek(size - max_bytes)
+            handle.readline()  # drop the partial line the seek landed inside
+        data = handle.read()
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def read_log_tail(
+    limit: int = 400,
+    level: Optional[str] = None,
+    search: Optional[str] = None,
+) -> dict[str, Any]:
+    """Tail the bot's log file, oldest line first, with optional filters.
+
+    ``level`` is a *minimum* severity: ``WARNING`` also returns ERROR and
+    CRITICAL, which is what "show me what went wrong" means in practice. A line
+    that does not match the log format is treated as a continuation (a
+    traceback frame) and inherits the previous line's verdict, so filtering by
+    level does not strip the stack trace that explains the error.
+    """
+    path = LOG_FILE
+    payload: dict[str, Any] = {
+        "lines": [],
+        "count": 0,
+        "scanned": 0,
+        "path": str(path),
+        "available": False,
+        "size_bytes": 0,
+        "updated_at": None,
+        "error": None,
+    }
+    if not path.is_file():
+        return payload
+
+    try:
+        lines = _read_tail(path)
+        stat = path.stat()
+    except OSError as exc:
+        log.warning("Cannot read log file %s: %s", path, exc)
+        payload["error"] = str(exc)
+        return payload
+
+    payload["available"] = True
+    payload["scanned"] = len(lines)
+    payload["size_bytes"] = stat.st_size
+    payload["updated_at"] = db.iso(datetime.fromtimestamp(stat.st_mtime, db.IST))
+
+    threshold = _LOG_LEVEL_RANK.get((level or "").strip().upper())
+    needle = (search or "").strip().lower()
+
+    selected: list[str] = []
+    keep_continuation = False
+    for line in lines:
+        match = _LOG_LINE_RE.match(line)
+        if match:
+            keep_continuation = threshold is None or _LOG_LEVEL_RANK[match["level"]] >= threshold
+            if not keep_continuation:
+                continue
+        elif not keep_continuation:
+            # An unparsed line with no severe entry above it is not a traceback
+            # we care about; drop it rather than showing orphaned frames.
+            continue
+        if needle and needle not in line.lower():
+            continue
+        selected.append(_redact_secrets(line))
+
+    payload["lines"] = selected[-limit:] if limit else selected
+    payload["count"] = len(payload["lines"])
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +425,26 @@ app.add_middleware(
 @app.get("/api/health", tags=["status"])
 def health() -> dict[str, Any]:
     return {"ok": True, "time": db.iso(), "uptime_seconds": round(time.time() - STARTED_AT, 1)}
+
+
+@app.get("/api/logs", tags=["status"])
+def api_logs(
+    limit: int = Query(400, ge=1, le=5000),
+    level: Optional[str] = Query(None, description="Minimum severity: DEBUG..CRITICAL"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring filter"),
+) -> dict[str, Any]:
+    """Tail of the bot's log file for the dashboard's Logs tab."""
+    minimum = (level or "").strip().upper() or None
+    if minimum and minimum not in _LOG_LEVEL_RANK:
+        raise HTTPException(
+            status_code=400, detail=f"level must be one of {', '.join(LOG_LEVELS)}"
+        )
+    payload = read_log_tail(limit=limit, level=minimum, search=search)
+    payload["level"] = minimum
+    payload["search"] = search or ""
+    payload["levels"] = list(LOG_LEVELS)
+    payload["max_bytes"] = _LOG_TAIL_BYTES
+    return payload
 
 
 @app.get("/api/status", tags=["status"])
