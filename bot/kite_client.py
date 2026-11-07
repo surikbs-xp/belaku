@@ -180,7 +180,8 @@ class KiteClient:
         self._profile_checked_at = 0.0
         self._margins_cache: Optional[dict[str, Any]] = None
         self._margins_checked_at = 0.0
-        self._quote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # symbol -> (fetched_at, quote or None). A None entry is a cached failure.
+        self._quote_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
         self._init_sdk()
 
     # -- SDK bootstrap ---------------------------------------------------
@@ -380,8 +381,10 @@ class KiteClient:
         """Live LTP/OHLC for ``symbol``; ``None`` when unavailable.
 
         Cached for ``max_age`` seconds so the mark loop and the dashboard share
-        one round-trip instead of each issuing its own. Pass ``max_age=0`` when
-        an order needs the freshest price.
+        one round-trip instead of each issuing its own. Failures are cached too:
+        with an expired token every call would otherwise pay a doomed network
+        round-trip (plus retries) on each mark tick. Pass ``max_age=0`` when an
+        order needs the freshest price.
         """
         if not self.sdk_ready:
             return None
@@ -398,15 +401,18 @@ class KiteClient:
                 break
             except TokenException as exc:
                 self._auth_error = f"Access token invalid/expired: {exc}"
+                self._remember_quote_failure(symbol)
                 return None
             except (KiteException, NetworkException) as exc:
                 self._auth_error = str(exc)
                 if attempt == 2:
                     log.warning("Quote failed for %s: %s", symbol, exc)
+                    self._remember_quote_failure(symbol)
                     return None
                 time.sleep(0.2 * (attempt + 1))
         payload = data.get(key)
         if not payload or payload.get("last_price") is None:
+            self._remember_quote_failure(symbol)
             return None
         price = float(payload["last_price"])
         self._last_prices[symbol] = price
@@ -460,6 +466,11 @@ class KiteClient:
                     return []
                 time.sleep(0.2 * (attempt + 1))
         return []
+
+    def _remember_quote_failure(self, symbol: str) -> None:
+        """Cache a failed quote so a dead token is not retried on every tick."""
+        with self._lock:
+            self._quote_cache[symbol] = (time.time(), None)
 
     def get_ltp(self, symbol: str, max_age: float = QUOTE_CACHE_SECONDS) -> Optional[float]:
         quote = self.get_quote(symbol, max_age=max_age)

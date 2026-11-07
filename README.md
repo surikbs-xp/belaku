@@ -1,11 +1,71 @@
 # Belaku — GIFT Nifty → Nifty Futures execution bot
 
+Single-process algorithmic trading bot for the `Surikbs` Pine strategy
+(`bot/st.pine`). It subscribes to **GIFT Nifty** ticks, builds candles, evaluates
+the Pine conditions itself, and trades the **NFO Nifty future**. No TradingView
+in the loop.
+
 Requires Python 3.12 or newer.
 
-Single-process algorithmic trading bot for the `Surikbs` Pine strategy
-(`bot/st.pine`). The bot subscribes to **GIFT Nifty** ticks, builds candles, evaluates
-the Pine conditions itself and trades the **NFO Nifty future**. No TradingView in
-the loop.
+**📖 Full documentation: <https://surikbs-xp.github.io/belaku/>**
+
+## The one idea that explains the design
+
+GIFT Nifty trades ~20 hours a day and is the standard pre-market proxy for
+Nifty 50 — but it is an *index*, and cannot be traded. So Belaku reads signals
+from GIFT Nifty and places orders on the NFO Nifty future. Everything else
+follows from that split.
+
+| Window | Behaviour |
+|---|---|
+| GIFT Nifty session (~20 h) | evaluate the strategy on every closed bar |
+| NSE F&O session (09:15–15:30 IST) | LIVE orders may be placed; PAPER uses available prices |
+| Outside NSE F&O hours | PAPER signals may simulate at the completed GIFT close; LIVE signals are **deferred and dropped** |
+
+A signal computed on a 02:00 bar is not a signal at 09:15, so deferred signals
+are never queued for the open.
+
+## Quick start
+
+```bash
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+test -f bot/.env || cp bot/.env.example bot/.env   # then edit bot/.env
+.venv/bin/python bot/bot.py
+```
+
+Kite credentials are **required**, not optional — the GIFT Nifty feed runs on
+`KiteTicker`, so without a token there is no data and no strategy.
+`EXECUTION_MODE=PAPER` mocks *orders*, not market data.
+
+Dashboard: <http://127.0.0.1:9000>
+
+```bash
+# Docker
+docker compose up -d --build
+```
+
+See [Setup](https://surikbs-xp.github.io/belaku/setup) and
+[Running](https://surikbs-xp.github.io/belaku/running) for the token flow, the
+Docker volume layout, and health checks.
+
+## Documentation
+
+| Page | What is in it |
+|---|---|
+| [Introduction](https://surikbs-xp.github.io/belaku/introduction) | What the bot does, precisely, and its honest limitations |
+| [Setup](https://surikbs-xp.github.io/belaku/setup) | Install, Kite credentials, getting an access token |
+| [Running](https://surikbs-xp.github.io/belaku/running) | Local and Docker, rebuilds, logs, stopping |
+| [Architecture](https://surikbs-xp.github.io/belaku/architecture) | Components, the two clocks, warm-up, signal lifecycle |
+| [Strategy](https://surikbs-xp.github.io/belaku/strategy) | Triple SuperTrend + PSAR, and why they are computed locally |
+| [Execution](https://surikbs-xp.github.io/belaku/execution) | Order path, safety gates, PAPER vs LIVE, margin, panic |
+| [Configuration](https://surikbs-xp.github.io/belaku/configuration) | Every environment variable |
+| [API](https://surikbs-xp.github.io/belaku/api) | The JSON endpoints |
+| [Dashboard](https://surikbs-xp.github.io/belaku/dashboard) | Tabs, polling, asset caching, security |
+| [Database](https://surikbs-xp.github.io/belaku/database) | What is stored, and why |
+| [Schema reference](https://surikbs-xp.github.io/belaku/database/schema) | Every table, column and index |
+| [Database operations](https://surikbs-xp.github.io/belaku/database/operations) | Inspecting, backup, pruning |
+| [Performance](https://surikbs-xp.github.io/belaku/performance) | Measured resource use and what was fixed |
+| [Testing](https://surikbs-xp.github.io/belaku/testing) | What the tests pin, and how to add one |
 
 ## Files
 
@@ -13,205 +73,16 @@ the loop.
 |---|---|
 | `bot/bot.py` | **The bot.** Entrypoint: tick feed, engine, mark loop, API, dashboard |
 | `bot/gift_nifty.py` | GIFT Nifty instrument resolution, KiteTicker subscription, tick→candle aggregation |
-| `bot/engine.py` | Evaluates `bot/st.pine` on GIFT Nifty bars; routes orders to the Nifty future |
-| `bot/strategy.py` | The `bot/st.pine` entry rules in Python (PSAR / triple SuperTrend) |
+| `bot/engine.py` | Evaluates the strategy on GIFT Nifty bars; routes orders to the Nifty future |
+| `bot/strategy.py` | The Pine entry rules in Python (PSAR / triple SuperTrend) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
 | `bot/kite_client.py` | KiteConnect wrapper; quotes, instrument lookup, mocked orders in PAPER |
 | `bot/kite_auth.py` | Kite login callback, request-token exchange, and access-token persistence |
 | `bot/database.py` | SQLite ledger: account, positions, orders, trades, equity curve, GIFT candles |
 | `bot/config.py` | `.env` loading, `EXECUTION_MODE` toggle, all tunables |
-| `bot/web/` | Chart-free vanilla-JS dashboard (Tailwind via CDN), served by `bot/bot.py` |
+| `bot/web/` | Chart-free vanilla-JS dashboard, served by `bot/bot.py` |
 | `tests/` | Focused automated regression tests |
-
-## Architecture
-
-```mermaid
-graph LR
-  K[KiteTicker<br/>NSEIX:GIFT NIFTY] -->|ticks| F[bot/gift_nifty.py<br/>tick → candles]
-  F -->|bars| DB[(bot/paper_trading.db)]
-  F -->|bars| E[bot/engine.py<br/>st.pine]
-  E -->|BULL/BEAR| OM[order_manager]
-  OM -->|order| K2[KiteConnect<br/>NFO:NIFTY..FUT]
-  E -->|mark| DB
-  B[bot/bot.py] -->|/api/*| JS[bot/web/ dashboard]
-  JS -->|poll 1.5s| B
-```
-
-### Signal source ≠ execution venue
-
-This is deliberate, not an oversight:
-
-* **GIFT Nifty is the signal source.** It trades ~20 hours on NSEIX and is the
-  standard pre-market proxy for Nifty 50, so it reflects overnight and
-  early-morning global moves before NSE opens.
-* **GIFT Nifty cannot be traded.** Zerodha staff, Kite Connect forum: *"GIFT
-  Nifty is not an index and is not tradeable via Zerodha. It has been placed
-  under the non-tradeable indices category."* It is an index row on NSEIX.
-* **Execution is the NFO Nifty future**, the front-month contract resolved from
-  the expiry calendar by `kite_client.future_symbol`.
-
-### Two clocks
-
-| Window | Behaviour |
-|---|---|
-| GIFT Nifty session (~20h) | evaluate `st.pine` on every closed bar |
-| NSE F&O session (09:15–15:30 IST) | LIVE orders may be placed; PAPER uses available market prices |
-| Outside NSE F&O hours | PAPER engine signals may simulate at the completed GIFT candle close; LIVE signals are deferred |
-
-A signal fires only on a fresh BUY/SELL transition after a completed candle.
-After-hours PAPER simulation does not force an order when the signal is neutral.
-Open PAPER engine positions are marked against the live GIFT Nifty price after
-hours; portfolio equity includes current unrealised P/L.
-PAPER orders are simulated and their positions/P&L are isolated by mode; only
-LIVE mode submits orders to Zerodha, and switching to LIVE requires confirmation.
-LIVE signals outside the NSE window are recorded as **deferred** and are not
-auto-executed at 09:15.
-
-### Warmup, stated plainly
-
-Kite **does** serve GIFT Nifty (NSEIX) history, including the overnight session,
-so the bot loads its candles from `kite.historical_data` and treats them as the
-source of truth. Entry rules are PSAR and 2-of-3 SuperTrend. The engine needs 14
-closed candles before its first valid signal (about 70 minutes at `5minute`),
-matching the longest SuperTrend's warm-up. After that, it evaluates each
-completed candle.
-Bars are persisted to the `gift_candles` table, so a restart **resumes** the
-warmup instead of restarting it.
-
-A fresh install therefore warms up immediately from Kite history rather than
-waiting ~65 minutes for ticks to accumulate. Tick-built candles are used only
-while history is unavailable, and the feed logs which source it is on.
-
-## Setup
-
-```bash
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
-test -f bot/.env || cp bot/.env.example bot/.env   # then edit bot/.env
-```
-
-Kite credentials are **required**, not optional — the GIFT Nifty feed runs on
-`KiteTicker`, so without a token there is no data and no strategy. Set
-`KITE_API_KEY` and `KITE_API_SECRET` from https://developers.kite.trade, and
-register the Redirect URL as `http://127.0.0.1:9000/zerodha/callback`.
-
-`EXECUTION_MODE=PAPER` still needs a live token: PAPER mocks *orders*, not
-market data.
-
-At startup, a valid saved token starts the GIFT Nifty feed automatically. If
-the token is missing or expired and Kite credentials are configured, the bot
-opens Zerodha login in the local browser. Sign-in and 2FA are still required;
-headless deployments must use the dashboard or manual request-token flow.
-
-### Getting the access token
-
-Kite has no username/password API — the token comes from a browser redirect.
-The bot handles both halves:
-
-1. Click **Connect to Kite** on the dashboard (or `POST /api/kite/login-url`).
-2. Authenticate in the tab that opens. Zerodha redirects to
-   `/zerodha/callback`, which exchanges the `request_token` automatically.
-3. The token is written back into `bot/.env` so it survives a restart, and the GIFT
-   Nifty feed starts immediately.
-
-If the redirect cannot reach the bot, paste the `request_token` from the
-redirect URL into the dashboard's manual field (or
-`POST /api/kite/session {"request_token": "..."}`).
-
-Tokens expire daily around **06:00 IST**. A stale token is not a crash: the bot
-keeps running on persisted candles and the dashboard separates account
-authentication from GIFT market-data status. The Kite button redirects in the
-current tab to avoid browser popup blocking; after login, use the dashboard's
-GIFT reconnect control if authentication succeeds but ticks do not arrive.
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/kite/status` | token health, user, redirect URL |
-| `POST /api/kite/login-url` | the URL to open |
-| `POST /api/kite/session` | exchange a `request_token` |
-| `GET /zerodha/callback` | redirect target; auto-exchanges the token |
-
-## Run
-
-```bash
-.venv/bin/python bot/bot.py    # the whole bot on WEBHOOK_HOST:WEBHOOK_PORT
-```
-
-Open `http://127.0.0.1:9000/` for the dashboard and `/docs` for the OpenAPI
-schema. There is nothing else to start, and no inbound endpoint to expose.
-
-## Run with Docker
-
-Docker Compose keeps the SQLite database in a named volume and mounts
-`bot/.env` so a renewed Kite access token survives container restarts. The
-dashboard port is published on host loopback only.
-
-```bash
-test -f bot/.env || cp bot/.env.example bot/.env
-# Edit bot/.env and set the Kite credentials; keep EXECUTION_MODE=PAPER initially.
-docker compose up --build -d
-docker compose logs -f bot
-```
-
-Open `http://127.0.0.1:9000/`. Stop the container with
-`docker compose down`; do not add `-v` unless you intend to delete the database
-volume.
-
-For a remote VPS, keep the port bound to loopback and use an HTTPS reverse
-proxy with authentication. Set `KITE_REDIRECT_URL` in `bot/.env` to the public
-HTTPS `/zerodha/callback` URL and register that exact URL in the Kite developer
-console. The proxy must forward that callback to port 9000. Do not expose the
-unauthenticated dashboard/API directly to the internet.
-
-## API
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/api/status` | mode, uptime, Kite auth, market clock, GIFT feed + engine state |
-| `GET` | `/api/portfolio` | balance, margin utilisation, realised/unrealised PnL |
-| `GET` | `/api/positions?status=all\|open\|closed` | Nifty futures positions |
-| `GET` | `/api/orders?limit=&search=&mode=` | order book from SQLite |
-| `GET` | `/api/equity?limit=` | cumulative equity curve |
-| `GET` | `/api/trades?limit=&mode=` | settled round trips with fees and net PnL |
-| `GET` | `/api/signals?limit=` | engine signal audit trail |
-| `POST` | `/api/toggle-mode` | `{"mode":"PAPER\|LIVE","confirm":bool}` |
-| `GET` | `/api/kite/status` | Kite token health |
-| `POST` | `/api/kite/login-url` | start the Zerodha login |
-| `POST` | `/api/kite/session` | exchange a `request_token` |
-| `POST` | `/api/kite/feed/reconnect` | restart GIFT market data with a valid token |
-| `POST` | `/api/pause` | `{"paused":bool,"reason":str}` |
-| `POST` | `/api/panic` | `{"confirm":true,"reason":str}` — squares off and pauses |
-
-Two guards are enforced server-side, not just in the UI: switching to `LIVE`
-requires `confirm=true` **and** complete Kite credentials, and `/api/panic`
-requires `confirm=true`. Both are rejected with a `4xx` otherwise.
-
-## Dashboard
-
-`bot/web/` is a no-build single-page app: Tailwind from CDN and plain ES2020 in
-`bot/web/app.js`. It polls every 1.5 s and patches the DOM in place.
-
-* **Dashboard** — portfolio value, margin available (with utilisation
-  bar), active mode pill (green LIVE / amber PAPER), real-time PnL coloured by
-  sign, the GIFT Nifty signal engine (verdict, indicator values, entry-rule
-  checks, warmup progress), open positions, a Paper/Live
-  toggle, pause, and the panic button. Live mode still requires an explicit
-  confirmation.
-* **Order Logs** — searchable, mode-filtered order book plus the engine signal
-  trail (placed / held / deferred and why), with CSV export.
-* **Performance & trades** — headline performance stats and the trade ledger.
-
-Polling pauses while the tab is hidden and resumes on focus. If the API goes
-away the UI keeps the last values on screen, flags the failure, and recovers on
-its own once the server returns.
-
-The frontend is unauthenticated and binds to `WEBHOOK_HOST` (default
-`127.0.0.1`). Keep it on loopback, or put it behind an authenticating reverse
-proxy before exposing it — anyone who can reach `/api/panic` or
-`/api/toggle-mode` can move real money.
-
-There is no inbound endpoint to expose: the bot pulls its own market data. The
-GIFT feed pill turns red when ticks stop arriving, so a dead websocket is
-visible without tailing logs.
+| `website/` | Docusaurus source for the documentation site |
 
 ## Tuning
 
@@ -220,14 +91,24 @@ visible without tailing logs.
 | `BOT_NAME` | dashboard title and browser tab name (default `Belaku`) |
 | `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
-| `STRATEGY_SUPERTRENDS` | the SuperTrend instances as `atr_length:multiplier` pairs (default `11:1,12:2,13:3`) |
+| `STRATEGY_SUPERTRENDS` | SuperTrend instances as `atr_length:multiplier` pairs (default `11:1,12:2,13:3`) |
 | `STRATEGY_ST_MIN_AGREE` | how many SuperTrends must agree before a signal is allowed |
 | `STRATEGY_PSAR_*` | Parabolic SAR start / increment / maximum |
+
+The warm-up requirement is derived from the configured SuperTrend periods
+(`longest ATR length + 1`), so it follows `STRATEGY_SUPERTRENDS` automatically.
 
 If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 — the indicators are only meaningful on the timeframe they were tuned for.
 
-## Safety rules
+## Tests
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q bot tests
+```
+
+## Safety
 
 | Rule | Where |
 |---|---|
@@ -241,70 +122,27 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 | Panic reports partial or failed square-offs instead of claiming success | `order_manager.OrderManager.square_off` |
 | Panic pauses new entries | `order_manager.pause` / `OrderManager.paused` |
 
-### Strategy evaluation
+### Known limitations
 
-`bot/strategy.py` applies the Pine strategy's entry rules using
-`pandas-ta-classic` for triple SuperTrend and a standard Wilder Parabolic SAR on
-GIFT Nifty OHLC. The dashboard shows indicator values for the forming candle
-when available, but strategy signals and orders remain based on completed
-candles. No synthetic or buffer candles are added; all 14 warm-up bars must be
-observed or restored from persisted GIFT Nifty data.
-`bot/engine.py` evaluates each closed GIFT Nifty bar and acts only on a **transition** — `BULL` after not-`BULL`
-— mirroring the Pine `not longCondition[1]` guard, so a run of bullish bars
-produces exactly one entry.
+* **No stop-loss, no profit target.** The Pine strategy defines entries only.
+  Positions stay open until an opposite entry or a manual square-off. Size
+  positions accordingly — this is a property of the strategy, not a missing
+  feature.
+* **The dashboard is unauthenticated.** Keep it on loopback or behind an
+  authenticating proxy.
+* **`bot/.env` is tracked in git.** Any credentials in it are in the repository
+  history. Move it out of version control and rotate the keys before treating
+  this as production. `.gitignore` already excludes `*.env*s`; the file was
+  added before that rule.
 
-The engine reports warm-up progress until enough closed bars are available, then
-evaluates every completed candle. The requirement is derived from the configured
-SuperTrend periods (`longest ATR length + 1`), so it follows
-`STRATEGY_SUPERTRENDS` automatically.
-
-The dashboard's condition checklist shows exactly which of the two rules pass,
-so a quiet bot is explainable rather than mysterious.
-
-SuperTrend comes from `pandas-ta-classic` (pinned in `requirements.txt`), the
-maintained fork of `pandas-ta`; the original's last release needs numba and
-cannot be installed on this project's Python 3.11 at all. Both forks produce
-identical SuperTrend output. Parabolic SAR is computed in `bot/strategy.py` with
-the standard Wilder algorithm because the library's `psar` was measured to
-deviate from it on about 30% of bars. Both indicators are pinned by tests that
-compare them against independently transcribed Pine references, and both match
-those references exactly on 1119 real GIFT Nifty bars. The bot logs the OHLC
-input, history length and PSAR/SuperTrend outputs once per completed GIFT candle.
-
-#### Candle data quality
-
-Indicators are recursive, so a hole or a truncated bar skews every later value
-until it washes out (measured: PSAR off by tens of points and SuperTrend by up to
-~14 points right after a gap, converging after roughly 50 bars). The feed
-therefore never feeds a bar to the strategy unless it observed it from the open:
-
-* a bar whose first tick arrived more than 10 s late (feed joined mid-bar),
-* a bar spanning a websocket disconnect, and
-* a bar cut off by a shutdown (kept only so a restart *inside the same
-  5-minute bucket* can resume it)
-
-are stored with a `partial` flag and excluded. The `history_bars` field in the
-indicator log shows how much clean history the bot has. Hours when the bot was
-not running are backfilled from Kite history on the next refresh, so a restart
-does not leave a hole in the series.
-Local runs write rotating logs to `bot/logs/bot.log`; Docker writes them to
-`/data/bot.log` in the persistent data volume.
-
-Evaluate the restored filters in paper mode before enabling live orders.
-
-The Pine strategy defines entries but no stop-loss, profit target, or timed
-exit. Positions remain open until an opposite entry or manual square-off; the
-bot does not automatically close them at the end of the NSE session.
-
-## Tests
+## Building the docs
 
 ```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python -m compileall -q bot tests
+cd website
+npm install
+npm run start     # dev server at http://localhost:3000/belaku/
+npm run build     # static output in website/build
 ```
 
-The strategy port is exercised with synthetic candle series; `strategy.evaluate`
-returns a `StrategyVerdict` whose `.conditions` dict shows which SuperTrend and
-PSAR conditions held on the final bar.
-
-Start the bot separately with `.venv/bin/python bot/bot.py`.
+Deployment to GitHub Pages is handled by
+`.github/workflows/deploy-docs.yml` on pushes to `main` that touch `website/`.

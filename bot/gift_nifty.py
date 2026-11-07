@@ -56,6 +56,11 @@ JOIN_GRACE_SECONDS = 10.0
 
 # Kite history is authoritative; refresh it at most this often unless forced.
 HISTORY_REFRESH_SECONDS = 30.0
+# After a failed history fetch, wait before trying again. Doubles per failure up
+# to the cap, so a dead token costs one attempt per few minutes instead of one
+# per refresh interval.
+HISTORY_RETRY_BASE_SECONDS = 30.0
+HISTORY_RETRY_MAX_SECONDS = 300.0
 # How much history to request, so recursive indicators are fully converged.
 HISTORY_LOOKBACK_DAYS = 5
 
@@ -244,6 +249,13 @@ class GiftNiftyFeed:
         self._loaded_count = 0
         self._history_source = "none"
         self._history_at: Optional[datetime] = None
+        # Fingerprint of the last Kite history payload, so an unchanged window
+        # is not rebuilt into fresh Candle objects on every refresh.
+        self._history_newest: Optional[datetime] = None
+        self._history_rows = 0
+        # Exponential backoff after a failed history fetch.
+        self._history_failures = 0
+        self._history_retry_at: Optional[datetime] = None
         self._history_error: Optional[str] = None
 
     # -- history ---------------------------------------------------------
@@ -308,6 +320,8 @@ class GiftNiftyFeed:
                 and (now - self._history_at).total_seconds() < HISTORY_REFRESH_SECONDS
             ):
                 return len(self._history)
+            if not force and self._history_retry_at is not None and now < self._history_retry_at:
+                return len(self._history)
             token = self.token
         if token is None:
             token = self.resolve_token()
@@ -326,10 +340,50 @@ class GiftNiftyFeed:
             with self._lock:
                 self._history_at = now
                 self._history_error = "Kite returned no GIFT Nifty history"
-            log.warning("Kite returned no GIFT Nifty history; keeping %d bars", self.bar_count())
+                # Back off so a dead token or a closed exchange does not retry
+                # (with its own retries and sleeps) every refresh interval.
+                self._history_failures += 1
+                self._history_retry_at = now + timedelta(
+                    seconds=min(
+                        HISTORY_RETRY_MAX_SECONDS,
+                        HISTORY_RETRY_BASE_SECONDS * (2 ** (self._history_failures - 1)),
+                    )
+                )
+                failures = self._history_failures
+            # Log the first failure and then only every tenth, so a long outage
+            # does not fill the log with the same line.
+            if failures == 1 or failures % 10 == 0:
+                log.warning(
+                    "Kite returned no GIFT Nifty history (attempt %d); keeping %d bars",
+                    failures,
+                    self.bar_count(),
+                )
             return self.bar_count()
 
         current_start = bucket_start(now, self.seconds)
+        # Kite returns the whole lookback window every time. When the newest
+        # closed bucket and the bar count are unchanged, the series is identical
+        # to what is already held, so skip rebuilding ~1200 Candle objects.
+        newest_closed = None
+        for row in reversed(rows):
+            moment = row["date"]
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=IST)
+            start = bucket_start(moment, self.seconds)
+            if start < current_start:
+                newest_closed = start
+                break
+        with self._lock:
+            unchanged = (
+                newest_closed is not None
+                and newest_closed == self._history_newest
+                and len(rows) == self._history_rows
+            )
+            if unchanged:
+                self._history_at = now
+                self._history_error = None
+                return len(self._history)
+
         closed: list[dict[str, Any]] = []
         forming: Optional[Candle] = None
         for row in rows:
@@ -357,6 +411,10 @@ class GiftNiftyFeed:
             self._history_source = "kite"
             self._loaded_count = len(self._history)
             self._history_loaded = True
+            self._history_newest = newest_closed
+            self._history_rows = len(rows)
+            self._history_failures = 0
+            self._history_retry_at = None
             if forming is not None:
                 # Kite's newest row is the bucket still in progress; keep it as
                 # the forming candle so the dashboard shows live values.
