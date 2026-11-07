@@ -78,7 +78,19 @@ docker compose logs -f bot
 The engine logs one line per completed candle with the OHLC input, history
 length, and every indicator value — enough to reproduce a verdict offline.
 
+### In the dashboard
+
+The **Logs** tab tails the same file in the browser, with level and text
+filters, follow-on-scroll, and copy/download. It is the same stream as
+`tail -f`; the browser just adds colour and filtering. See
+[Dashboard → Logs](/dashboard#logs).
+
+Credentials are masked server-side before the lines are sent, but the endpoint
+has no authentication of its own — keep the dashboard on loopback or behind an
+authenticating proxy, as the [Configuration](/configuration) warning says.
+
 ## Next
 
 - [Configuration](/configuration)
 - [Database operations](/database/operations)
+- [Docs site](/docs-site)

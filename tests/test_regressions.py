@@ -60,6 +60,105 @@ def test_bot_configures_a_rotating_file_handler(monkeypatch, tmp_path) -> None:
         root.setLevel(original_level)
 
 
+def test_log_tail_filters_by_level_and_keeps_tracebacks(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "bot.log"
+    log_file.write_text(
+        "\n".join(
+            [
+                "2026-11-07 09:15:00,001 INFO bot: candle closed at 25010.5",
+                "2026-11-07 09:15:01,002 DEBUG bot.engine: vote 3/3 bull",
+                "2026-11-07 09:15:02,003 WARNING bot.kite_client: Quote failed for NIFTY26KFUT: boom",
+                "2026-11-07 09:15:03,004 ERROR bot.order_manager: Execution failure",
+                "Traceback (most recent call last):",
+                '  File "order_manager.py", line 1, in place',
+                "ValueError: nope",
+                "2026-11-07 09:15:04,005 INFO bot: recovered",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_app, "LOG_FILE", log_file)
+
+    everything = bot_app.read_log_tail()
+    assert everything["available"] is True
+    assert everything["count"] == 8
+    assert everything["lines"][0].startswith("2026-11-07 09:15:00")
+
+    warnings = bot_app.read_log_tail(level="WARNING")
+    # WARNING is a minimum severity, and the traceback rides along with the
+    # ERROR it explains rather than being filtered out as unparsed noise.
+    assert warnings["lines"] == [
+        "2026-11-07 09:15:02,003 WARNING bot.kite_client: Quote failed for NIFTY26KFUT: boom",
+        "2026-11-07 09:15:03,004 ERROR bot.order_manager: Execution failure",
+        "Traceback (most recent call last):",
+        '  File "order_manager.py", line 1, in place',
+        "ValueError: nope",
+    ]
+
+    searched = bot_app.read_log_tail(search="recovered")
+    assert searched["lines"] == ["2026-11-07 09:15:04,005 INFO bot: recovered"]
+
+    # Oldest line first, capped to the newest `limit` entries.
+    assert bot_app.read_log_tail(limit=2)["lines"] == [
+        "ValueError: nope",
+        "2026-11-07 09:15:04,005 INFO bot: recovered",
+    ]
+
+
+def test_log_tail_redacts_credentials(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "bot.log"
+    log_file.write_text(
+        "2026-11-07 09:15:00,001 INFO bot: KITE_ACCESS_TOKEN=abc123secret\n"
+        "2026-11-07 09:15:01,002 INFO bot: request_token: 'def456'\n"
+        '2026-11-07 09:15:02,003 INFO bot: password = "hunter2"\n'
+        "2026-11-07 09:15:03,004 INFO bot: api_secret=zzz\n"
+        "2026-11-07 09:15:04,005 INFO bot: subscribed instrument token 256265\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_app, "LOG_FILE", log_file)
+
+    blob = "\n".join(bot_app.read_log_tail()["lines"])
+    for secret in ("abc123secret", "def456", "hunter2", "zzz"):
+        assert secret not in blob
+    assert blob.count("***") == 4
+    # A bare numeric instrument token is not a credential and must survive.
+    assert "subscribed instrument token 256265" in blob
+
+
+def test_log_tail_reports_a_missing_file(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "absent.log")
+    payload = bot_app.read_log_tail()
+    assert payload["available"] is False
+    assert payload["lines"] == []
+
+
+def test_logs_endpoint_validates_the_level(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    log_file = tmp_path / "bot.log"
+    log_file.write_text(
+        "2026-11-07 09:15:00,001 INFO bot: warmed up\n"
+        "2026-11-07 09:15:01,002 ERROR bot: feed dropped\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bot_app, "LOG_FILE", log_file)
+
+    client = TestClient(bot_app.app)
+    assert client.get("/api/logs", params={"level": "NOPE"}).status_code == 400
+
+    ok = client.get("/api/logs", params={"limit": 5})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["level"] is None
+    assert body["levels"] == list(bot_app.LOG_LEVELS)
+    assert body["count"] == 2
+
+    only_errors = client.get("/api/logs", params={"level": "warning"}).json()
+    assert only_errors["level"] == "WARNING"
+    assert only_errors["lines"] == ["2026-11-07 09:15:01,002 ERROR bot: feed dropped"]
+
+
 def test_pandas_ta_indicators_warm_up_from_real_candles() -> None:
     candles = [
         {

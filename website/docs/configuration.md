@@ -25,12 +25,19 @@ evaluate the strategy without a token.
 | `WEBHOOK_HOST` | `127.0.0.1` | Bind address. Keep on loopback. |
 | `WEBHOOK_PORT` | `9000` | |
 | `LOG_FILE` | `bot/logs/bot.log` | Docker: `/data/bot.log` |
-| `LOG_LEVEL` | `INFO` | |
+| `LOG_LEVEL` | `INFO` | Minimum level written. Also the floor the Logs tab can query. |
 | `UVICORN_ACCESS_LOG` | `0` | Set `1` to log every request |
+
+`LOG_FILE` is rotated at 5 MB with 5 backups, and the Logs tab only reads the
+last 512 KB of it — so a long-running bot cannot make the dashboard slow.
 
 :::danger[The dashboard is unauthenticated]
 Anyone who can reach `/api/panic` or `/api/toggle-mode` can move real money.
 Keep it on loopback, or put it behind an authenticating reverse proxy.
+
+This includes `/api/logs`, which tail-reads `LOG_FILE`. Credential-shaped
+strings are masked before the response is built, but the log is still a
+diagnostic stream you would not want on a public URL.
 :::
 
 

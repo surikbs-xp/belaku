@@ -14,11 +14,20 @@ Base URL: `http://127.0.0.1:9000`
 |---|---|---|
 | `GET` | `/api/health` | Liveness probe |
 | `GET` | `/api/status` | Mode, uptime, Kite auth, market clock, feed + engine state, strategy config |
+| `GET` | `/api/logs?limit=&level=&search=` | Tail of the bot's log file for the Logs tab |
 | `GET` | `/api/live/readiness` | Every LIVE pre-flight check and what is blocking |
 | `GET` | `/api/holidays` | NSE F&O closure list (`?refresh=true` to refetch) |
 
 `/api/status` is the dashboard's main poll. It returns the engine's current and
 previous verdicts, the feed state, and the resolved strategy configuration.
+
+`/api/logs` reads only the last 512 KB of `LOG_FILE`, so a rotated 5 MB log
+costs one seek rather than a full parse. `level` is a **minimum** severity —
+`WARNING` also returns `ERROR` and `CRITICAL` — and a traceback stays attached
+to the entry it explains instead of being filtered out as unparsed noise.
+Anything matching `access_token=`, `api_secret=`, `request_token=`, `password=`
+and friends is masked to `***` before it leaves the process, because the
+dashboard is unauthenticated.
 
 ## Portfolio
 
@@ -119,5 +128,8 @@ The dashboard polls every 1.5 s, so the hot endpoints are cached:
 | `/api/status` | 2–4 ms |
 | `/api/portfolio` | 11–24 ms |
 | `/api/positions`, `/api/orders`, `/api/trades`, `/api/signals` | 2–5 ms |
+
+`/api/logs` is **not** on the 1.5 s poll — the Logs tab refreshes it every 3 s
+and only while that tab is open, so an idle dashboard never reads the file.
 
 See [Performance](/performance) for how that was achieved.

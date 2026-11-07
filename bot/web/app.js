@@ -15,6 +15,10 @@ const POLL_MS = 1500;
 const LEDGER_MS = 5000;
 /** Countdown refresh. Independent of POLL_MS so the seconds hand stays smooth. */
 const TICK_MS = 250;
+/** Log tail refresh. Independent of POLL_MS so the tab controls its own cost. */
+const LOG_MS = 3000;
+/** Tail length requested from /api/logs. */
+const LOG_LINES = 600;
 /** Samples kept for the client-side sparkline (last ~40 polls). */
 const SPARK_POINTS = 40;
 const ENDPOINTS = {
@@ -27,6 +31,7 @@ const ENDPOINTS = {
   analytics: '/api/analytics',
   holidays:  '/api/holidays',
   readiness: '/api/live/readiness',
+  logs:      '/api/logs',
   toggle:    '/api/toggle-mode',
   pause:     '/api/pause',
   panic:     '/api/panic',
@@ -66,6 +71,10 @@ const state = {
   botName: null,
   // When the ledger rows were last fetched (see LEDGER_MS).
   ledgerLoadedAt: 0,
+  // Log tail: the lines currently on screen, plus the interval that refreshes
+  // them while the Logs tab is open.
+  logsRaw: [],
+  logTimer: null,
 };
 
 /* ── Small helpers ─────────────────────────────────────────────────── */
@@ -1355,6 +1364,129 @@ function exportCsv() {
   URL.revokeObjectURL(url);
 }
 
+/* ── Logs ──────────────────────────────────────────────────────────── */
+
+/**
+ * Split a log line into its timestamp, level, logger and message.
+ *
+ * Mirrors the server's "%(asctime)s %(levelname)s %(name)s: %(message)s".
+ * Anything that does not match (a traceback frame, a stray print) is returned
+ * as a continuation so it stays attached to the entry that explains it.
+ */
+const LOG_LINE_RE = /^(\d{4}-\d{2}-\d{2}[ T][\d:,.]*)\s+(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+([\w.]*):?\s?([\s\S]*)$/;
+
+function parseLogLine(line) {
+  const match = LOG_LINE_RE.exec(line);
+  if (!match) return { continuation: true, text: line };
+  return {
+    continuation: false,
+    ts: match[1],
+    level: match[2],
+    logger: match[3],
+    message: match[4],
+  };
+}
+
+function renderLogLine(line) {
+  const parsed = parseLogLine(line);
+  if (parsed.continuation) {
+    return `<div class="log-line is-continuation">${escapeHtml(parsed.text)}</div>`;
+  }
+  const severe = parsed.level === 'ERROR' || parsed.level === 'CRITICAL';
+  return `<div class="log-line${severe ? ' has-error' : ''}">
+    <span class="log-ts">${escapeHtml(parsed.ts)}</span>
+    <span class="log-level log-level-${parsed.level}">${parsed.level}</span>
+    <span class="log-logger">${escapeHtml(parsed.logger)}</span>
+    <span class="log-message">${escapeHtml(parsed.message)}</span>
+  </div>`;
+}
+
+/** True when the viewport is scrolled to (or near) the bottom. */
+function logsAtBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+}
+
+function renderLogs() {
+  const viewport = $('logs-viewport');
+  const lines = state.logsRaw;
+
+  if (!lines.length) {
+    viewport.innerHTML = '<p class="log-empty">No log lines match the current filter.</p>';
+    return;
+  }
+
+  // Only stick to the bottom when Follow is on *and* the user was already
+  // there; otherwise keep their scroll position so a refresh does not yank the
+  // view away from the line they are reading.
+  const follow = $('logs-follow').checked && logsAtBottom(viewport);
+  const previousTop = viewport.scrollTop;
+
+  viewport.innerHTML = lines.map(renderLogLine).join('');
+  viewport.scrollTop = follow ? viewport.scrollHeight : previousTop;
+}
+
+function renderLogMeta(payload) {
+  const suffix = payload.search ? ` · matching “${payload.search}”` : '';
+  const level = payload.level ? ` · ${payload.level}+` : '';
+  setText('logs-caption', `${payload.count} of ${payload.scanned} tail lines${level}${suffix}`);
+  setText('logs-path', payload.path || '—');
+  if (payload.max_bytes) {
+    setText('logs-window', `${Math.round(payload.max_bytes / 1024)} KB`);
+  }
+}
+
+async function loadLogs() {
+  const params = new URLSearchParams({ limit: String(LOG_LINES) });
+  const level = $('logs-level').value;
+  const search = $('logs-search').value.trim();
+  if (level) params.set('level', level);
+  if (search) params.set('search', search);
+
+  const payload = await api(`${ENDPOINTS.logs}?${params}`);
+  state.logsRaw = payload.lines || [];
+  renderLogMeta(payload);
+  renderLogs();
+}
+
+async function copyLogs() {
+  if (!state.logsRaw.length) {
+    toast('Nothing to copy', 'info');
+    return;
+  }
+  const text = state.logsRaw.join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`Copied ${state.logsRaw.length} log lines`, 'ok');
+  } catch {
+    // Clipboard needs a secure context; http://127.0.0.1 counts as one, but a
+    // LAN IP over plain http does not. Fall back to a selectable dump.
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand('copy');
+    area.remove();
+    toast(ok ? `Copied ${state.logsRaw.length} log lines` : 'Copy blocked by the browser', ok ? 'ok' : 'err');
+  }
+}
+
+function downloadLogs() {
+  if (!state.logsRaw.length) {
+    toast('Nothing to download', 'info');
+    return;
+  }
+  const url = URL.createObjectURL(
+    new Blob([state.logsRaw.join('\n')], { type: 'text/plain;charset=utf-8' }),
+  );
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `belaku_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.log`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 /* ── Tabs ──────────────────────────────────────────────────────────── */
 
 function switchTab(tab) {
@@ -1362,11 +1494,22 @@ function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((btn) => {
     btn.classList.toggle('tab-active', btn.dataset.tab === tab);
   });
-  ['monitor', 'orders', 'analytics'].forEach((name) => {
+  ['monitor', 'orders', 'analytics', 'logs'].forEach((name) => {
     $(`view-${name}`).classList.toggle('hidden', name !== tab);
   });
   if (tab === 'orders') renderOrders();
   if (tab === 'analytics') renderCalendar();
+  // The log tail is only interesting on its own tab, and each refresh costs a
+  // file read, so the interval lives and dies with the tab.
+  clearInterval(state.logTimer);
+  state.logTimer = null;
+  if (tab === 'logs') {
+    // Refresh immediately so the tab is never shown empty for a whole interval.
+    loadLogs().catch(() => { /* the previous tail stays on screen */ });
+    state.logTimer = setInterval(() => {
+      loadLogs().catch(() => { /* keep the last tail */ });
+    }, LOG_MS);
+  }
 }
 
 /* ── Wiring ────────────────────────────────────────────────────────── */
@@ -1388,6 +1531,33 @@ function init() {
   $('btn-resume').addEventListener('click', togglePause);
   $('btn-panic').addEventListener('click', panic);
   $('btn-orders-csv').addEventListener('click', exportCsv);
+
+  $('logs-level').addEventListener('change', () => {
+    loadLogs().catch((error) => toast(`Logs: ${error.message}`, 'err'));
+  });
+  let logSearchTimer = null;
+  $('logs-search').addEventListener('input', () => {
+    clearTimeout(logSearchTimer);
+    logSearchTimer = setTimeout(() => {
+      loadLogs().catch((error) => toast(`Logs: ${error.message}`, 'err'));
+    }, 200);
+  });
+  $('logs-wrap').addEventListener('change', (event) => {
+    $('logs-viewport').classList.toggle('is-wrapped', event.target.checked);
+  });
+  $('btn-logs-copy').addEventListener('click', copyLogs);
+  $('btn-logs-download').addEventListener('click', downloadLogs);
+  $('logs-viewport').addEventListener('scroll', () => {
+    // Unchecking Follow on manual scroll is the standard tail behaviour: it
+    // makes "I am reading this line" explicit instead of guessing.
+    if (!logsAtBottom($('logs-viewport'))) $('logs-follow').checked = false;
+  });
+  $('logs-follow').addEventListener('change', (event) => {
+    if (event.target.checked) {
+      const viewport = $('logs-viewport');
+      viewport.scrollTop = viewport.scrollHeight;
+    }
+  });
 
   $('cal-prev').addEventListener('click', () => shiftCalendarMonth(-1));
   $('cal-next').addEventListener('click', () => shiftCalendarMonth(1));
@@ -1418,10 +1588,15 @@ function init() {
     if (document.hidden) {
       clearInterval(state.timer);
       clearInterval(state.tickTimer);
+      clearInterval(state.logTimer);
     } else {
       poll();
       state.timer = setInterval(poll, POLL_MS);
       state.tickTimer = setInterval(tickCountdown, TICK_MS);
+      if (state.tab === 'logs') {
+        loadLogs().catch(() => { /* keep the last tail */ });
+        state.logTimer = setInterval(loadLogs, LOG_MS);
+      }
     }
   });
 

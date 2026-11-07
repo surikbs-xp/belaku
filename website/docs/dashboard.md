@@ -37,18 +37,38 @@ held, deferred, and **why**. CSV export.
 Headline stats, a P&L calendar (green/red day cells with trade count and win
 rate, holiday cells for NSE closures), and the trade ledger.
 
+### Logs
+
+The running process's log file, colour-coded by level (`ERROR` rows are tinted
+red so a bad night is scannable rather than readable).
+
+- **Level filter** is a *minimum* — `Warning +` also shows errors and criticals.
+- **Tracebacks stay attached** to the `ERROR` above them, so filtering by level
+  never leaves orphaned stack frames.
+- **Search** filters the already-tailed lines by substring.
+- **Follow** sticks to the newest line and unchecks itself when you scroll up,
+  so a refresh does not yank the view away from what you are reading.
+- **Wrap** re-flows long lines; off by default so columns stay aligned.
+- **Copy** / **Download** take the currently filtered tail.
+
+Credentials are masked server-side (`access_token=***`) before the lines are
+sent, because this page is unauthenticated. See
+[API → `/api/logs`](/api#status) for the details.
+
 ## Polling
 
 | Cadence | Endpoints |
 |---|---|
 | 1.5 s | `/api/status`, `/api/portfolio` |
+| 3 s | `/api/logs` — **only while the Logs tab is open** |
 | 5 s | positions, orders, trades, signals |
 | 20 s | Kite token health, LIVE readiness |
 | 60 s | calendar rollup, holidays |
 
 Polling pauses while the tab is hidden and resumes on focus. If the API goes
 away the UI keeps the last values on screen, flags the failure, and recovers on
-its own.
+its own. The log tail has its own interval that starts when you open the Logs
+tab and stops when you leave it, so an idle dashboard never touches the file.
 
 ## Design notes
 
@@ -74,8 +94,8 @@ proxy before exposing it — anyone who can reach `/api/panic` or
 `index.html` links assets with a version query:
 
 ```html
-<link rel="stylesheet" href="/static/styles.css?v=trader-6" />
-<script src="/static/app.js?v=trader-6" defer></script>
+<link rel="stylesheet" href="/static/styles.css?v=trader-7" />
+<script src="/static/app.js?v=trader-7" defer></script>
 ```
 
 :::warning[Bump the version when you change CSS or JS]
