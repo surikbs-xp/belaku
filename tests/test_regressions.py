@@ -711,7 +711,7 @@ def test_after_hours_paper_engine_pnl_uses_gift_mark(monkeypatch, tmp_path) -> N
     class FakeClient:
         mode = PAPER
 
-        def get_ltp(self, _symbol):
+        def get_ltp(self, _symbol, max_age=None):
             return 110.0
 
         def instrument_for_symbol(self, _symbol):
@@ -763,7 +763,7 @@ def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_p
     class FakeClient:
         mode = PAPER
 
-        def get_ltp(self, _symbol):
+        def get_ltp(self, _symbol, max_age=None):
             return 25_000.0
 
         def place_order(self, **kwargs):
@@ -1007,7 +1007,7 @@ def test_open_ack_does_not_create_position(monkeypatch, tmp_path) -> None:
     class FakeClient:
         mode = PAPER
 
-        def get_ltp(self, symbol):
+        def get_ltp(self, symbol, max_age=None):
             return 100.0
 
         def place_order(self, **kwargs):
@@ -1053,7 +1053,7 @@ def test_rejected_square_off_reports_failure_and_keeps_position(monkeypatch, tmp
     class FakeClient:
         mode = PAPER
 
-        def get_ltp(self, symbol):
+        def get_ltp(self, symbol, max_age=None):
             return 100.0
 
         def place_order(self, **kwargs):
@@ -1221,3 +1221,93 @@ def test_market_status_opens_on_a_normal_session(monkeypatch, tmp_path) -> None:
 
     assert status["is_open"] is True
     assert status["calendar_known"] is True
+
+
+def _stub_client(calls: dict[str, int]) -> KiteClient:
+    """A KiteClient whose SDK calls are counted instead of hitting the network."""
+    client = KiteClient(api_key="key", access_token="token")
+    client._kite = SimpleNamespace(
+        profile=lambda: calls.__setitem__("profile", calls.get("profile", 0) + 1)
+        or {"user_id": "AB1234"},
+        margins=lambda: calls.__setitem__("margins", calls.get("margins", 0) + 1)
+        or {"equity": {"available": {"live_balance": 1000.0}}},
+        quote=lambda keys: calls.__setitem__("quote", calls.get("quote", 0) + 1)
+        or {keys[0]: {"last_price": 25_000.0, "ohlc": {"close": 24_900.0}}},
+    )
+    return client
+
+
+def test_profile_is_cached_between_dashboard_polls() -> None:
+    calls: dict[str, int] = {}
+    client = _stub_client(calls)
+
+    for _ in range(5):
+        assert client.auth_status()["authenticated"] is True
+
+    assert calls["profile"] == 1
+    # max_age=0 must always reach the broker (used after a token change).
+    client.profile(max_age=0)
+    assert calls["profile"] == 2
+
+
+def test_margins_are_cached_between_dashboard_polls() -> None:
+    calls: dict[str, int] = {}
+    client = _stub_client(calls)
+
+    for _ in range(5):
+        assert client.available_cash() == 1000.0
+
+    assert calls["margins"] == 1
+
+
+def test_quote_cache_is_shared_but_orders_can_bypass_it() -> None:
+    calls: dict[str, int] = {}
+    client = _stub_client(calls)
+
+    for _ in range(5):
+        assert client.get_ltp("NIFTY26KFUT") == 25_000.0
+    assert calls["quote"] == 1
+
+    # An order needs the freshest price, so it must not read the cache.
+    client.get_ltp("NIFTY26KFUT", max_age=0)
+    assert calls["quote"] == 2
+
+
+def test_engine_status_reuses_the_verdict_until_a_new_bar(monkeypatch) -> None:
+    evaluations: list[int] = []
+
+    class FakeFeed:
+        seconds = 300
+
+        def refresh_history(self, force: bool = False):
+            return 0
+
+        def candle_snapshot(self):
+            return (
+                [
+                    {"time": f"2026-11-06T22:{minute:02d}:00+05:30", "open": 100.0,
+                     "high": 101.0, "low": 99.0, "close": 100.5}
+                    for minute in range(20)
+                ],
+                False,
+            )
+
+        def status(self):
+            return {}
+
+    def fake_evaluate(candles, _params):
+        evaluations.append(len(candles))
+        return strategy.StrategyVerdict(strategy.NEUTRAL, 100.5, values={"psar": 99.0})
+
+    monkeypatch.setattr(engine, "get_feed", FakeFeed)
+    monkeypatch.setattr(engine.strategy, "evaluate", fake_evaluate)
+    monkeypatch.setattr(engine, "required_bars", lambda: 2)
+    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False})
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+
+    subject = engine.StrategyEngine()
+    for _ in range(5):
+        subject.status()
+
+    # Two slots (current + previous), each evaluated once for the same bar.
+    assert len(evaluations) == 2
