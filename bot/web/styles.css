@@ -434,16 +434,6 @@ body {
 .indicator-value-sm { font-size: 0.86rem; font-weight: 600; color: var(--ink-1); }
 
 /* Three-segment vote bar mirroring the 2-of-3 rule. */
-.st-votes { display: flex; gap: 3px; margin: 0.35rem 0 0.1rem; }
-.st-vote {
-  height: 0.3rem;
-  flex: 1 1 0;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.22);
-}
-.st-vote.bull { background: var(--good); }
-.st-vote.bear { background: var(--bad); }
-
 /* ── Account metrics ───────────────────────────────────────────────── */
 .metric-grid {
   display: grid;
@@ -865,15 +855,19 @@ select.field { appearance: none; }
 .vote-seg.bull { background: var(--good); }
 .vote-seg.bear { background: var(--bad); }
 
-/* Per-vote caption: which SuperTrend instance each segment represents. */
+/* Per-vote caption: the SuperTrend level for each instance, so a number sits
+   directly beneath the segment that voted it. `.vote-bar` and `.vote-legend`
+   must keep identical `gap` and equal-flex children for that alignment to hold;
+   the negative margin pulls the caption under the bar's own margin. */
 .vote-legend {
   display: flex;
   gap: 6px;
-  margin-top: 0.3rem;
+  margin-top: -0.15rem;
 }
 
 .vote-legend span {
   flex: 1 1 0;
+  min-width: 0;
   text-align: center;
   font-size: 0.66rem;
   letter-spacing: 0.02em;

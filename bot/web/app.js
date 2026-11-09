@@ -523,16 +523,16 @@ function renderEngine(eng, market) {
     setText('e-st-sub', stConfig.length
       ? stConfig.map((item) => `${item.length}×${Number(item.multiplier)}`).join(' · ')
       : '—');
-    renderVotes('st-votes', values.supertrend_bull, values.supertrend_bear, stTotal);
-    renderVoteLegend('st-legend', stConfig, values);
+    // The bar, its captions and the count above all come from the same
+    // index-aligned list, so they cannot disagree about which instance voted.
+    renderStVotes(stConfig, values);
     // PSAR is a single binary check: close above SAR is bullish.
     const psarAbove = !!psarConditions.buy_psar;
     const psarBelow = !!psarConditions.sell_psar;
     renderVotes('psar-votes', psarAbove ? 1 : 0, psarBelow ? 1 : 0, 1);
   } else {
     ['e-psar', 'e-st'].forEach((id) => setText(id, '—'));
-    renderVotes('st-votes', 0, 0, state.strategyConfig?.supertrends?.length || 3);
-    renderVoteLegend('st-legend', state.strategyConfig?.supertrends || [], {});
+    renderStVotes(state.strategyConfig?.supertrends || [], {});
     renderVotes('psar-votes', 0, 0, 1);
   }
 
@@ -546,10 +546,10 @@ function renderEngine(eng, market) {
 }
 
 /**
- * Segmented green/red vote bar. `segments` slots are drawn: green for each
- * bullish vote, red for each bearish vote, then grey placeholders — so both the
- * count and the direction read from one visual language. SuperTrend uses three
- * slots (2-of-3 rule), PSAR uses one (a single price-position check).
+ * Segmented green/red vote bar for a single count-based check (PSAR). `segments`
+ * slots are drawn: green for each bullish vote, red for each bearish vote, then
+ * grey placeholders — so both the count and the direction read from one visual
+ * language. PSAR uses one slot because it is a single price-position check.
  */
 function renderVotes(id, bull, bear, segments) {
   const host = $(id);
@@ -571,22 +571,54 @@ function renderVotes(id, bull, bear, segments) {
 }
 
 /**
- * Value caption under the vote bar: the SuperTrend line for each instance, so
- * the number sits directly beneath the segment that voted it. The period and
- * multiplier move to the sub-line instead of repeating here.
+ * SuperTrend vote bar and its per-instance captions, built in one pass so a
+ * segment can never be coloured differently from its caption.
+ *
+ * `config` is index-aligned with `values.supertrend_config` — both come from
+ * `strategy_params()` in the same order — so `item.direction` is the exact
+ * direction that produced segment *i*, and `item.key` is the exact value
+ * rendered beneath it. Deriving the count and the colours from one source is
+ * what keeps the bar consistent with the caption and with the "N/3 bullish"
+ * headline; filling the bar from aggregate bull/bear counts instead would place
+ * the votes in a different order and mis-colour them.
+ *
+ * Empty directions (warm-up, or a missing config) draw unfilled slots, so the
+ * bar still reserves the right number of cells.
  */
-function renderVoteLegend(id, config, values) {
-  const host = $(id);
-  if (!host) return;
-  if (!Array.isArray(config) || !config.length) {
-    host.innerHTML = '';
-    return;
+function renderStVotes(config, values) {
+  const bar = $('st-votes');
+  const legend = $('st-legend');
+  if (!bar) return;
+  const items = Array.isArray(config) ? config : [];
+  const segments = Math.max(items.length, 1);
+
+  if (bar.childElementCount !== segments) {
+    bar.innerHTML = Array(segments)
+      .fill('<span class="vote-seg"></span>')
+      .join('');
   }
-  host.innerHTML = config.map((item) => {
+  Array.from(bar.children).forEach((seg, i) => {
+    const item = items[i];
+    const direction = item ? num(item.direction) : null;
+    // Both producers agree: negative direction is bullish, positive bearish.
+    const kind = direction === null || direction === 0
+      ? ''
+      : direction < 0 ? 'bull' : 'bear';
+    seg.classList.toggle('bull', kind === 'bull');
+    seg.classList.toggle('bear', kind === 'bear');
+    seg.title = item
+      ? `${item.length}×${Number(item.multiplier)} · ${kind === 'bull' ? 'bullish' : kind === 'bear' ? 'bearish' : 'flat'}`
+      : '';
+  });
+
+  if (!legend) return;
+  legend.innerHTML = items.map((item) => {
     const direction = num(item.direction);
-    const kind = direction === null || direction === 0 ? '' : direction < 0 ? 'bull' : 'bear';
+    const kind = direction === null || direction === 0
+      ? ''
+      : direction < 0 ? 'bull' : 'bear';
     const label = `${item.length}×${Number(item.multiplier)}`;
-    return `<span class="${kind}" title="${label} · ${direction < 0 ? 'bullish' : direction > 0 ? 'bearish' : 'flat'}">${level(values[item.key])}</span>`;
+    return `<span class="${kind}" title="${label} · ${kind === 'bull' ? 'bullish' : kind === 'bear' ? 'bearish' : 'flat'}">${level(values[item.key])}</span>`;
   }).join('');
 }
 
