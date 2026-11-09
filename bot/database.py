@@ -109,7 +109,11 @@ CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
 -- a fallback. This table also lets the strategy survive a restart instead of
 -- re-accumulating its warm-up from scratch.
 CREATE TABLE IF NOT EXISTS gift_candles (
-    start                 TEXT PRIMARY KEY,
+    start                 TEXT NOT NULL,
+    -- Timeframe this bar was built at. Part of the key, not just a column: a
+    -- 5-minute and a 15-minute bucket can both start at 10:00 but cover
+    -- different windows, so `start` alone cannot separate them.
+    interval              TEXT NOT NULL DEFAULT '5minute',
     open                  REAL NOT NULL,
     high                  REAL NOT NULL,
     low                   REAL NOT NULL,
@@ -118,9 +122,12 @@ CREATE TABLE IF NOT EXISTS gift_candles (
     ticks                 INTEGER NOT NULL DEFAULT 0,
     created_at            TEXT NOT NULL,
     -- 0 complete; 1 missing ticks inside the bar; 2 cut off by a shutdown.
-    partial               INTEGER NOT NULL DEFAULT 0
+    partial               INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (start, interval)
 );
 CREATE INDEX IF NOT EXISTS idx_gift_candles_start ON gift_candles (start DESC);
+-- The interval index is created by _migrate(), not here: SCHEMA runs before the
+-- migration, so on an existing database the column would not exist yet.
 
 -- Trader journal. One row per closed trade, keyed by trade id, holding the
 -- discretionary context a ledger can't derive: why the trade was taken, how it
@@ -149,6 +156,69 @@ def iso(dt: Optional[datetime] = None) -> str:
 _in_init_db = False
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current schema.
+
+    ``CREATE TABLE IF NOT EXISTS`` in SCHEMA handles new databases but silently
+    does nothing for an existing table, so columns added after a database was
+    first created have to be applied here.
+    """
+    info = list(conn.execute("PRAGMA table_info(gift_candles)"))
+    columns = {row[1] for row in info}
+
+    if "partial" not in columns:
+        conn.execute(
+            "ALTER TABLE gift_candles ADD COLUMN partial INTEGER NOT NULL DEFAULT 0"
+        )
+    if "interval" not in columns:
+        # Rows written before this column existed were all built at the then-only
+        # interval, so the default describes them truthfully rather than guessing.
+        conn.execute(
+            "ALTER TABLE gift_candles ADD COLUMN interval TEXT NOT NULL DEFAULT '5minute'"
+        )
+
+    # The interval has to be part of the primary key, not just a column. With
+    # `start` alone as the key a 15-minute bar at 10:00 overwrites the 5-minute
+    # bar at 10:00, because a coarser bar always begins on a finer bar's start.
+    # Switching timeframe would then silently destroy the other series.
+    key = {row[1] for row in info if row[5]}  # row[5] is the pk ordinal
+    if key == {"start"}:
+        conn.execute("ALTER TABLE gift_candles RENAME TO gift_candles_old")
+        conn.execute(
+            """
+            CREATE TABLE gift_candles (
+                start       TEXT NOT NULL,
+                interval    TEXT NOT NULL DEFAULT '5minute',
+                open        REAL NOT NULL,
+                high        REAL NOT NULL,
+                low         REAL NOT NULL,
+                close       REAL NOT NULL,
+                volume      REAL NOT NULL DEFAULT 0,
+                ticks       INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                partial     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (start, interval)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO gift_candles
+                (start, interval, open, high, low, close, volume, ticks, created_at, partial)
+            SELECT start, COALESCE(interval, '5minute'),
+                   open, high, low, close, volume, ticks, created_at, COALESCE(partial, 0)
+            FROM gift_candles_old
+            """
+        )
+        conn.execute("DROP TABLE gift_candles_old")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gift_candles_start ON gift_candles (start DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gift_candles_interval "
+        "ON gift_candles (interval, start DESC)"
+    )
+
+
 def _connect(path: Optional[str] = None) -> sqlite3.Connection:
     """Open a connection, creating the schema on first touch.
 
@@ -168,6 +238,7 @@ def _connect(path: Optional[str] = None) -> sqlite3.Connection:
         _in_init_db = True
         try:
             conn.executescript(SCHEMA)
+            _migrate(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO account (id, initial_balance, balance, updated_at) "
                 "VALUES (1, ?, ?, ?)",
@@ -201,11 +272,7 @@ def init_db(path: Optional[str] = None, initial_balance: Optional[float] = None)
     conn = _connect(path)
     try:
         conn.executescript(SCHEMA)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(gift_candles)")}
-        if "partial" not in columns:
-            conn.execute(
-                "ALTER TABLE gift_candles ADD COLUMN partial INTEGER NOT NULL DEFAULT 0"
-            )
+        _migrate(conn)
         conn.execute(
             "INSERT OR IGNORE INTO account (id, initial_balance, balance, updated_at) "
             "VALUES (1, ?, ?, ?)",
@@ -510,29 +577,49 @@ def record_gift_candle(
     volume: float = 0.0,
     ticks: int = 0,
     partial: int = 0,
+    interval: str = "5minute",
     path: Optional[str] = None,
 ) -> None:
-    """Upsert one GIFT Nifty bar (``start`` is the bucket timestamp)."""
+    """Upsert one GIFT Nifty bar (``start`` is the bucket timestamp).
+
+    ``interval`` records the timeframe the bar was built at. Bars of different
+    intervals do not share a series - a 5-minute bucket and a 15-minute bucket
+    can start at the same instant but cover different windows - so the column
+    keeps them from being mixed when the configured interval changes. The
+    default mirrors the column default and the only interval that predates it.
+    """
     init_db(path)
     with session(path) as conn:
         conn.execute(
             "INSERT INTO gift_candles "
-            "(start, open, high, low, close, volume, ticks, created_at, partial) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(start) DO UPDATE SET open=excluded.open, high=excluded.high, "
-            "low=excluded.low, close=excluded.close, volume=excluded.volume, "
-            "ticks=excluded.ticks, partial=excluded.partial",
-            (start, open_, high, low, close, volume, ticks, iso(), partial),
+            "(start, interval, open, high, low, close, volume, ticks, created_at, partial) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(start, interval) DO UPDATE SET open=excluded.open, "
+            "high=excluded.high, low=excluded.low, close=excluded.close, "
+            "volume=excluded.volume, ticks=excluded.ticks, partial=excluded.partial",
+            (start, interval, open_, high, low, close, volume, ticks, iso(), partial),
         )
 
 
 def get_gift_candles(
-    limit: int = 2000, path: Optional[str] = None
+    limit: int = 2000, path: Optional[str] = None, interval: str = ""
 ) -> list[dict[str, Any]]:
-    """Persisted GIFT Nifty bars in chronological order (oldest first)."""
-    rows = _fetch_all(
-        "SELECT * FROM gift_candles ORDER BY start DESC LIMIT ?", [limit], path
-    )
+    """Persisted GIFT Nifty bars in chronological order (oldest first).
+
+    When ``interval`` is given, only bars built at that timeframe are returned.
+    Without the filter a change of configured interval would splice two
+    different candle series together and the indicators would run on garbage.
+    """
+    if interval:
+        rows = _fetch_all(
+            "SELECT * FROM gift_candles WHERE interval = ? ORDER BY start DESC LIMIT ?",
+            [interval, limit],
+            path,
+        )
+    else:
+        rows = _fetch_all(
+            "SELECT * FROM gift_candles ORDER BY start DESC LIMIT ?", [limit], path
+        )
     return list(reversed(rows))
 
 

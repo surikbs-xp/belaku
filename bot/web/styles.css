@@ -1276,3 +1276,50 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
 }
 
 .risk-banner.hidden { display: none; }
+
+/* Execution future, shown beneath GIFT Nifty inside the same panel so the
+   basis between the two prices reads at a glance. Tabular numerals keep the
+   price from shifting width as ticks arrive. */
+.exec-quote {
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--edge-soft);
+}
+
+.exec-quote-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.exec-quote-symbol {
+  font-size: 0.68rem;
+  color: var(--ink-3);
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.exec-quote-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-top: 0.1rem;
+}
+
+.exec-quote-price {
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  color: var(--ink-0);
+}
+
+.exec-quote-basis {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}

@@ -294,9 +294,26 @@ class StrategyEngine:
             verdict.detail,
             paper_reference_price=verdict.close,
             signal_timestamp=closed_at,
+            max_age_seconds=self._signal_max_age(),
         )
         return {"ok": True, "signal": signal, "detail": verdict.detail, "action": action,
                 "result": result}
+
+    def _signal_max_age(self) -> int:
+        """How stale a signal may be before the broker refuses it.
+
+        A signal is stamped with the close of the bar that produced it, so it
+        arrives already one bar old. The limit therefore has to exceed the bar
+        length, not sit under it: at 15-minute bars a fixed 300s rejects the
+        engine's own fresh signals, and the harder it is to satisfy the longer
+        the bar. One and a half bars covers the engine poll and execution while
+        still refusing anything that outlived a full bar plus half.
+        """
+        try:
+            seconds = settings.gift_candle_interval_seconds
+        except Exception:  # pragma: no cover - defensive
+            seconds = 900
+        return max(300, int(seconds * 1.5))
 
     # -- execution -------------------------------------------------------
     def execute(
@@ -306,6 +323,7 @@ class StrategyEngine:
         *,
         paper_reference_price: Optional[float] = None,
         signal_timestamp: Optional[datetime] = None,
+        max_age_seconds: Optional[int] = None,
     ) -> dict[str, Any]:
         """Place a signal, using a GIFT-close fill only for after-hours PAPER."""
         manager = get_order_manager()
@@ -366,7 +384,7 @@ class StrategyEngine:
             "source": "GIFT_NIFTY_ENGINE",
             "gift_detail": detail,
             "paper_after_hours": paper_after_hours,
-            "max_age_seconds": 300,
+            "max_age_seconds": max_age_seconds or self._signal_max_age(),
         }
         if signal_timestamp is not None:
             payload["timestamp"] = signal_timestamp.astimezone(IST).isoformat()

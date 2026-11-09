@@ -129,7 +129,7 @@ class Settings:
     # truth) and falls back to building them from live NSEIX ticks only while
     # history is unavailable, then evaluates st.pine on them. This interval must
     # match the timeframe the Pine strategy was tuned on.
-    gift_candle_interval: str = _env("GIFT_CANDLE_INTERVAL", "5minute")
+    gift_candle_interval: str = _env("GIFT_CANDLE_INTERVAL", "15minute")
 
     # --- Engine loop ------------------------------------------------------
     # How often the mark loop updates PnL/equity and the strategy engine checks
@@ -142,6 +142,13 @@ class Settings:
     extras: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
+    @property
+    def gift_candle_interval_seconds(self) -> int:
+        """Bar length in seconds, derived from ``GIFT_CANDLE_INTERVAL``."""
+        import gift_nifty  # local: gift_nifty imports this module
+
+        return gift_nifty.interval_to_seconds(self.gift_candle_interval)
+
     @property
     def is_live_configured(self) -> bool:
         return bool(self.api_key and _env("KITE_ACCESS_TOKEN", self.access_token) and self.api_secret)

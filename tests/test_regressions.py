@@ -2143,3 +2143,265 @@ def test_watchdog_survives_a_failing_webhook() -> None:
         wd.run_once(**unhealthy)
 
     assert wd.state.alerts_sent == 1
+
+
+# ---------------------------------------------------------------------------
+# Execution future ticks (shown beside GIFT Nifty on the dashboard)
+# ---------------------------------------------------------------------------
+def test_execution_ticks_do_not_reach_the_gift_candle_builder() -> None:
+    """The two prices differ by the basis, so routing an execution tick into
+    the builder would corrupt the signal series rather than fail loudly."""
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+
+    feed._handle_ticks(None, [
+        {"instrument_token": 222, "last_price": 25060.0},
+    ])
+
+    assert feed.last_price is None
+    assert feed.tick_count == 0
+    assert feed._builder.current is None
+    assert feed.exec_last_price == 25060.0
+    assert feed.exec_ticks == 1
+
+
+def test_gift_and_execution_ticks_are_kept_apart() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+
+    feed._handle_ticks(None, [
+        {"instrument_token": 111, "last_price": 25000.0},
+        {"instrument_token": 222, "last_price": 25060.0},
+        {"instrument_token": 111, "last_price": 25001.0},
+    ])
+
+    assert feed.last_price == 25001.0
+    assert feed.tick_count == 2
+    assert feed.exec_last_price == 25060.0
+    assert feed.exec_ticks == 1
+
+
+def test_a_tick_without_a_token_counts_as_gift() -> None:
+    """Every existing caller and test sends a bare tick, so the default must
+    stay GIFT - the series that must never be disturbed."""
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+
+    feed._handle_ticks(None, [{"last_price": 25000.0}])
+
+    assert feed.last_price == 25000.0
+    assert feed.exec_last_price is None
+
+
+def test_exec_quote_reports_provenance_and_the_basis_inputs() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+    feed._handle_ticks(None, [
+        {"instrument_token": 111, "last_price": 25000.0},
+        {"instrument_token": 222, "last_price": 25060.0},
+    ])
+
+    exec_quote = feed.status()["exec"]
+
+    assert exec_quote["symbol"] == "NIFTY26KFUT"
+    assert exec_quote["price"] == 25060.0
+    assert exec_quote["source"] == "tick"
+    assert exec_quote["subscribed"] is True
+    assert exec_quote["ticks"] == 1
+    assert exec_quote["age_seconds"] is not None
+
+
+def test_exec_quote_is_safe_before_any_tick() -> None:
+    feed = GiftNiftyFeed("1minute")
+
+    exec_quote = feed.status()["exec"]
+
+    assert exec_quote["price"] is None
+    assert exec_quote["age_seconds"] is None
+    assert exec_quote["source"] == "none"
+    assert exec_quote["subscribed"] is False
+
+
+def test_unresolved_execution_token_falls_back_to_polling(monkeypatch) -> None:
+    """A future that cannot be resolved must not leave the card blank: the
+    mark loop polls a quote instead of relying on a subscription."""
+    feed = GiftNiftyFeed("1minute")
+    monkeypatch.setattr(feed, "current_exec_symbol", lambda: "NIFTY26KFUT")
+
+    feed.set_exec_token("NIFTY26KFUT", None)
+    assert feed.exec_source == "poll"
+
+    monkeypatch.setattr(
+        gift_nifty, "get_client", lambda: SimpleNamespace(get_ltp=lambda s: 25060.0)
+    )
+    feed.refresh_exec_quote()
+
+    assert feed.exec_last_price == 25060.0
+    assert feed.status()["exec"]["source"] == "poll"
+
+
+def test_tick_source_wins_over_a_later_poll(monkeypatch) -> None:
+    """Once real ticks arrive, a polled quote should not relabel the source."""
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+    feed._handle_ticks(None, [{"instrument_token": 222, "last_price": 25060.0}])
+
+    monkeypatch.setattr(
+        gift_nifty, "get_client", lambda: SimpleNamespace(get_ltp=lambda s: 25061.0)
+    )
+    feed.refresh_exec_quote()
+
+    assert feed.exec_last_price == 25061.0
+    assert feed.status()["exec"]["source"] == "tick"
+
+
+def test_future_symbol_matches_kites_instrument_dump() -> None:
+    """Kite's NFO dump uses three-letter months (NIFTY26NOVFUT). The older
+    single-letter form (NIFTY26KFUT) matched nothing, so the token could not be
+    resolved and PAPER mode reported a contract that does not exist."""
+    from kite_client import future_symbol
+
+    assert future_symbol(datetime(2026, 11, 9, tzinfo=IST)) == "NIFTY26NOVFUT"
+    assert future_symbol(datetime(2026, 12, 9, tzinfo=IST)) == "NIFTY26DECFUT"
+    assert future_symbol(datetime(2026, 1, 9, tzinfo=IST)) == "NIFTY26JANFUT"
+    # No single-letter month code may survive anywhere in the symbol.
+    symbol = future_symbol(datetime(2026, 5, 9, tzinfo=IST))
+    assert symbol == "NIFTY26MAYFUT"
+
+
+def test_future_symbol_rolls_to_the_next_contract(monkeypatch) -> None:
+    """After the front-month expiry the next contract becomes current, and the
+    months_ahead form must agree with it."""
+    from kite_client import future_symbol
+
+    now = datetime(2026, 11, 9, tzinfo=IST)
+    assert future_symbol(now, months_ahead=0) == "NIFTY26NOVFUT"
+    assert future_symbol(now, months_ahead=1) == "NIFTY26DECFUT"
+    assert future_symbol(now, months_ahead=2) == "NIFTY27JANFUT"
+
+
+# ---------------------------------------------------------------------------
+# Candle interval isolation
+# ---------------------------------------------------------------------------
+def test_candles_of_different_intervals_do_not_mix(monkeypatch, tmp_path) -> None:
+    """A 5-minute and a 15-minute bucket can both start at 10:00 but cover
+    different windows, so `start` alone cannot separate them. Without the
+    interval column a timeframe change would splice two series together and the
+    indicators would run on garbage."""
+    use_test_database(monkeypatch, tmp_path)
+    start = "2026-11-06T10:00:00+05:30"
+
+    db.record_gift_candle(
+        start=start, open_=100.0, high=102.0, low=99.0, close=101.0, interval="5minute"
+    )
+    db.record_gift_candle(
+        start=start, open_=200.0, high=205.0, low=198.0, close=204.0, interval="15minute"
+    )
+
+    assert [r["close"] for r in db.get_gift_candles(interval="5minute")] == [101.0]
+    assert [r["close"] for r in db.get_gift_candles(interval="15minute")] == [204.0]
+    # Unfiltered still returns everything, which is what the count uses.
+    assert len(db.get_gift_candles()) == 2
+
+
+def test_feed_only_loads_its_own_interval(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    db.record_gift_candle(
+        start="2026-11-06T09:00:00+05:30",
+        open_=100.0, high=101.0, low=99.0, close=100.5, interval="5minute",
+    )
+    db.record_gift_candle(
+        start="2026-11-06T10:00:00+05:30",
+        open_=200.0, high=201.0, low=199.0, close=200.5, interval="15minute",
+    )
+
+    feed = GiftNiftyFeed("15minute")
+    feed.load_persisted()
+
+    times = [c["time"] for c in feed.candles()]
+    assert times == ["2026-11-06T10:00:00+05:30"]
+
+
+def test_default_candle_interval_is_fifteen_minutes() -> None:
+    """The strategy timeframe is configuration, but the shipped default must
+    match the .env.example value so a fresh install is self-consistent."""
+    from config import Settings
+
+    assert Settings().gift_candle_interval == "15minute"
+
+
+def test_interval_to_seconds_maps_fifteen_minutes() -> None:
+    from gift_nifty import interval_to_seconds
+
+    assert interval_to_seconds("15minute") == 900
+    assert interval_to_seconds("5minute") == 300
+    assert interval_to_seconds("1hour") == 3600
+
+
+
+def test_settings_exposes_bar_length_in_seconds() -> None:
+    """The staleness limit is derived from the bar length, so the length has to
+    be reachable as a number without repeating the interval table."""
+    assert Settings(gift_candle_interval="15minute").gift_candle_interval_seconds == 900
+    assert Settings(gift_candle_interval="5minute").gift_candle_interval_seconds == 300
+    assert Settings(gift_candle_interval="1hour").gift_candle_interval_seconds == 3600
+
+
+def test_signal_max_age_outlives_the_bar(monkeypatch) -> None:
+    """A signal is stamped with the *close* of its bar, so it is already one bar
+    old on arrival. A fixed 300s limit rejected the engine's own fresh signals
+    once the timeframe moved to 15 minutes (they arrived ~717s old)."""
+    eng = engine.StrategyEngine.__new__(engine.StrategyEngine)
+
+    def with_bar(seconds: int) -> int:
+        monkeypatch.setattr(
+            engine, "settings", SimpleNamespace(gift_candle_interval_seconds=seconds)
+        )
+        return eng._signal_max_age()
+
+    assert with_bar(300) == 450      # 5-minute bars
+    assert with_bar(900) == 1350     # 15-minute bars, the shipped default
+    assert with_bar(60) == 300       # floor: the limit only ever loosens
+
+
+def test_engine_payload_carries_the_bar_scaled_max_age(monkeypatch) -> None:
+    """The broker falls back to its own 300s default when the payload omits the
+    limit, so the engine must send the scaled one."""
+    captured = {}
+
+    class FakeResult:
+        ok = True
+        reason = "simulated"
+
+        def to_dict(self):
+            return {"ok": True, "action": "BUY"}
+
+    class FakeManager:
+        paused = False
+
+        def current_symbol(self):
+            return "NIFTY26NOVFUT"
+
+        def process_signal(self, payload, source):
+            captured.update(payload=payload)
+            return FakeResult()
+
+    monkeypatch.setattr(
+        engine, "settings",
+        SimpleNamespace(gift_candle_interval_seconds=900, default_lots=1),
+    )
+    monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False, "reason": "Post-market"})
+    monkeypatch.setattr(engine, "get_order_manager", lambda: FakeManager())
+
+    engine.StrategyEngine().execute(
+        "BUY", "15m bar closed",
+        paper_reference_price=25_100.0,
+        signal_timestamp=datetime.now(IST),
+    )
+    assert captured["payload"]["max_age_seconds"] == 1350

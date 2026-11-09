@@ -15,9 +15,15 @@ The trading view. Top to bottom:
 
 - **Signal hero** — the current verdict (BULL / BEAR / NEUTRAL), accented by
   state, with the close, PSAR and SuperTrend vote counts.
-- **Candle countdown** — time until the current 5-minute bar closes, anchored to
+- **Candle countdown** — time until the current GIFT Nifty bar closes (the label
+  follows `GIFT_CANDLE_INTERVAL`), anchored to
   the server's bucket start so a skewed client clock cannot shift it.
-- **GIFT Nifty quote** — the signal source, with a client-side sparkline.
+- **GIFT Nifty quote** — the signal source, with a client-side sparkline, and
+  the execution future's ticks directly beneath it. The basis between the two
+  (future minus GIFT) is shown next to the price, because that is what the
+  signal has to overcome before a trade is profitable. The line under it says
+  whether the number came from a live tick or a polled quote, and flags it as
+  stale after 60 seconds.
 - **Execution panel** — the Nifty future, lots, product.
 - **Live indicators** — SuperTrend vote bar (one segment per instance, labelled
   with its line value) and Parabolic SAR.

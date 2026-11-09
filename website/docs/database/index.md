@@ -75,7 +75,8 @@ Two of these deserve emphasis:
 
 **`gift_candles` is why a restart is cheap.** The indicators are recursive, so
 they need history. Without this table the bot would re-accumulate its warm-up
-from scratch after every restart — about 70 minutes at `5minute`. Instead it
+from scratch after every restart — about 70 minutes at `5minute`, 3.5 hours at
+`15minute`. Instead it
 loads the persisted bars and is immediately ready.
 
 **`signals` records refusals, not just successes.** A quiet bot is the hardest

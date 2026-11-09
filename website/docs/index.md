@@ -42,7 +42,7 @@ session rather than firing them late.
 
 | | |
 |---|---|
-| **Signal source** | `NSEIX:GIFT NIFTY`, 5-minute bars from Kite history |
+| **Signal source** | `NSEIX:GIFT NIFTY`, 15-minute bars from Kite history |
 | **Execution venue** | Front-month `NFO` Nifty future |
 | **Entry rule** | 2-of-3 SuperTrend agree **and** price on the correct side of PSAR |
 | **Warm-up** | 14 closed bars (longest SuperTrend ATR + 1) |

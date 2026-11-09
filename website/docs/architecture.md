@@ -24,7 +24,7 @@ resolved from the expiry calendar by `kite_client.future_symbol`.
 | File | Role |
 |---|---|
 | `bot/bot.py` | Entrypoint: feed, engine, mark loop, API, dashboard |
-| `bot/gift_nifty.py` | Instrument resolution, `KiteTicker` subscription, tick → candle |
+| `bot/gift_nifty.py` | Instrument resolution, `KiteTicker` subscription, tick → candle, execution-future ticks |
 | `bot/engine.py` | Evaluates the strategy on closed bars; routes orders |
 | `bot/strategy.py` | The entry rules in Python (triple SuperTrend + PSAR) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
@@ -49,6 +49,24 @@ A deferred LIVE signal is **never** auto-executed at 09:15. It is recorded as
 deferred and dropped — firing a stale signal into the open is worse than missing
 it.
 
+## One websocket, two instruments
+
+The execution future's ticks ride the **same** `KiteTicker` socket as GIFT
+Nifty, subscribed as a second token. This is not an optimisation: Twisted's
+reactor is process-global and one-shot, so a second `KiteTicker` cannot be
+created without raising `ReactorNotRestartable` on the first.
+
+That makes tick routing load-bearing. `_handle_ticks` dispatches on
+`instrument_token`, and only GIFT ticks reach the candle builder — the two
+prices differ by the basis, so a misrouted tick would corrupt the signal series
+rather than fail loudly. A tick with no token is treated as GIFT, which keeps
+every existing caller and test valid.
+
+If the future's token cannot be resolved, the feed falls back to polling its
+quote from the mark loop (every `ENGINE_INTERVAL_SECONDS`, not per dashboard
+poll — Kite's quote API is rate limited). The dashboard shows which source is in
+use.
+
 ## Warm-up
 
 The indicators are recursive, so they need history before they mean anything.
@@ -56,7 +74,8 @@ The indicators are recursive, so they need history before they mean anything.
 Kite **does** serve GIFT Nifty (NSEIX) history, including the overnight session,
 so the bot loads candles from `kite.historical_data` and treats them as the
 source of truth. Entry rules are PSAR and 2-of-3 SuperTrend, which needs **14
-closed bars** (longest ATR period + 1) — about 70 minutes at `5minute`.
+closed bars** (longest ATR period + 1) — about 70 minutes at `5minute`,
+3.5 hours at `15minute`.
 
 Bars are persisted to `gift_candles`, so a restart **resumes** the warm-up
 instead of restarting it. A fresh install warms up immediately from Kite history

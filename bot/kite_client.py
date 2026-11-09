@@ -43,8 +43,14 @@ log = logging.getLogger("kite_client")
 
 IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
-# NSE F&O symbols: NIFTY + 2-digit year + month code + "FUT" (e.g. NIFTY26FUTFUT)
-_MONTH_CODES = {m: c for m, c in zip(range(1, 13), "ABCDEFGHIJKL")}
+# NSE F&O symbols: NIFTY + 2-digit year + month + "FUT", e.g. NIFTY26NOVFUT.
+# Three-letter month names, not the older single-letter codes (NIFTY26KFUT):
+# Kite's NFO dump only contains the long form, so the short form resolved to
+# nothing and PAPER mode traded a symbol that does not exist.
+_MONTH_NAMES = {m: name for m, name in zip(range(1, 13), (
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+))}
 EXPIRY_WEEKDAY = 1  # Tuesday: NSE's monthly F&O expiry day since Sep 2025
 
 MARKET_OPEN = (9, 15)
@@ -142,11 +148,15 @@ def _expiry_after(expiry: datetime) -> datetime:
 
 
 def future_symbol(now: Optional[datetime] = None, months_ahead: int = 0) -> str:
-    """Trading symbol for the Nifty futures contract (0 = current month)."""
+    """Trading symbol for the Nifty futures contract (0 = current month).
+
+    Must match the symbols in Kite's NFO instrument dump exactly, because the
+    result is looked up there to resolve an instrument token.
+    """
     expiry = nearest_monthly_expiry(now)
     for _ in range(max(0, months_ahead)):
         expiry = _expiry_after(expiry)
-    return f"NIFTY{expiry:%y}{_MONTH_CODES[expiry.month]}FUT"
+    return f"NIFTY{expiry:%y}{_MONTH_NAMES[expiry.month]}FUT"
 
 
 # ---------------------------------------------------------------------------

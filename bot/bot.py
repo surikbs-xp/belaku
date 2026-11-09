@@ -335,6 +335,14 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             engine["last_tick_at"] = db.iso()
             engine["interval_seconds"] = period
         try:
+            # Keep the execution future's price fresh for the dashboard. Priced
+            # here, at the mark cadence, rather than in the status endpoint,
+            # which the dashboard polls every 1.5s - Kite's quote API is rate
+            # limited and that would be ~16k calls a session.
+            get_feed().refresh_exec_quote()
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("Execution quote refresh failed: %s", exc)
+        try:
             positions = db.get_open_positions(mode=get_execution_mode())
             if positions:
                 if get_execution_mode() == PAPER:
@@ -417,7 +425,7 @@ async def lifespan(app: FastAPI):
     restored = feed.load_persisted()
     _connect_kite_on_startup()
     # Kite serves GIFT Nifty history, so warm the indicators from it instead of
-    # waiting ~65 minutes for tick-built candles.
+    # waiting hours for tick-built candles.
     try:
         restored = feed.refresh_history(force=True) or restored
     except Exception as exc:  # pragma: no cover - network
@@ -1142,6 +1150,11 @@ def _start_gift_feed(*, reconnect: bool = False) -> dict[str, Any]:
     feed = reset_feed() if reconnect else get_feed()
     if feed.bar_count() == 0:
         feed.load_persisted()
+    # Resolve the execution future and hand it to the feed before start(), so
+    # _handle_connect can subscribe it in the same pass as GIFT Nifty. A failure
+    # here is not fatal: refresh_exec_quote() polls instead.
+    symbol = get_order_manager().current_symbol()
+    feed.set_exec_token(symbol, feed._resolve_exec_token(symbol))
     started = feed.start()
     status = feed.status()
     status["start_requested"] = started

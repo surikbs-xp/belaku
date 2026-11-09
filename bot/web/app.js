@@ -454,6 +454,7 @@ function renderEngine(eng, market) {
     hasLivePrice ? 'Last tick' : 'Last candle close',
   ));
   setText('e-gift-sub', `${feed.bars ?? 0} bars · ${feed.ticks ?? 0} ticks`);
+  renderExecQuote(feed.exec, signalSourcePrice);
   setText('e-exec', eng.execution_symbol || '—');
   setText('e-exec-sub', market.is_open
     ? (eng.mode === 'PAPER' ? 'PAPER — simulated at market price' : 'NSE F&O open — orders live')
@@ -595,7 +596,13 @@ function renderVoteLegend(id, config, values) {
  * clock or a different timezone cannot shift the countdown.
  */
 function renderCandle(eng, feed, ready, warmupHave) {
-  const intervalSeconds = num(feed.interval_seconds) || 300;
+  const intervalSeconds = num(feed.interval_seconds) || 900;
+  // Label the panel from the live interval so the heading cannot drift from the
+  // timeframe the engine is actually evaluating.
+  const intervalLabel = document.getElementById('candle-interval-label');
+  if (intervalLabel) {
+    intervalLabel.textContent = `${Math.round(intervalSeconds / 60)}-minute`;
+  }
   const barAt = eng.current_bar_at || eng.previous_bar_at || eng.last_bar_at;
   const boundary = istClock(barAt);
 
@@ -1355,6 +1362,50 @@ async function clearRiskBreach() {
       toast(`Risk: ${error.message}`, 'err');
     }
   });
+}
+
+/* Nifty future ticks, shown beside GIFT Nifty. The basis is the interesting
+   number: it is what the signal has to overcome before the trade is profitable,
+   so it is shown next to the price rather than hidden. */
+function renderExecQuote(exec, giftPrice) {
+  if (!exec) {
+    setText('e-exec-symbol', '—');
+    setText('e-exec-price', '—');
+    setText('e-exec-basis', '—');
+    setText('e-exec-tick', 'Not configured');
+    return;
+  }
+
+  setText('e-exec-symbol', exec.symbol || '—');
+
+  const hasPrice = exec.price !== null && exec.price !== undefined;
+  setText('e-exec-price', hasPrice
+    ? inr(exec.price, 2)
+    : '—');
+
+  const hasGift = giftPrice !== null && giftPrice !== undefined;
+  if (hasPrice && hasGift) {
+    const basis = exec.price - giftPrice;
+    setText('e-exec-basis', `${basis >= 0 ? '+' : ''}${basis.toFixed(2)} vs GIFT`);
+  } else {
+    setText('e-exec-basis', '—');
+  }
+
+  // Say where the number came from: a live tick is trustworthy, a polled quote
+  // is up to one mark cycle old, and stale means the feed has stopped.
+  if (!hasPrice) {
+    setText('e-exec-tick', exec.subscribed
+      ? 'Subscribed · awaiting first tick'
+      : 'Waiting for a quote…');
+    return;
+  }
+  const age = exec.age_seconds;
+  const when = exec.last_tick_at ? formatIstTimestamp(exec.last_tick_at) : null;
+  const how = exec.source === 'tick' ? 'tick' : 'quote';
+  const stale = age !== null && age > 60;
+  setText('e-exec-tick', when
+    ? `Last ${how} ${when} IST${stale ? ' · stale' : ''}`
+    : `Last ${how}${stale ? ' · stale' : ''}`);
 }
 
 async function signOut() {

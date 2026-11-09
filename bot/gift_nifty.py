@@ -33,7 +33,7 @@ from typing import Any, Callable, Optional
 
 import database as db
 from config import settings
-from kite_client import IST, get_client
+from kite_client import IST, future_symbol, get_client
 
 log = logging.getLogger("gift_nifty")
 
@@ -123,7 +123,7 @@ def interval_to_seconds(interval: str) -> int:
     try:
         return max(60, int(text) * 60)
     except ValueError:
-        return 300
+        return 900
 
 
 def bucket_start(moment: datetime, seconds: int) -> datetime:
@@ -140,7 +140,7 @@ class CandleBuilder:
     a later bucket; the final bar of a session is flushed by :meth:`flush`.
     """
 
-    seconds: int = 300
+    seconds: int = 900
     on_close: Optional[Callable[[Candle], None]] = None
     current: Optional[Candle] = None
     closed: list[Candle] = field(default_factory=list)
@@ -253,6 +253,17 @@ class GiftNiftyFeed:
         self.tick_count = 0
         self.error: Optional[str] = None
         self.session_ticks = 0
+        # The execution future rides the same websocket as GIFT Nifty, because
+        # Twisted's reactor is process-global and one-shot: a second ticker
+        # cannot be created without raising ReactorNotRestartable on the first.
+        # Its ticks must NOT reach the candle builder, which is the signal
+        # source - see _handle_ticks.
+        self.exec_token: Optional[int] = None
+        self.exec_symbol = ""
+        self.exec_last_price: Optional[float] = None
+        self.exec_last_tick_at: Optional[datetime] = None
+        self.exec_ticks = 0
+        self.exec_source = "none"
         self._history: list[dict[str, Any]] = []
         self._resume_candle: Optional[Candle] = None
         self._history_loaded = False
@@ -274,7 +285,7 @@ class GiftNiftyFeed:
         with self._lock:
             if self._history_loaded:
                 return self._loaded_count
-        rows = db.get_gift_candles(limit=self._builder.max_history)
+        rows = db.get_gift_candles(limit=self._builder.max_history, interval=self.interval)
         current_start = bucket_start(datetime.now(IST), self.seconds)
         resume_candle: Optional[Candle] = None
         if rows and datetime.fromisoformat(rows[-1]["start"]) == current_start:
@@ -447,6 +458,7 @@ class GiftNiftyFeed:
                 volume=candle.volume,
                 ticks=candle.ticks,
                 partial=candle.partial,
+                interval=self.interval,
             )
         except Exception as exc:  # pragma: no cover - best effort
             log.warning("Failed to persist GIFT candle: %s", exc)
@@ -514,6 +526,21 @@ class GiftNiftyFeed:
                 price = tick.get("last_price")
                 if price is None:
                     continue
+                token = tick.get("instrument_token")
+                # Route by token. Without this an execution-future tick would be
+                # fed into the GIFT candle builder and silently corrupt the
+                # signal series - the two prices differ by the basis, so the
+                # candles would be wrong rather than obviously broken.
+                #
+                # A tick with no token is treated as GIFT: every existing caller
+                # and test passes bare ``{"last_price": ...}``, and the GIFT
+                # series is the one that must never be disturbed.
+                if self.exec_token is not None and token == self.exec_token:
+                    self.exec_last_price = float(price)
+                    self.exec_last_tick_at = datetime.now(IST)
+                    self.exec_ticks += 1
+                    self.exec_source = "tick"
+                    continue
                 self.last_price = float(price)
                 self.last_tick_at = datetime.now(IST)
                 self.error = None
@@ -555,6 +582,12 @@ class GiftNiftyFeed:
             self.connected = False
             self.error = f"subscribe failed: {exc}"
             log.error("GIFT Nifty subscribe failed: %s", exc)
+            return
+        # The execution future shares this socket (see set_exec_token). After a
+        # reconnect the subscription is gone, so it is re-armed here rather than
+        # once at startup.
+        if self.exec_token is not None:
+            self._arm_exec_future(self.exec_symbol)
 
     def _handle_close(self, _ws: Any, code: Any, reason: Any) -> None:
         self.connected = False
@@ -731,6 +764,109 @@ class GiftNiftyFeed:
             return True
         return bool(self._thread and self._thread.is_alive())
 
+    # -- execution future ------------------------------------------------
+    @staticmethod
+    def _resolve_exec_token(symbol: str) -> Optional[int]:
+        """Instrument token for the execution future, or None."""
+        if not symbol:
+            return None
+        try:
+            return get_client().resolve_instrument_token(symbol)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("Could not resolve %s token: %s", symbol, exc)
+            return None
+
+    def _arm_exec_future(self, symbol: str) -> None:
+        """Subscribe the execution future so its ticks arrive on this socket."""
+        ticker = self._ticker
+        if ticker is None or self.exec_token is None:
+            return
+        try:
+            ticker.subscribe([self.exec_token])
+            # LTP mode is enough: only the price is needed, not depth or OHLC.
+            ticker.set_mode(ticker.MODE_LTP, [self.exec_token])
+            log.info(
+                "%s subscribed for execution ticks (token %s)", symbol, self.exec_token
+            )
+        except Exception as exc:
+            # Not fatal: set_exec_token() falls back to REST polling.
+            log.warning("Could not subscribe %s: %s", symbol, exc)
+            self.exec_source = "unsubscribed"
+
+    def set_exec_token(self, symbol: str, token: Optional[int]) -> None:
+        """Point the execution ticker at ``symbol``.
+
+        Called when the front-month contract rolls and when a token is first
+        resolved. Passing a different symbol unsubscribes the old token, so a
+        roll does not leave both contracts streaming.
+        """
+        symbol = (symbol or "").strip().upper()
+        with self._lock:
+            if symbol == self.exec_symbol and token == self.exec_token:
+                return
+            previous = self.exec_token
+            self.exec_symbol = symbol
+            self.exec_token = token
+            self.exec_ticks = 0
+        ticker = self._ticker
+        if ticker is not None and previous is not None:
+            try:
+                ticker.unsubscribe([previous])
+            except Exception as exc:
+                log.warning("Could not unsubscribe token %s: %s", previous, exc)
+        if token is None:
+            log.warning("No instrument token for %s; falling back to quote polling", symbol)
+            self.exec_source = "poll"
+
+    def refresh_exec_quote(self, symbol: Optional[str] = None) -> None:
+        """Poll the execution future's price. Fallback when ticks are absent.
+
+        Called from the mark loop, so it runs at ``ENGINE_INTERVAL_SECONDS``
+        (5s by default) rather than at the dashboard's 1.5s poll rate. The Kite
+        quote endpoint is rate limited, so this deliberately does not run per
+        status request.
+        """
+        target = (symbol or self.exec_symbol or self.current_exec_symbol()).strip().upper()
+        if not target:
+            return
+        price = get_client().get_ltp(target)
+        if price is None:
+            return
+        with self._lock:
+            self.exec_last_price = float(price)
+            self.exec_last_tick_at = datetime.now(IST)
+            if self.exec_source != "tick":
+                self.exec_source = "poll"
+
+    def current_exec_symbol(self) -> str:
+        """The front-month future the order manager would trade right now."""
+        try:
+            from order_manager import get_order_manager
+
+            return get_order_manager().current_symbol()
+        except Exception:  # pragma: no cover - defensive
+            return future_symbol()
+
+    def exec_quote(self) -> dict[str, Any]:
+        """Execution future price for the dashboard, with its provenance."""
+        with self._lock:
+            age = (
+                (datetime.now(IST) - self.exec_last_tick_at).total_seconds()
+                if self.exec_last_tick_at
+                else None
+            )
+            return {
+                "symbol": self.exec_symbol or self.current_exec_symbol(),
+                "price": self.exec_last_price,
+                "last_tick_at": self.exec_last_tick_at.isoformat(timespec="seconds")
+                if self.exec_last_tick_at
+                else None,
+                "age_seconds": round(age, 1) if age is not None else None,
+                "ticks": self.exec_ticks,
+                "source": self.exec_source,
+                "subscribed": self.exec_token is not None,
+            }
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             age = (
@@ -774,6 +910,22 @@ class GiftNiftyFeed:
                 "tick_age_seconds": round(age, 1) if age is not None else None,
                 "ticks": self.tick_count,
                 "error": self.error,
+                # Execution future, shown beside GIFT Nifty on the dashboard.
+                "exec": {
+                    "symbol": self.exec_symbol or self.current_exec_symbol(),
+                    "price": self.exec_last_price,
+                    "last_tick_at": self.exec_last_tick_at.isoformat(timespec="seconds")
+                    if self.exec_last_tick_at
+                    else None,
+                    "age_seconds": round(
+                        (datetime.now(IST) - self.exec_last_tick_at).total_seconds(), 1
+                    )
+                    if self.exec_last_tick_at
+                    else None,
+                    "ticks": self.exec_ticks,
+                    "source": self.exec_source,
+                    "subscribed": self.exec_token is not None,
+                },
             }
 
 

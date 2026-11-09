@@ -92,7 +92,7 @@ triple is used.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `GIFT_CANDLE_INTERVAL` | `5minute` | Must match the timeframe the strategy was tuned on |
+| `GIFT_CANDLE_INTERVAL` | `15minute` | Must match the timeframe the strategy was tuned on |
 | `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop and closed-bar check cadence |
 | `QUOTE_POLL_SECONDS` | `5` | |
 | `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
@@ -130,6 +130,15 @@ rate-limited to one per kind per 15 minutes. See
 **`GIFT_CANDLE_INTERVAL` must match the strategy's timeframe.** The indicators
 are only meaningful on the timeframe they were tuned for. Changing it without
 re-tuning the strategy changes the signals.
+
+It also decides how long warm-up takes, because it is bars - not time - that
+the indicators need: the longest SuperTrend wants 14 closed bars, which is
+70 minutes at 5 minutes and 3.5 hours at 15. The bot sidesteps that on
+startup by loading Kite history, so the delay only bites if history is
+unavailable and the series has to be built from live ticks.
+
+Bars are stored per interval, so switching this back and forth does not mix
+two series together.
 
 **`LOT_MARGIN` is an estimate.** LIVE prefers Kite's real margin API and reports
 when it falls back to this number. Set it conservatively.
