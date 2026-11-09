@@ -19,3 +19,8 @@ paper_trading.db-wal
 *.sqlite3
 bot/logs/
 bot/data/
+
+# Database backups. These hold the full trading record - positions, orders,
+# trades, PnL - and belong off-box, not in a public repository.
+backups/
+*.db.bak
