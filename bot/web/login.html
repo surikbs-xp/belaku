@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Belaku · Sign in</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="login-body">
+    <main class="login-card">
+      <div class="login-brand">
+        <span class="login-mark">B</span>
+        <div>
+          <h1>Belaku</h1>
+          <p>GIFT Nifty execution bot</p>
+        </div>
+      </div>
+
+      <form id="login-form" autocomplete="on">
+        <label for="password">Dashboard password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          autofocus
+        />
+        <button type="submit" id="login-submit">Sign in</button>
+      </form>
+
+      <p id="login-error" class="login-error" role="alert" hidden></p>
+      <p class="login-note">
+        This dashboard can arm live trading and square off positions, so it is
+        password protected. Set <code>DASHBOARD_PASSWORD</code> in
+        <code>bot/.env</code> to change it.
+      </p>
+    </main>
+
+    <script src="/static/login.js"></script>
+  </body>
+</html>

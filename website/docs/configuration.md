@@ -26,6 +26,8 @@ evaluate the strategy without a token.
 | `WEBHOOK_PORT` | `9000` | |
 | `ALLOWED_HOSTS` | `127.0.0.1,localhost,[::1],testserver` | Host header allow-list. Only widen this for a real proxy. |
 | `ALLOWED_ORIGINS` | *(empty)* | Extra cross-origin callers, comma separated. Empty = same-origin only. |
+| `DASHBOARD_PASSWORD` | *(empty)* | Password for the dashboard and control API. **Empty leaves it open.** |
+| `DASHBOARD_SESSION_SECRET` | *(random per process)* | Pins the session signing key so logins survive a restart |
 | `ENABLE_API_DOCS` | `0` | Set `1` to serve `/docs` and `/openapi.json` again |
 | `LOG_FILE` | `bot/logs/bot.log` | Docker: `/data/bot.log` |
 | `LOG_LEVEL` | `INFO` | Minimum level written. Also the floor the Logs tab can query. |
@@ -62,6 +64,7 @@ your machine, anyone who can send a request can panic the account.
 | `DEFAULT_LOTS` | `1` | Lots per entry |
 | `NIFTY_LOT_SIZE` | `65` | Fallback when Kite instruments are unavailable |
 | `MAX_OPEN_LOTS` | `4` | Hard cap on concurrent lots |
+| `STOP_LOSS_POINTS` | `0` | Close a position this many points against entry. `0` disables. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
 | `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT` |
@@ -108,6 +111,20 @@ so `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` must all point at `/data`.
 :::
 
 
+## Alerting
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ALERT_WEBHOOK_URL` | *(empty)* | JSON webhook for watchdog alerts. Empty = log and dashboard only. |
+| `WATCHDOG_INTERVAL_SECONDS` | `30` | How often trading health is checked |
+
+The watchdog alerts when the process is up but the trading is not: a stale feed,
+a disconnected feed during market hours, a risk breach, a paused strategy, or an
+engine error. Alerts fire only after three consecutive failing checks and are
+rate-limited to one per kind per 15 minutes. See
+[Production deployment](./production.md#monitoring).
+
+
 ## Tuning notes
 
 **`GIFT_CANDLE_INTERVAL` must match the strategy's timeframe.** The indicators
@@ -117,5 +134,9 @@ re-tuning the strategy changes the signals.
 **`LOT_MARGIN` is an estimate.** LIVE prefers Kite's real margin API and reports
 when it falls back to this number. Set it conservatively.
 
-**`MAX_OPEN_LOTS` is the only position-size cap.** There is no stop-loss, so this
-is your primary risk control.
+**`MAX_OPEN_LOTS` caps position size; `STOP_LOSS_POINTS` caps loss.** The strategy
+has no stop-loss of its own — it exits on an opposite signal or a manual
+square-off — so without this a position is unbounded between those two events.
+The limit latches: once tripped the bot squares off, pauses, and stays paused
+until you acknowledge the breach on the dashboard. See
+[Production deployment](./production.md#risk-limits).

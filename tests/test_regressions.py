@@ -32,6 +32,25 @@ def use_test_database(monkeypatch, tmp_path) -> None:
     db.init_db()
 
 
+def use_risk_limits(monkeypatch, *, stop_loss_points=0.0) -> None:
+    """Override the risk limits.
+
+    ``Settings`` is a frozen dataclass, so the module's reference is swapped for
+    a stand-in rather than mutated - the same approach ``use_test_database``
+    takes for ``db.settings``.
+    """
+    import risk
+
+    monkeypatch.setattr(
+        risk,
+        "settings",
+        SimpleNamespace(
+            stop_loss_points=stop_loss_points,
+            max_open_lots=4,
+        ),
+    )
+
+
 def test_bot_configures_a_rotating_file_handler(monkeypatch, tmp_path) -> None:
     root = logging.getLogger()
     existing_handlers = list(root.handlers)
@@ -792,7 +811,9 @@ def test_engine_status_reports_forming_bar_indicators_without_signaling(monkeypa
     monkeypatch.setattr(
         engine,
         "get_order_manager",
-        lambda: SimpleNamespace(current_symbol=lambda: "NIFTY", paused=False),
+        lambda: SimpleNamespace(
+            current_symbol=lambda: "NIFTY", paused=False, paused_reason=""
+        ),
     )
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
 
@@ -1682,3 +1703,443 @@ def test_failed_quote_is_cached_so_a_dead_token_is_not_retried() -> None:
     # An order still forces a fresh attempt.
     assert client.get_ltp("NIFTY26KFUT", max_age=0) is None
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Dashboard authentication
+# ---------------------------------------------------------------------------
+def test_control_endpoints_require_a_session(monkeypatch) -> None:
+    """The control API can arm live trading and square off positions, so an
+    unauthenticated caller must not reach it even from loopback."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    client = TestClient(bot_app.app)
+
+    for path, body in (
+        ("/api/panic", {"confirm": True}),
+        ("/api/toggle-mode", {"mode": "LIVE", "confirm": True}),
+        ("/api/pause", {"paused": True}),
+        ("/api/kite/feed/reconnect", {}),
+    ):
+        response = client.post(path, json=body)
+        assert response.status_code == 401, path
+        assert response.json()["detail"] == "Authentication required"
+
+
+def test_read_endpoints_require_a_session(monkeypatch) -> None:
+    """Positions, orders and the log tail are account data, not public."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    client = TestClient(bot_app.app)
+
+    for path in ("/api/status", "/api/positions", "/api/orders", "/api/logs"):
+        assert client.get(path).status_code == 401, path
+
+
+def test_health_and_login_stay_reachable(monkeypatch) -> None:
+    """The container healthcheck has no cookie, and the login page cannot
+    require a session or nobody could ever sign in."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    client = TestClient(bot_app.app)
+
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/login").status_code == 200
+    assert client.get("/api/auth/status").status_code == 200
+    assert client.get("/static/styles.css").status_code == 200
+
+
+def test_dashboard_redirects_to_login_instead_of_401(monkeypatch) -> None:
+    """A browser navigating to / must land on the login page, not a bare 401."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    response = TestClient(bot_app.app).get("/", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_login_grants_access_and_logout_revokes_it(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    client = TestClient(bot_app.app)
+
+    assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
+    assert client.get("/api/status").status_code == 401
+
+    ok = client.post("/api/auth/login", json={"password": "hunter2"})
+    assert ok.status_code == 200
+    assert client.get("/api/status").status_code == 200
+
+    assert client.post("/api/auth/logout").status_code == 200
+    assert client.get("/api/status").status_code == 401
+
+
+def test_session_cookie_is_httponly_and_samesite_strict(monkeypatch) -> None:
+    """HttpOnly keeps the token away from script; SameSite=Strict is what stops
+    a cross-site page from riding the session."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    response = TestClient(bot_app.app).post(
+        "/api/auth/login", json={"password": "hunter2"}
+    )
+
+    cookie = response.headers["set-cookie"].lower()
+    assert "httponly" in cookie
+    assert "samesite=strict" in cookie
+
+
+def test_forged_session_cookie_is_rejected(monkeypatch) -> None:
+    """The cookie is HMAC-signed, so a guessed or edited value must not work."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    client = TestClient(bot_app.app)
+
+    for forged in ("", "1.abc.deadbeef", "9999999999.abc.deadbeef"):
+        client.cookies.set("belaku_session", forged)
+        assert client.get("/api/status").status_code == 401, forged
+
+
+def test_login_is_rate_limited(monkeypatch) -> None:
+    """Without a limit the password is brute-forceable at network speed."""
+    from fastapi.testclient import TestClient
+
+    import dashboard_auth
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    dashboard_auth.reset_state()
+    client = TestClient(bot_app.app)
+
+    for _ in range(dashboard_auth.MAX_ATTEMPTS):
+        assert client.post("/api/auth/login", json={"password": "no"}).status_code == 401
+
+    blocked = client.post("/api/auth/login", json={"password": "hunter2"})
+    assert blocked.status_code == 429
+    dashboard_auth.reset_state()
+
+
+def test_dashboard_is_open_when_no_password_is_set(monkeypatch) -> None:
+    """Preserves local development: no password means no gate."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    client = TestClient(bot_app.app)
+
+    assert client.get("/api/status").status_code == 200
+    assert client.get("/api/auth/status").json() == {
+        "auth_required": False,
+        "authenticated": True,
+    }
+
+
+def test_session_token_expires(monkeypatch) -> None:
+    import dashboard_auth
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    token = dashboard_auth.issue_token(now=1000.0)
+
+    assert dashboard_auth.verify_token(token, now=1000.0)
+    assert not dashboard_auth.verify_token(
+        token, now=1000.0 + dashboard_auth.SESSION_TTL_SECONDS + 1
+    )
+
+
+# ---------------------------------------------------------------------------
+# Risk limits
+# ---------------------------------------------------------------------------
+def test_stop_loss_measures_adverse_points_in_both_directions() -> None:
+    """A long loses when price falls; a short loses when price rises. Getting
+    the sign wrong would make the stop fire on a winning position."""
+    import risk
+
+    assert risk.open_position_points(
+        {"entry_price": 25000.0, "last_price": 24850.0, "position_key": 1}
+    ) == 150.0
+    assert risk.open_position_points(
+        {"entry_price": 25000.0, "last_price": 25150.0, "position_key": -1}
+    ) == 150.0
+    assert risk.open_position_points(
+        {"entry_price": 25000.0, "last_price": 25150.0, "position_key": 1}
+    ) == -150.0
+
+
+def test_stop_loss_ignores_a_position_with_no_mark() -> None:
+    """A missing mark must not be read as zero loss, nor as a breach."""
+    import risk
+
+    assert risk.open_position_points(
+        {"entry_price": 25000.0, "last_price": None, "position_key": 1}
+    ) is None
+
+
+def test_stop_loss_fires_past_the_limit(monkeypatch, tmp_path) -> None:
+    import risk
+
+    use_test_database(monkeypatch, tmp_path)
+    use_risk_limits(monkeypatch, stop_loss_points=100.0)
+    position_id = db.open_position("TEST", 65, 25000.0, mode=PAPER)
+    db.update_position_price(position_id, 24850.0)
+
+    breach = risk.check_stop_loss(PAPER)
+    assert breach is not None
+    assert breach.kind == risk.STOP_LOSS
+    assert breach.symbol == "TEST"
+    assert breach.points == 150.0
+
+
+def test_stop_loss_stays_quiet_inside_the_limit(monkeypatch, tmp_path) -> None:
+    import risk
+
+    use_test_database(monkeypatch, tmp_path)
+    use_risk_limits(monkeypatch, stop_loss_points=100.0)
+    position_id = db.open_position("TEST", 65, 25000.0, mode=PAPER)
+    db.update_position_price(position_id, 24950.0)
+
+    assert risk.check_stop_loss(PAPER) is None
+
+
+def test_stop_loss_disabled_when_zero(monkeypatch, tmp_path) -> None:
+    """0 means off, so an operator who has not chosen a stop is not surprised
+    by one firing."""
+    import risk
+
+    use_test_database(monkeypatch, tmp_path)
+    use_risk_limits(monkeypatch, stop_loss_points=0.0)
+    position_id = db.open_position("TEST", 65, 25000.0, mode=PAPER)
+    db.update_position_price(position_id, 20000.0)
+
+    assert risk.check_stop_loss(PAPER) is None
+
+
+
+
+def test_breach_latches_and_pauses_entries(monkeypatch, tmp_path) -> None:
+    """The kill-switch must be sticky: a limit that clears itself when price
+    recovers turns one bad day into a run of them."""
+    import risk
+
+    use_test_database(monkeypatch, tmp_path)
+    use_risk_limits(monkeypatch, stop_loss_points=100.0)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    position_id = db.open_position("TEST", 65, 25000.0, mode=PAPER)
+    db.update_position_price(position_id, 24850.0)
+
+    class FakeClient:
+        mode = PAPER
+
+        def get_ltp(self, symbol, max_age=None):
+            return 24850.0
+
+        def place_order(self, **kwargs):
+            return {"status": "COMPLETE", "order_id": "1", "average_price": 24850.0,
+                    "filled_quantity": 65}
+
+    manager = OrderManager(FakeClient())
+    monkeypatch.setattr(engine, "get_order_manager", lambda: manager)
+
+    strategy_engine = engine.StrategyEngine()
+    first = strategy_engine.enforce_risk()
+
+    assert first is not None
+    assert first["kind"] == risk.STOP_LOSS
+    assert manager.paused
+
+    # Price recovers, but the latch holds.
+    db.update_position_price(position_id, 26000.0)
+    assert strategy_engine.enforce_risk() is not None
+    assert strategy_engine.breach is not None
+
+    strategy_engine.clear_breach()
+    assert strategy_engine.breach is None
+
+
+def test_risk_breach_is_reported_on_status(monkeypatch, tmp_path) -> None:
+    import risk
+
+    use_test_database(monkeypatch, tmp_path)
+    use_risk_limits(monkeypatch, stop_loss_points=100.0)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    position_id = db.open_position("TEST", 65, 25000.0, mode=PAPER)
+    db.update_position_price(position_id, 24850.0)
+
+    class FakeClient:
+        mode = PAPER
+
+        def get_ltp(self, symbol, max_age=None):
+            return 24850.0
+
+        def place_order(self, **kwargs):
+            return {"status": "COMPLETE", "order_id": "1", "average_price": 24850.0,
+                    "filled_quantity": 65}
+
+    manager = OrderManager(FakeClient())
+    monkeypatch.setattr(engine, "get_order_manager", lambda: manager)
+
+    strategy_engine = engine.StrategyEngine()
+    strategy_engine.enforce_risk()
+    payload = strategy_engine.status()
+
+    assert payload["risk_breach"]["kind"] == risk.STOP_LOSS
+    assert payload["risk"]["stop_loss_points"] == 100.0
+    assert payload["paused"] is True
+
+
+# ---------------------------------------------------------------------------
+# Watchdog
+# ---------------------------------------------------------------------------
+def _watchdog(**kwargs):
+    import watchdog
+
+    sent: list[tuple[str, dict]] = []
+    wd = watchdog.Watchdog(
+        webhook_url="https://example.invalid/hook",
+        sender=lambda url, payload: sent.append((url, payload)) or True,
+        **kwargs,
+    )
+    return wd, sent
+
+
+def test_watchdog_alerts_on_a_stale_feed() -> None:
+    """A connected feed with no ticks is the failure a liveness probe misses."""
+    wd, _ = _watchdog(stale_tick_seconds=180.0)
+
+    alerts = wd.check(
+        market_open=True,
+        feed={"connected": True, "tick_age_seconds": 600.0},
+        engine={},
+    )
+
+    assert [a.kind for a in alerts] == ["STALE_FEED"]
+    assert alerts[0].severity == "critical"
+
+
+def test_watchdog_ignores_a_stale_feed_when_the_market_is_closed() -> None:
+    """Overnight and on holidays there are no ticks, and that is normal."""
+    wd, _ = _watchdog(stale_tick_seconds=180.0)
+
+    alerts = wd.check(
+        market_open=False,
+        feed={"connected": True, "tick_age_seconds": 40000.0},
+        engine={},
+    )
+
+    assert alerts == []
+
+
+def test_watchdog_alerts_on_a_disconnected_feed() -> None:
+    wd, _ = _watchdog()
+
+    alerts = wd.check(
+        market_open=True,
+        feed={"connected": False, "starting": False, "error": "token expired"},
+        engine={},
+    )
+
+    assert [a.kind for a in alerts] == ["FEED_DOWN"]
+    assert "token expired" in alerts[0].detail
+
+
+def test_watchdog_does_not_alert_while_the_feed_is_starting() -> None:
+    """A feed that is still connecting is not a failure."""
+    wd, _ = _watchdog()
+
+    alerts = wd.check(
+        market_open=True,
+        feed={"connected": False, "starting": True},
+        engine={},
+    )
+
+    assert alerts == []
+
+
+def test_watchdog_alerts_on_a_risk_breach_and_a_pause() -> None:
+    wd, _ = _watchdog()
+
+    alerts = wd.check(
+        market_open=True,
+        feed={"connected": True, "tick_age_seconds": 1.0},
+        engine={
+            "risk_breach": {"detail": "stop-loss hit"},
+            "paused": True,
+            "paused_reason": "STOP_LOSS",
+        },
+    )
+
+    assert {a.kind for a in alerts} == {"RISK_BREACH", "PAUSED"}
+
+
+def test_watchdog_requires_sustained_failure_before_alerting() -> None:
+    """One slow poll must not page anyone, or the alerts get muted."""
+    import watchdog
+
+    wd, sent = _watchdog()
+    unhealthy = dict(
+        market_open=True,
+        feed={"connected": False, "starting": False, "error": "down"},
+        engine={},
+    )
+
+    for _ in range(watchdog.FAILURES_BEFORE_ALERT - 1):
+        wd.run_once(**unhealthy)
+    assert sent == []
+
+    wd.run_once(**unhealthy)
+    assert len(sent) == 1
+
+
+def test_watchdog_rate_limits_repeated_alerts() -> None:
+    """A persistent fault must not send an alert every cycle."""
+    import watchdog
+
+    wd, sent = _watchdog()
+    unhealthy = dict(
+        market_open=True,
+        feed={"connected": False, "starting": False, "error": "down"},
+        engine={},
+    )
+
+    for _ in range(watchdog.FAILURES_BEFORE_ALERT + 5):
+        wd.run_once(**unhealthy)
+
+    assert len(sent) == 1
+
+
+def test_watchdog_reports_healthy_when_nothing_is_wrong() -> None:
+    wd, sent = _watchdog()
+
+    alerts = wd.run_once(
+        market_open=True,
+        feed={"connected": True, "tick_age_seconds": 2.0},
+        engine={},
+    )
+
+    assert alerts == []
+    assert wd.state.healthy is True
+    assert sent == []
+
+
+def test_watchdog_survives_a_failing_webhook() -> None:
+    """A broken alert channel must not take the bot down with it."""
+    import watchdog
+
+    def explode(url, payload):
+        raise RuntimeError("network down")
+
+    wd = watchdog.Watchdog(webhook_url="https://example.invalid/hook", sender=explode)
+    unhealthy = dict(
+        market_open=True,
+        feed={"connected": False, "starting": False, "error": "down"},
+        engine={},
+    )
+
+    for _ in range(watchdog.FAILURES_BEFORE_ALERT):
+        wd.run_once(**unhealthy)
+
+    assert wd.state.alerts_sent == 1

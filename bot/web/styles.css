@@ -1142,3 +1142,137 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
   text-align: center;
   color: var(--ink-3);
 }
+
+/* ---------------------------------------------------------------------------
+   Login page. Standalone: it must render without app.js or Tailwind, because
+   an unauthenticated page should not load the dashboard bundle.
+   --------------------------------------------------------------------------- */
+.login-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  margin: 0;
+  padding: 1.5rem;
+  background-color: #060a14;
+  color: var(--ink-1);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 24rem;
+  padding: 1.75rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.9rem;
+  background: var(--panel-solid);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.login-mark {
+  display: grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.6rem;
+  background: var(--brand);
+  color: #04121f;
+  font-weight: 700;
+  font-size: 1.15rem;
+}
+
+.login-brand h1 {
+  margin: 0;
+  font-size: 1.05rem;
+  color: var(--ink-0);
+}
+
+.login-brand p {
+  margin: 0.1rem 0 0;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+}
+
+.login-card label {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--ink-2);
+}
+
+.login-card input {
+  width: 100%;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  background: #0d1424;
+  color: var(--ink-0);
+  font-size: 0.9rem;
+}
+
+.login-card input:focus {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+.login-card button {
+  width: 100%;
+  margin-top: 0.9rem;
+  padding: 0.6rem;
+  border: 0;
+  border-radius: 0.5rem;
+  background: var(--brand);
+  color: #04121f;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.login-card button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.login-error {
+  margin: 0.9rem 0 0;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--bad);
+  border-radius: 0.5rem;
+  background: rgba(244, 63, 94, 0.1);
+  color: #fecdd3;
+  font-size: 0.8rem;
+}
+
+.login-note {
+  margin: 1.25rem 0 0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+
+.login-note code {
+  color: var(--ink-2);
+}
+
+/* Risk breach banner. Red rather than the pause banner's amber: a breach means
+   the bot already closed a position or halted the session, not that it is
+   waiting for input. */
+.risk-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-bottom: 0.7rem;
+  border: 1px solid rgba(244, 63, 94, 0.5);
+  border-radius: 0.7rem;
+  background: rgba(244, 63, 94, 0.12);
+  padding: 0.6rem 0.85rem;
+}
+
+.risk-banner.hidden { display: none; }

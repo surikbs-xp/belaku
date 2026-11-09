@@ -69,16 +69,22 @@ class Settings:
     webhook_port: int = _env_int("WEBHOOK_PORT", 9000)
     # Shown as the browser tab title and the dashboard header.
     bot_name: str = _env("BOT_NAME", "Belaku")
-    # Host header allow-list. The dashboard has no session auth, so the only
-    # identity a request carries is its Host and Origin; without this a
-    # malicious page can DNS-rebind its own hostname to 127.0.0.1 and talk to
-    # the API "same-origin" with no CORS involvement at all.
+    # Host header allow-list. Without this a malicious page can DNS-rebind its
+    # own hostname to 127.0.0.1 and talk to the API "same-origin" with no CORS
+    # involvement at all.
     allowed_hosts: str = _env(
         "ALLOWED_HOSTS", "127.0.0.1,localhost,[::1],testserver"
     )
     # Extra origins allowed to make cross-origin calls, beyond same-origin.
     # Empty means same-origin only, which is what the bundled dashboard needs.
     allowed_origins: str = _env("ALLOWED_ORIGINS", "")
+    # Dashboard password. Empty leaves the dashboard open, which is only
+    # acceptable on a machine nobody else can reach - the control endpoints can
+    # arm live trading and square off positions.
+    dashboard_password: str = _env("DASHBOARD_PASSWORD", "")
+    # Pins the session signing key so logins survive a restart. Empty means a
+    # fresh random key per process, which invalidates sessions on restart.
+    dashboard_session_secret: str = _env("DASHBOARD_SESSION_SECRET", "")
 
     # --- Execution --------------------------------------------------------
     execution_mode: str = _env("EXECUTION_MODE", PAPER).upper()
@@ -93,6 +99,18 @@ class Settings:
 
     # --- Risk / pricing ---------------------------------------------------
     lot_margin: float = _env_float("LOT_MARGIN", 150_000.0)
+    # Close a position once it is this many index points against entry. 0
+    # disables the check. The strategy has no stop-loss of its own, so this is
+    # the only limit that acts before a loss becomes large.
+    stop_loss_points: float = _env_float("STOP_LOSS_POINTS", 0.0)
+
+    # --- Alerting ---------------------------------------------------------
+    # Webhook that receives JSON alerts when the bot is up but not working
+    # (stale feed, risk breach, paused strategy). Empty disables sending; the
+    # alerts are still logged and shown on the dashboard.
+    alert_webhook_url: str = _env("ALERT_WEBHOOK_URL", "")
+    # How often the watchdog checks trading health, in seconds.
+    watchdog_interval_seconds: float = _env_float("WATCHDOG_INTERVAL_SECONDS", 30.0)
     instrument_refresh_seconds: int = _env_int("INSTRUMENT_REFRESH_SECONDS", 3600)
     quote_poll_seconds: int = _env_int("QUOTE_POLL_SECONDS", 5)
     http_timeout_seconds: float = _env_float("HTTP_TIMEOUT_SECONDS", 4.0)

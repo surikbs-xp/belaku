@@ -43,12 +43,13 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import database as db
+import dashboard_auth
 import kite_auth
 from config import (
     LIVE,
@@ -64,6 +65,7 @@ from gift_nifty import GIFT_KEY, get_feed, reset_feed
 from kite_client import future_symbol, get_client, market_status
 from market_calendar import get_calendar
 from order_manager import get_order_manager
+from watchdog import get_watchdog
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -429,6 +431,10 @@ async def lifespan(app: FastAPI):
     marks = threading.Thread(target=mark_loop, args=(_stop,), name="marks", daemon=True)
     marks.start()
 
+    # 4. Watchdog: alerts when the process is up but the trading is not.
+    watchdog = get_watchdog()
+    watchdog.start(settings.watchdog_interval_seconds)
+
     log.info(
         "Bot ready - mode=%s db=%s signals=%s (%ss bars, %d restored) "
         "execution=%s dashboard=http://%s:%s/",
@@ -442,6 +448,7 @@ async def lifespan(app: FastAPI):
         _stop.set()
         with STATUS_LOCK:
             STATUS["running"] = False
+        watchdog.stop()
         engine.stop()
         feed.stop()
         marks.join(timeout=5)
@@ -502,6 +509,38 @@ def _origin_allowed(origin: str, host: str) -> bool:
 # container healthcheck (no Origin) and reveals nothing worth protecting.
 _CSRF_EXEMPT: tuple[str, ...] = ("/api/health",)
 
+# Reachable without a session: the login page and its POST, the health probe the
+# container healthcheck uses, and the Zerodha redirect target (Zerodha's browser
+# redirect carries no cookie of ours, and the request_token it delivers is
+# useless without the API secret).
+_AUTH_EXEMPT: tuple[str, ...] = (
+    "/api/health",
+    "/login",
+    "/api/auth/login",
+    "/api/auth/status",
+    "/zerodha/callback",
+    "/kite/callback",
+    "/favicon.ico",
+)
+
+# Static assets are served to the login page itself, so they cannot require a
+# session. They contain no data - only the dashboard's own CSS/JS.
+_AUTH_EXEMPT_PREFIXES: tuple[str, ...] = ("/static/",)
+
+
+def _auth_exempt(path: str) -> bool:
+    if any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
+        return True
+    return any(fnmatch.fnmatch(path, p) for p in _AUTH_EXEMPT)
+
+
+def _session_valid(request: Request) -> bool:
+    return dashboard_auth.verify_token(request.cookies.get(dashboard_auth.COOKIE_NAME, ""))
+
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
 app = FastAPI(
     title="GIFT Nifty Execution Bot",
     version="3.0.0",
@@ -551,6 +590,18 @@ async def security_middleware(request: Request, call_next: Any) -> Any:
         return JSONResponse(
             {"detail": "Cross-site request blocked"}, status_code=403
         )
+
+    # Authentication. Runs after the Origin check so a cross-site request is
+    # rejected as cross-site rather than as unauthenticated, and before routing
+    # so a new endpoint is protected by default rather than by remembering to
+    # add a dependency to it.
+    if dashboard_auth.auth_required() and not _auth_exempt(request.url.path):
+        if not _session_valid(request):
+            if request.url.path.startswith("/api/"):
+                return JSONResponse({"detail": "Authentication required"}, status_code=401)
+            # A browser navigating to the dashboard gets the login page instead
+            # of a bare 401, so the operator is never stuck.
+            return RedirectResponse("/login", status_code=303)
 
     response = await call_next(request)
     # No inline script/style is used by the dashboard (styles.css and app.js are
@@ -649,6 +700,7 @@ def api_status() -> dict[str, Any]:
             },
         },
         "engine": get_engine().status(),
+        "watchdog": get_watchdog().state.to_dict(),
         "strategy_config": strategy_summary(),
         "market": market,
         "symbol": {
@@ -1035,6 +1087,24 @@ def api_pause(request: PauseRequest) -> dict[str, Any]:
     return {"ok": True, "paused": manager.paused, "reason": request.reason}
 
 
+@app.post("/api/risk/clear", tags=["control"])
+def api_risk_clear() -> dict[str, Any]:
+    """Acknowledge a risk breach and allow entries again.
+
+    Deliberately separate from resume: clearing the latch is an explicit
+    decision that the operator has seen the breach, not a side effect of
+    un-pausing.
+    """
+    engine = get_engine()
+    previous = engine.breach
+    engine.clear_breach()
+    return {
+        "ok": True,
+        "cleared": previous.to_dict() if previous else None,
+        "risk_breach": None,
+    }
+
+
 @app.post("/api/panic", tags=["control"])
 def api_panic(request: PanicRequest) -> dict[str, Any]:
     """Square off every open position, then pause the strategy."""
@@ -1223,6 +1293,75 @@ def kite_callback(
         )
         + (" Check the dashboard for the GIFT feed connection status."),
     )
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+class LoginRequest(BaseModel):
+    password: str = Field(..., max_length=200)
+
+
+@app.get("/api/auth/status", tags=["auth"])
+def api_auth_status(request: Request) -> dict[str, Any]:
+    """Whether a password is configured, and whether this caller is signed in."""
+    required = dashboard_auth.auth_required()
+    return {
+        "auth_required": required,
+        "authenticated": _session_valid(request) if required else True,
+    }
+
+
+@app.post("/api/auth/login", tags=["auth"])
+def api_auth_login(request: Request, payload: LoginRequest) -> Any:
+    """Exchange the dashboard password for a signed session cookie."""
+    if not dashboard_auth.auth_required():
+        return {"ok": True, "auth_required": False}
+
+    client = _client_key(request)
+    if dashboard_auth.rate_limited(client):
+        log.warning("Login rate limited for %s", client)
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again in a few minutes.",
+        )
+
+    if not dashboard_auth.check_password(payload.password):
+        dashboard_auth.record_failure(client)
+        log.warning("Failed dashboard login from %s", client)
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
+    dashboard_auth.clear_failures(client)
+    log.info("Dashboard login from %s", client)
+    response = JSONResponse({"ok": True, "auth_required": True})
+    response.set_cookie(
+        dashboard_auth.COOKIE_NAME,
+        dashboard_auth.issue_token(),
+        max_age=dashboard_auth.SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="strict",
+        # Not Secure: the dashboard is served over plain HTTP on loopback or a
+        # private network. Setting Secure here would make the cookie unusable
+        # and lock the operator out. Put TLS in front before exposing it.
+        secure=False,
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout", tags=["auth"])
+def api_auth_logout() -> Any:
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(dashboard_auth.COOKIE_NAME, path="/")
+    return response
+
+
+@app.get("/login", include_in_schema=False)
+def login_page() -> Any:
+    page = WEB_DIR / "login.html"
+    if not page.is_file():
+        return HTMLResponse("<h1>Login page missing</h1>", status_code=500)
+    return FileResponse(page, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------

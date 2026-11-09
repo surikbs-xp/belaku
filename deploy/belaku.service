@@ -1,0 +1,29 @@
+[Unit]
+Description=Belaku GIFT Nifty execution bot
+Documentation=https://github.com/surikbs-xp/belaku
+# Docker must be up before the compose stack can start.
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/belaku
+
+# `up -d` returns once the container is started, so this unit is oneshot with
+# RemainAfterExit: systemd tracks the stack, not a foreground process.
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart bot
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+# Restart the stack if it dies. The container also has `restart: unless-stopped`,
+# but that only covers the container process; this covers the daemon losing the
+# stack entirely (a host reboot, or a `docker compose down` by hand).
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

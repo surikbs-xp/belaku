@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import database as db
+import risk
 import strategy
 from config import PAPER, get_execution_mode, settings, strategy_params
 from gift_nifty import GIFT_KEY, get_feed
@@ -106,6 +107,69 @@ class StrategyEngine:
         self._last_bar_at: Optional[str] = None
         # Memoised dashboard verdicts, keyed by (bar timestamp, candle count).
         self._verdict_cache: dict[str, tuple[tuple[str, int], strategy.StrategyVerdict]] = {}
+        # Latched risk breach. Sticky on purpose: a limit that clears itself
+        # when price recovers turns one bad day into a run of them.
+        self._breach: Optional[risk.Breach] = None
+
+    # -- risk ------------------------------------------------------------
+    @property
+    def breach(self) -> Optional[risk.Breach]:
+        """The latched risk breach, if any."""
+        return self._breach
+
+    def clear_breach(self) -> None:
+        """Operator acknowledgement. Resumes entries; does not close anything."""
+        with self._lock:
+            if self._breach is not None:
+                log.warning("Risk breach cleared by operator: %s", self._breach.detail)
+            self._breach = None
+
+    def enforce_risk(self) -> Optional[dict[str, Any]]:
+        """Apply the risk limits. Returns the breach dict when one is active.
+
+        Called from the loop rather than from signal handling so it runs even
+        when no signal fires - a position drifting against entry produces no
+        signal at all, which is exactly the case a stop-loss exists for.
+        """
+        mode = get_execution_mode()
+        manager = get_order_manager()
+
+        if self._breach is not None:
+            return self._breach.to_dict()
+
+        breach = risk.evaluate(mode)
+        if breach is None:
+            return None
+
+        with self._lock:
+            self._breach = breach
+        log.error("RISK LIMIT BREACHED: %s", breach.detail)
+
+        # Close only the offending symbol. A stop-loss is a per-position limit,
+        # so flattening unrelated positions would be a bigger action than the
+        # breach calls for.
+        symbol = breach.symbol
+        try:
+            result = manager.square_off(
+                reason=breach.kind, source=f"RISK_{breach.kind}", symbol=symbol
+            )
+            log.error(
+                "Risk square-off (%s): ok=%s %s",
+                breach.kind, result.ok, result.reason,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("Risk square-off failed")
+            result = None
+
+        # Pause regardless of whether the square-off succeeded. Leaving entries
+        # open after a breach would let the strategy re-enter the same position.
+        manager.pause(f"{breach.kind}: {breach.detail}")
+
+        payload = breach.to_dict()
+        payload["square_off_ok"] = bool(result and result.ok)
+        payload["square_off_reason"] = result.reason if result else "square-off raised"
+        payload["paused"] = manager.paused
+        return payload
 
     def _opposes_open_paper_position(self, signal: str) -> bool:
         if get_execution_mode() != PAPER or signal not in {strategy.BULL, strategy.BEAR}:
@@ -341,6 +405,12 @@ class StrategyEngine:
         log.info("Strategy engine started (poll %.1fs, GIFT Nifty bars)", period)
         while not stop.wait(period):
             try:
+                self.enforce_risk()
+            except Exception as exc:  # pragma: no cover - defensive
+                log.exception("Risk check failed")
+                with self._lock:
+                    self.state.last_error = f"risk check: {exc}"
+            try:
                 self.evaluate_now()
             except Exception as exc:  # pragma: no cover - defensive
                 log.exception("Engine evaluation failed")
@@ -421,6 +491,9 @@ class StrategyEngine:
         payload["mode"] = mode
         payload["will_execute"] = bool(market["is_open"] or mode == PAPER)
         payload["paused"] = get_order_manager().paused
+        payload["paused_reason"] = get_order_manager().paused_reason
+        payload["risk"] = risk.limits()
+        payload["risk_breach"] = self._breach.to_dict() if self._breach else None
         return payload
 
 

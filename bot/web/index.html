@@ -26,7 +26,7 @@
     },
   };
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=trader-8" />
+<link rel="stylesheet" href="/static/styles.css?v=trader-10" />
 </head>
 
 <body class="bg-ink-950 text-slate-200 antialiased">
@@ -62,6 +62,7 @@
         </div>
         <button id="btn-pause" class="btn btn-neutral header-control-button">Pause</button>
         <button id="btn-panic" class="btn btn-danger header-control-button" title="Emergency square-off all open positions">Square off</button>
+        <button id="btn-logout" class="btn btn-neutral header-control-button hidden" title="Sign out of the dashboard">Sign out</button>
       </div>
       <div class="header-status-row">
         <span id="pill-market" class="pill pill-idle">Market —</span>
@@ -87,6 +88,18 @@
       </div>
     </div>
     <button id="btn-resume" class="btn btn-warn">Resume strategy</button>
+  </div>
+
+  <!-- ── Risk breach ────────────────────────────────────────────────── -->
+  <div id="risk-banner" class="risk-banner hidden">
+    <div class="pause-banner-copy">
+      <span class="pause-banner-icon">🛑</span>
+      <div>
+        <p class="pause-banner-title" id="risk-banner-title">Risk limit breached</p>
+        <p class="pause-banner-sub" id="risk-banner-sub"></p>
+      </div>
+    </div>
+    <button id="btn-risk-clear" class="btn btn-warn">Acknowledge &amp; resume</button>
   </div>
 
   <!-- ── LIVE readiness ─────────────────────────────────────────────── -->
@@ -462,6 +475,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=trader-8" defer></script>
+<script src="/static/app.js?v=trader-10" defer></script>
 </body>
 </html>

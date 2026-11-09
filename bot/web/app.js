@@ -221,6 +221,13 @@ async function api(url, options) {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
+  // The session expired or was revoked. Reloading lands on the login page via
+  // the server's redirect, which is better than a toast the operator may miss
+  // while the dashboard silently stops updating.
+  if (response.status === 401) {
+    window.location.replace('/login');
+    throw new Error('Session expired');
+  }
   const text = await response.text();
   let body = null;
   try {
@@ -312,6 +319,8 @@ function renderStatus(status) {
   const banner = $('paused-banner');
   banner.classList.toggle('hidden', !strategy.paused);
   banner.classList.toggle('flex', !!strategy.paused);
+
+  renderRiskBanner(status.engine || {});
 
   const pauseBtn = $('btn-pause');
   pauseBtn.textContent = strategy.paused ? 'Resume' : 'Pause';
@@ -1312,6 +1321,64 @@ async function togglePause() {
   });
 }
 
+/* Risk breach banner. The engine latches a breach and pauses entries, so this
+   is the operator's only signal that the bot stopped trading on its own. */
+function renderRiskBanner(engine) {
+  const banner = $('risk-banner');
+  const breach = engine.risk_breach;
+  if (!breach) {
+    banner.classList.add('hidden');
+    return;
+  }
+  const label = 'Stop-loss triggered';
+  $('risk-banner-title').textContent = label;
+  $('risk-banner-sub').textContent = breach.detail || '';
+  banner.classList.remove('hidden');
+}
+
+async function clearRiskBreach() {
+  const ok = await confirmDialog({
+    title: 'Acknowledge risk breach',
+    body: 'This clears the latched limit and allows new entries again. '
+      + 'It does <strong>not</strong> reopen any position. Only continue if you '
+      + 'have reviewed why the limit fired.',
+    okLabel: 'Acknowledge',
+    danger: false,
+  });
+  if (!ok) return;
+  await withBusy(async () => {
+    try {
+      await api('/api/risk/clear', { method: 'POST' });
+      toast('Risk breach acknowledged', 'ok');
+      await poll();
+    } catch (error) {
+      toast(`Risk: ${error.message}`, 'err');
+    }
+  });
+}
+
+async function signOut() {
+  try {
+    await api('/api/auth/logout', { method: 'POST' });
+  } catch (error) {
+    // Even if the call fails the cookie may be gone; the reload decides.
+  }
+  window.location.replace('/login');
+}
+
+/* Reveal the sign-out control only when a password is actually configured,
+   so a local no-password dashboard is not cluttered with a dead button. */
+async function initAuth() {
+  try {
+    const status = await api('/api/auth/status');
+    if (status && status.auth_required) {
+      $('btn-logout').classList.remove('hidden');
+    }
+  } catch (error) {
+    // A failure here means the session is already gone; api() redirects.
+  }
+}
+
 async function panic() {
   const ok = await confirmDialog({
     title: '🚨 Panic square-off',
@@ -1534,6 +1601,8 @@ function init() {
   $('btn-pause').addEventListener('click', togglePause);
   $('btn-resume').addEventListener('click', togglePause);
   $('btn-panic').addEventListener('click', panic);
+  $('btn-logout').addEventListener('click', signOut);
+  $('btn-risk-clear').addEventListener('click', clearRiskBreach);
   $('btn-orders-csv').addEventListener('click', exportCsv);
 
   $('logs-level').addEventListener('change', () => {
@@ -1605,6 +1674,7 @@ function init() {
   });
 
   switchTab('monitor');
+  initAuth();
   poll();
   state.timer = setInterval(poll, POLL_MS);
   state.tickTimer = setInterval(tickCountdown, TICK_MS);
