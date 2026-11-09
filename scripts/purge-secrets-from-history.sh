@@ -39,6 +39,12 @@ fi
 
 # Paths to drop. `--path` in git-filter-repo is an exact path match, so each
 # variant has to be listed. Patterns are passed with --path-glob instead.
+#
+# NOTE: `.env.example` is deliberately absent. The .env candidates below are
+# exact names and `*.env` is not among them, so the templates never match and
+# need no "protect" pass. Adding one would be actively harmful: under
+# --invert-paths every --path/--path-glob is a *removal* target, so a protect
+# glob deletes the very files it was meant to spare.
 PATHS=(
   ".env"
   "bot/.env"
@@ -48,7 +54,6 @@ PATHS=(
   ".env.local"
 )
 GLOBS=("backups/*.db" "backups/*.db-shm" "backups/*.db-wal")
-PROTECT=("*.env.example" ".env.example" "bot/.env.example")
 
 echo "Repository: $REPO_ROOT"
 echo "Mode:       ${MODE#--}"
@@ -124,8 +129,6 @@ FR="$(command -v git-filter-repo || echo "$REPO_ROOT/.venv/bin/git-filter-repo")
 args=(--force --invert-paths)
 for p in "${present_paths[@]}"; do args+=(--path "$p"); done
 for g in "${present_globs[@]}"; do args+=(--path-glob "$g"); done
-# Belt and braces: even if a template matched, keep it.
-for p in "${PROTECT[@]}"; do args+=(--path-glob "$p"); done
 
 echo "Rewriting history..."
 "$FR" "${args[@]}"
@@ -154,10 +157,20 @@ done
 echo "  clean."
 
 echo
-echo "Templates still present (expected):"
-for p in "${PROTECT[@]}"; do
-  git ls-files --error-unmatch "$p" >/dev/null 2>&1 && echo "  kept  $p"
+echo "Templates still present (must be kept):"
+for p in ".env.example" "bot/.env.example"; do
+  if git log --oneline --all -- "$p" >/dev/null 2>&1 \
+     && [[ -n "$(git log --oneline --all -- "$p")" ]]; then
+    echo "  kept  $p"
+  else
+    echo "  MISSING  $p" >&2
+    failed=1
+  fi
 done
+[[ "$failed" -eq 0 ]] || {
+  echo "ERROR: a .env.example template was removed. Restore it from the backup above." >&2
+  exit 1
+}
 
 cat <<EOF
 
