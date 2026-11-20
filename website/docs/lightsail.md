@@ -214,6 +214,20 @@ This is not optional when you use OIDC: the trust policy in step 2 matches on
 environment presents a `:ref:refs/heads/main` subject instead, which the policy
 rejects. With access keys the environment is only a gate, not a requirement.
 
+### Skipping the deploy
+
+The `preflight` job decides whether the deploy can run. With **no** AWS secret
+set, `deploy` is skipped and the workflow stays green; the bot also runs from
+`docker compose up` and from [`deploy/belaku.service`](hosting.md), so an
+un-deployed repository is a valid state and a red run should mean the code broke.
+
+Two cases still fail, deliberately:
+
+| Situation | Result |
+| --- | --- |
+| Only one of `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` set | `preflight` fails — a half-configured key pair is a mistake, not an absent integration |
+| `workflow_dispatch` | `deploy` always runs, so a manual deploy is never silently skipped |
+
 ### 5. Register the callback URL with Kite
 
 The bot's public domain is assigned by Lightsail and is not known until the

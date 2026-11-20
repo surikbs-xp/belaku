@@ -53,8 +53,50 @@ jobs:
       - name: Test
         run: python -m pytest -q
 
+  # Decides whether there is anything to deploy *before* the deploy job runs.
+  #
+  # A job-level `if:` cannot read `secrets`, so the check has to be a step, and a
+  # step that fails cannot stop a job that has already started. This job publishes
+  # the answer as an output the deploy job gates on instead.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Check whether deploy credentials exist
+        id: check
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -n "$AWS_ROLE_ARN" ]; then
+            echo "OIDC role configured: $AWS_ROLE_ARN"
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "Access-key pair configured"
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$AWS_ACCESS_KEY_ID" ] || [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+            # One half of the pair set is a mistake, not an absent integration:
+            # it must be reported rather than silently skipped.
+            echo "::error::Only one of AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY is set. Set both, or neither (and use AWS_ROLE_ARN for OIDC). See website/docs/lightsail.md."
+            exit 1
+          else
+            echo "No AWS credentials configured; the deploy will be skipped."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
   deploy:
-    needs: test
+    needs: [test, preflight]
+    # A repository that has never set an AWS secret used to go red on every push
+    # with "Could not load credentials from any providers" - a failure unrelated
+    # to the code. The bot also runs from `docker compose up` and
+    # `deploy/belaku.service`, so an un-deployed repository is a valid state. A
+    # manual run always deploys, so an operator asking for it is never silently
+    # skipped.
+    if: >-
+      needs.preflight.outputs.configured == 'true' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment:
       name: lightsail

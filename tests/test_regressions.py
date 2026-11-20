@@ -1801,6 +1801,32 @@ def test_market_status_opens_on_a_normal_session(monkeypatch, tmp_path) -> None:
     assert status["calendar_known"] is True
 
 
+def test_the_suite_has_a_calendar_without_network_access() -> None:
+    """Every test must see a trading calendar without reaching NSE.
+
+    ``market_status`` reports the session unverified when no calendar has loaded,
+    and an unverified session rejects every order. The cache lives under
+    ``bot/data/``, which is gitignored, so a developer machine had one and a CI
+    runner did not: ~20 engine tests passed locally and failed in CI on the same
+    commit with "Outside market hours (Session unverified)". The suite also
+    depended on NSE being reachable, so the same SHA passed one run and failed
+    the next.
+
+    The conftest fixture supplies the calendar offline. This pins that it stays
+    that way - if it is ever removed, this fails by name instead of as a dozen
+    unrelated order rejections.
+    """
+    calendar = kite_client.get_calendar()
+
+    assert calendar.available, "the test suite must not depend on a live NSE fetch"
+    assert calendar.status()["source"] == "cache"
+    # A mid-week, non-holiday date is open; that is the state the engine tests
+    # assume when they act on a bar.
+    status = kite_client.market_status(datetime(2026, 11, 11, 11, 0, tzinfo=IST))
+    assert status["calendar_known"] is True
+    assert status["is_open"] is True
+
+
 def _stub_client(calls: dict[str, int]) -> KiteClient:
     """A KiteClient whose SDK calls are counted instead of hitting the network."""
     client = KiteClient(api_key="key", access_token="token")
