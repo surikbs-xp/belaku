@@ -362,9 +362,33 @@ from somewhere else.
 | Approach | Manual steps | Notes |
 | --- | --- | --- |
 | Log in through the dashboard | One per trading day | No redeploy; survives a restart, not a redeploy |
-| Refresh `KITE_ACCESS_TOKEN` secret + redeploy | One per trading day | `gh secret set` then `gh workflow run` |
+| Refresh `KITE_ACCESS_TOKEN` secret + redeploy | One per trading day | `scripts/kite-token.py --github`, then `gh workflow run` |
 | Run on a residential/VPS IP and use headless login | None | Only if Zerodha does not challenge that IP |
 | Run on a VM with a persistent volume | One per trading day, via the dashboard | The token survives restarts *and* redeploys — see [Hosting](./hosting.md) |
+
+### Refreshing the token with the helper script
+
+`scripts/kite-token.py` runs the three steps that are easy to get wrong by hand:
+it builds the login URL from the app's own `api_key`, exchanges the
+`request_token` for an access token, **verifies the token with Kite before
+claiming success**, writes it into `bot/.env`, and can push it to the
+`KITE_ACCESS_TOKEN` secret.
+
+```bash
+# Interactive: prints the login URL, paste the redirect URL back.
+scripts/kite-token.py
+
+# Publish the token you already have (re-checks it is still valid first).
+scripts/kite-token.py --push-secret
+
+# Both at once, for the daily Lightsail routine.
+scripts/kite-token.py --request-token '<redirect URL>' --github
+```
+
+A `request_token` is single-use and expires within a minute, so paste the
+redirect promptly; if it is rejected, run the script again for a fresh URL. No
+dependency install is needed — the exchange is done with `urllib` and
+`hashlib`.
 
 ### Logging in through the dashboard
 

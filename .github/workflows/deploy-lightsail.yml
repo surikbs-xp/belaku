@@ -152,6 +152,10 @@ jobs:
           KITE_TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
           DASHBOARD_SESSION_SECRET: ${{ secrets.DASHBOARD_SESSION_SECRET }}
+          # ALERT_ENABLED was documented as a secret but never passed, so setting
+          # it did nothing: the container kept the .env default of 0 and stayed
+          # silent however the secret was set.
+          ALERT_ENABLED: ${{ secrets.ALERT_ENABLED }}
           ALERT_CHANNEL: ${{ secrets.ALERT_CHANNEL }}
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
           ALERT_TELEGRAM_BOT_TOKEN: ${{ secrets.ALERT_TELEGRAM_BOT_TOKEN }}
@@ -164,7 +168,7 @@ jobs:
           for name in KITE_API_KEY KITE_API_SECRET KITE_ACCESS_TOKEN \
                       KITE_USER_ID KITE_PASSWORD KITE_TOTP_SECRET \
                       DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET \
-                      ALERT_CHANNEL ALERT_WEBHOOK_URL \
+                      ALERT_ENABLED ALERT_CHANNEL ALERT_WEBHOOK_URL \
                       ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID \
                       EXECUTION_MODE; do
             value="$(printenv "$name" || true)"
