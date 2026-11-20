@@ -101,8 +101,10 @@ leaves the row `OPEN`; a full close flips `status` to `CLOSED`.
 | `entry_price` | REAL | |
 | `entry_time` | TEXT | ISO-8601 IST |
 | `last_price` | REAL | Last mark, updated by the mark loop |
-| `sl_price` | REAL | Reserved; the strategy has no stop-loss |
-| `trailing_stop` | REAL | Reserved |
+| `sl_price` | REAL | **Legacy.** Retained for schema compatibility; nothing writes it now that the exit is signal-driven |
+| `initial_sl_price` | REAL | **Legacy**, same reason |
+| `trailing_stop` | REAL | **Legacy**, same reason |
+| `best_price` | REAL | Best favourable price since entry: the high for a long, the low for a short. Still maintained so an older ledger stays coherent, but nothing reads it |
 | `status` | TEXT | `OPEN` or `CLOSED`. `CHECK` constrained |
 | `exit_price` | REAL | Set on full close |
 | `exit_time` | TEXT | Set on full close |
@@ -218,16 +220,17 @@ Every strategy verdict, whether or not it became an order.
 |---|---|---|
 | `id` | INTEGER PK | |
 | `ts` | TEXT | ISO-8601 IST |
-| `action` | TEXT | `BULL`, `BEAR`, `NEUTRAL`, `FLAT`, `PANIC` |
+| `action` | TEXT | `BULL`, `BEAR`, `FLAT`, `PANIC` |
 | `payload` | TEXT | JSON: the indicator values behind the verdict |
 | `accepted` | INTEGER | `1` accepted, `0` blocked |
 | `reason` | TEXT | Why it was blocked, when it was |
 
 **Index:** `idx_signals_ts (ts DESC)`.
 
-This table is the answer to "why didn't it trade?". A `NEUTRAL` verdict with
+This table is the answer to "why didn't it trade?". A blocked entry with
 `accepted = 0` and a reason is a complete explanation, and it is the reason this
-table exists at all.
+table exists at all. A bar where the two indicators disagree writes no row at
+all: it is not an action, and there is no neutral exit to record.
 
 ---
 
@@ -282,6 +285,21 @@ The journal endpoints (`/api/journal`) and this table are functional but the
 dashboard no longer surfaces them. The data model is kept because the
 endpoints are still served.
 :::
+
+## `settings`
+
+Operator-editable values that must survive a restart. A key/value table rather
+than columns, so a new setting does not need a migration.
+
+| Column | Type | Notes |
+|---|---|---|
+| `key` | TEXT PK | Setting name |
+| `value` | TEXT | Stored as text; coerced on read |
+| `updated_at` | TEXT | IST timestamp of the last write |
+
+Currently holds the owed-entry latch, so a signal deferred across a session
+boundary survives a restart. The trailing-stop fields that used to live here are
+no longer read: there is no stop to configure.
 
 
 ---

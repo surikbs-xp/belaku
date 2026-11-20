@@ -17,7 +17,7 @@ import TabItem from "@theme/TabItem";
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-dev.txt
 test -f bot/.env || cp bot/.env.example bot/.env
 ```
 

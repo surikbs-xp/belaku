@@ -13,35 +13,80 @@ title: Dashboard
 
 The trading view. Top to bottom:
 
-- **Signal hero** — the current verdict (BULL / BEAR / NEUTRAL), accented by
-  state, with the close, PSAR and SuperTrend vote counts.
-- **Candle countdown** — time until the current GIFT Nifty bar closes (the label
-  follows `GIFT_CANDLE_INTERVAL`), anchored to
-  the server's bucket start so a skewed client clock cannot shift it.
-- **GIFT Nifty quote** — the signal source, with a client-side sparkline, and
-  the execution future's ticks directly beneath it. The basis between the two
-  (future minus GIFT) is shown next to the price, because that is what the
-  signal has to overcome before a trade is profitable. The line under it says
-  whether the number came from a live tick or a polled quote, and flags it as
-  stale after 60 seconds.
-- **Execution panel** — the Nifty future, lots, product.
-- **Live indicators** — SuperTrend vote bar (one segment per instance, labelled
-  with its line value) and Parabolic SAR.
-- **Account metrics** — portfolio value, real-time PnL, margin available with a
-  utilisation bar, active mode.
-- **Open positions** — with PnL and points.
-- **Live rule checks** — exactly which of the two entry rules pass, for BUY and
-  SELL separately.
+- **Market strip** — the signal source's price with a sparkline, the execution
+  future with its lots, product, **expiry** and the contract it **rolls to**, and
+  the future's own ticks with the basis against the signal source. Global rather
+  than per-book: both books trade the same future and read the same two series,
+  so repeating them per band would be four copies of two numbers.
+- **One band per strategy** — side by side from 760px. Each band is a complete
+  view of that book, because two books are two independent strategies and a
+  shared panel would have to be read twice without ever saying which figure
+  belonged to which:
+
+  | Section | What it shows |
+  |---|---|
+  | **Head** | Name, venue tag (`GIFT` / `NIFTY`, shown only when the name does not already say it), series, interval, lots, exit rule, entry filters, and a running/warming/error pill |
+  | **Signal** | The verdict as a filled chip — green for a long book, red for a short one — with the band's left rail and border carrying the same direction so two bands compare by colour before either is read |
+  | **Indicators & rule checks** | One row per indicator. Each states its level, its own direction, the distance price must travel to flip it, and whether it agrees with the verdict. A gap under a quarter of the bar's own range turns amber. The close the verdict used sits above the rows |
+  | **Account** | That book's own equity, net P&L, trade count, win rate and profit factor |
+  | **Position** | What that book currently holds, or `Flat` |
+
+  Indicators and rule checks share one table because they are the same two
+  numbers read two ways. A single `2 of 2 confirmed` count hides *which*
+  indicator voted which way, so a split bar reads as a weaker version of an
+  agreeing one; naming each rule and colouring it by its own direction makes the
+  disagreement the visible thing. A split bar's rows say `split` rather than
+  leaving a dash that reads as missing data.
+
+  Every figure comes from that book's own ledger and its own verdict. The close
+  in particular is the one *that run* computed — measuring a book's
+  distance-to-flip against another book's price would be quietly wrong.
+- **Shadow paper book** — shown only when `PAPER_MIRROR=1` and LIVE is armed:
+  live vs paper P&L and the model's error between them.
+- **Alerting** — channel, target, whether it is armed, alerts sent, last alert
+  kind and watchdog health, with a **Send test alert** button. A channel that is
+  silently misconfigured looks exactly like a quiet market, so it is testable on
+  demand.
+
+There is no aggregate portfolio panel. Each band carries its own account, so a
+page-level total repeated equity and P&L without answering anything a band did
+not; the Performance tab carries the venue-scoped totals.
+
+There is no session loss cap panel, because there is no session loss cap — see
+[Configuration](./configuration.md).
 
 ### Orders & signals
 
 Searchable, mode-filtered order book plus the engine signal trail — placed,
 held, deferred, and **why**. CSV export.
 
+A **venue** selector scopes the whole tab to one book: *Nifty future* or *GIFT
+Nifty index*. The two books live in different databases, so this is a real scope
+switch rather than a filter — the index book's rows can never appear under the
+futures heading. The mode filter is disabled for the index book, which has no
+LIVE path at all, and the CSV filename names the venue so two exports are
+distinguishable.
+
+The **signal trail follows the same selector**: the index venue reads
+`/api/gift/signals` from its own ledger, so a book that traded always shows the
+decisions behind those fills. When the selected book is empty but the other one
+has rows, the empty state names the other book and its row count instead of
+reading as "the bot did nothing".
+
 ### Performance & trades
 
 Headline stats, a P&L calendar (green/red day cells with trade count and win
 rate, holiday cells for NSE closures), and the trade ledger.
+
+The same **venue** selector scopes the tab, including the headline tiles and the
+calendar: the index venue reads `/api/gift/analytics` and `/api/gift/portfolio`
+instead of the futures endpoints. When `GIFT_BOOK` is off the tab says so rather
+than showing an empty calendar, which would read as "no trades" instead of "this
+book is not running".
+
+The futures venue reuses the portfolio payload the 1.5 s poll already fetched,
+cached in the page, so opening the tab or switching back to it never blanks the
+tiles while waiting for the next poll.
 
 ### Logs
 
@@ -63,13 +108,16 @@ Credentials are masked server-side (`access_token=***`) before the lines are
 sent, because this page is unauthenticated. See
 [API → `/api/logs`](/api#status) for the details.
 
+Timestamps are IST, matching the rest of the dashboard. The container itself
+runs in UTC, so the formatter converts rather than trusting the system clock.
+
 ## Polling
 
 | Cadence | Endpoints |
 |---|---|
 | 1.5 s | `/api/status`, `/api/portfolio` |
 | 3 s | `/api/logs` — **only while the Logs tab is open** |
-| 5 s | positions, orders, trades, signals |
+| 5 s | positions, orders, trades, signals — both books |
 | 20 s | Kite token health, LIVE readiness |
 | 60 s | calendar rollup, holidays |
 
@@ -80,9 +128,11 @@ tab and stops when you leave it, so an idle dashboard never touches the file.
 
 ## Design notes
 
-**The vote bar is per-instance, not aggregate.** Three segments, each labelled
-with its own SuperTrend line value and tinted by its own direction. An aggregate
-"2 of 3" hides which period dissented.
+**The indicator bars are one segment each.** There is a single SuperTrend
+instance, so its bar is green when bullish and red when bearish rather than a
+count across periods; PSAR is likewise one binary price-position check. The rule
+confirmation still reads "2 of 2", because that counts the two *rules*, not
+SuperTrend instances.
 
 **The countdown is server-anchored.** The client measures elapsed time from the
 server's bucket start rather than trusting its own clock.

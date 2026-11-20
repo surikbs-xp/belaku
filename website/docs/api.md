@@ -26,6 +26,11 @@ costs one seek rather than a full parse. `level` is a **minimum** severity —
 `WARNING` also returns `ERROR` and `CRITICAL` — and a traceback stays attached
 to the entry it explains instead of being filtered out as unparsed noise.
 
+Log lines are stamped in **IST**, not the container clock. The image runs in
+UTC, so a UTC stamp would sit 5h30m behind every other time on the dashboard and
+make a fresh entry look stale. Lines written before this was fixed keep their
+original UTC stamps.
+
 Anything matching `access_token=`, `api_secret=`, `request_token=`,
 `password=`, or the SDK's `Authorization: token <key>:<token>` header is masked
 to `***` **before** the search filter runs, so `?search=` cannot be used to
@@ -42,6 +47,22 @@ additionally pinned to `WARNING`, because at `DEBUG` it prints the
 | `GET` | `/api/equity?limit=` | Cumulative equity curve |
 | `GET` | `/api/trades?limit=&mode=` | Settled round trips with fees and net PnL |
 | `GET` | `/api/analytics` | Trade statistics (KPIs, streaks, breakdowns) |
+| `GET` | `/api/mirror` | Shadow paper book: sync state, live vs paper comparison |
+| `GET` | `/api/venues` | Both books side by side — GIFT Nifty index vs Nifty future |
+| `GET` | `/api/gift/positions` | GIFT Nifty index-book positions (paper only) |
+| `GET` | `/api/gift/trades` | Settled round trips in the index book |
+| `GET` | `/api/gift/orders` | Index-book order log |
+| `GET` | `/api/gift/signals` | Index-book signal audit trail, including refusals |
+| `GET` | `/api/gift/summary` | Index-book health and metrics |
+| `GET` | `/api/gift/analytics` | Index-book trade statistics, shaped like `/api/analytics` |
+| `GET` | `/api/gift/portfolio` | Index-book account metrics, shaped like `/api/portfolio` |
+
+`/api/gift/analytics`, `/api/gift/portfolio` and `/api/gift/signals` are separate
+endpoints rather than a `venue` parameter on the futures ones. The two books are
+different databases, and a query parameter that silently switched ledgers would
+make a wrong number look like a real one. All of them report `enabled: false`
+when `GIFT_BOOK` is off, which is a normal state for the UI to render rather than
+a 500.
 
 ## Ledger
 
@@ -80,6 +101,10 @@ no longer shows them. Kept because they are still served.
 | `POST` | `/api/toggle-mode` | `{"mode":"PAPER\|LIVE","confirm":bool}` | Switch execution mode |
 | `POST` | `/api/pause` | `{"paused":bool,"reason":str}` | Pause new entries |
 | `POST` | `/api/panic` | `{"confirm":true,"reason":str}` | Square off and pause |
+`/api/risk/trailing` was removed along with the trailing stop, and the session
+loss cap was removed with it. There is no per-trade stop and no session limit to
+configure: the exit is the pair flipping, and `MAX_OPEN_LOTS` is the only
+exposure limit. Both are read from the environment rather than edited at runtime.
 
 ## Guards
 
@@ -109,21 +134,20 @@ curl -s localhost:9000/api/status | python -m json.tool
   "engine": {
     "ready": true,
     "warmup_have": 1187,
-    "warmup_needed": 14,
+    "warmup_needed": 15,
     "last_signal": "BULL",
     "current_values": {
       "psar": 24957.79,
-      "supertrend_bull": 3,
-      "supertrend_bear": 0,
-      "supertrend_total": 3,
-      "st_11_1": 25021.40,
-      "st_12_2": 25004.26,
-      "st_13_3": 24987.02
+      "supertrend": 25021.40,
+      "supertrend_bullish": true,
+      "supertrend_bearish": false,
+      "st_14_3": 25021.40
     }
   },
   "strategy_config": {
-    "supertrend_label": "11×1 · 12×2 · 13×3",
-    "min_agree": 2
+    "supertrend": { "length": 14, "multiplier": 3.0 },
+    "supertrend_label": "14×3",
+    "confirmations_total": 2
   }
 }
 ```

@@ -7,13 +7,13 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Getting started',
       collapsed: false,
-      items: ['setup', 'running', 'production'],
+      items: ['setup', 'running', 'production', 'hosting', 'lightsail'],
     },
     {
       type: 'category',
       label: 'Architecture',
       collapsed: false,
-      items: ['architecture', 'strategy', 'execution'],
+      items: ['architecture', 'strategy', 'execution', 'multi-strategy'],
     },
     {
       type: 'category',
@@ -31,7 +31,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Development',
       collapsed: false,
-      items: ['testing', 'performance', 'docs-site'],
+      items: ['testing', 'backtesting', 'performance', 'docs-site'],
     },
   ],
 };

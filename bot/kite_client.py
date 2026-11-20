@@ -53,6 +53,21 @@ _MONTH_NAMES = {m: name for m, name in zip(range(1, 13), (
 ))}
 EXPIRY_WEEKDAY = 1  # Tuesday: NSE's monthly F&O expiry day since Sep 2025
 
+# How many days before expiry the engine starts using the next month's contract.
+#
+# Rolling early is a deliberate trade-off. The front month is usually the more
+# liquid contract, so leaving it early costs some spread - but a position opened
+# in the last few days of a contract has to be closed or carried through an
+# expiry, and an expiry is a settlement event rather than a trade. Five days
+# leaves room for a signal to arrive and the position to be established in the
+# contract that will still exist next week.
+#
+# The window only decides which contract the engine *names*. An existing position
+# moves when a signal flips it (see ``OrderManager._execute_directional``), so a
+# quiet market can carry a position all the way to the close - which is why a leg
+# whose contract has stopped trading blocks new entries until it is squared off.
+ROLLOVER_DAYS_BEFORE_EXPIRY = 5
+
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
@@ -147,13 +162,183 @@ def _expiry_after(expiry: datetime) -> datetime:
     return datetime(year, month, _last_weekday_of_month(year, month, EXPIRY_WEEKDAY), 15, 30, tzinfo=IST)
 
 
-def future_symbol(now: Optional[datetime] = None, months_ahead: int = 0) -> str:
+def _expiry_before(expiry: datetime) -> datetime:
+    year, month = (expiry.year - 1, 12) if expiry.month == 1 else (expiry.year, expiry.month - 1)
+    return datetime(year, month, _last_weekday_of_month(year, month, EXPIRY_WEEKDAY), 15, 30, tzinfo=IST)
+
+
+def _expiry_has_passed(expiry: date, now: Optional[datetime] = None) -> bool:
+    """Whether the 15:30 close on ``expiry`` has passed.
+
+    Expiry day is still a trading day, so the date alone is not enough: the
+    contract is live until the close and only dead after it. One source of truth
+    for that instant, shared by the rollover status and the entry block.
+    """
+    moment = now or datetime.now(IST)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=IST)
+    if expiry < moment.date():
+        return True
+    return (
+        expiry == moment.date()
+        and moment.time().replace(tzinfo=None) > datetime_time(*MARKET_CLOSE)
+    )
+
+
+def contract_expiry(symbol: str) -> Optional[date]:
+    """Expiry date encoded in a symbol like ``NIFTY26NOVFUT``, if it parses.
+
+    The symbol carries the year and month but not the day, so the day is derived
+    from the same rule ``future_symbol`` uses to build it - keeping one source of
+    truth for "which Tuesday is expiry" instead of two that can drift.
+    """
+    try:
+        body = str(symbol).strip().upper()
+        if not (body.startswith("NIFTY") and body.endswith("FUT")):
+            return None
+        token = body[len("NIFTY") : -len("FUT")]
+        month_name = token[-3:]
+        months = {name: number for number, name in _MONTH_NAMES.items()}
+        month = months.get(month_name)
+        if month is None:
+            return None
+        year = 2000 + int(token[:-3])
+    except (ValueError, IndexError):
+        return None
+    return date(year, month, _last_weekday_of_month(year, month, EXPIRY_WEEKDAY))
+
+
+def expiry_label(symbol: str) -> Optional[str]:
+    """Human form of a contract's expiry, e.g. ``Tue 24 Nov 2026``.
+
+    The symbol encodes only the year and month, so the day comes from the same
+    last-Tuesday rule that builds the symbol. A label derived any other way could
+    disagree with the contract it is describing.
+    """
+    expiry = contract_expiry(symbol)
+    if expiry is None:
+        return None
+    return f"{expiry:%a %d %b %Y}"
+
+
+def rollover_at(now: Optional[datetime] = None) -> datetime:
+    """Moment the front month stops trading: the last Tuesday's 15:30 close.
+
+    NSE Nifty monthly futures expire on the last Tuesday of the month, and the
+    contract stops trading at the 15:30 close. A position still open at that
+    instant has no venue, so this is the deadline for rolling forward - the same
+    timestamp ``nearest_monthly_expiry`` uses to decide which month is current.
+    """
+    return nearest_monthly_expiry(now)
+
+
+def rollover_status(
+    now: Optional[datetime] = None,
+    open_symbol: Optional[str] = None,
+) -> dict[str, Any]:
+    """How close the front month is to expiry, for the dashboard and alerts.
+
+    ``rolled`` means the contract named by ``open_symbol`` has *stopped trading* -
+    the last Tuesday's 15:30 close has passed - which is the state in which an
+    open position has no venue left and needs a human decision.
+
+    It cannot be derived from ``nearest_monthly_expiry`` alone. That function
+    rolls the calendar forward at the close, so the contract it returns is always
+    still tradeable and a "has it expired" test against it is never true. The
+    deadline is therefore the expiry of the contract that is *currently*
+    front-month, which is the previous month's once the close has passed.
+
+    ``open_symbol`` is what makes ``rolled`` meaningful. The engine always trades
+    the current front month, so the only contract that can be expired is one
+    carried over from before the close; without it there is nothing to be late
+    for, and ``rolled`` is reported as False.
+    """
+    moment = now or datetime.now(IST)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=IST)
+    # The contract the engine trades *now*, and the one it will trade next. The
+    # first already accounts for the early rollover window, so inside the window
+    # `current_symbol` is next month's and `expiry` is that contract's expiry.
+    current_symbol = future_symbol(moment)
+    next_symbol = future_symbol(moment, months_ahead=1)
+    # The contract that is literally still trading, which is what "expiring" and
+    # "in the rollover window" are measured against - not the one the engine has
+    # already moved to.
+    calendar_expiry = nearest_monthly_expiry(moment)
+    days_to_calendar_expiry = (calendar_expiry.date() - moment.date()).days
+    # The expiry of the contract named by `current_symbol`, which is what the
+    # countdown points at. Inside the rollover window that is next month's.
+    expiry = (
+        calendar_expiry
+        if contract_expiry(current_symbol) == calendar_expiry.date()
+        else _expiry_after(calendar_expiry)
+    )
+
+    open_expiry = contract_expiry(open_symbol) if open_symbol else None
+    # A contract stops trading at the 15:30 close on its expiry day, so the same
+    # date is only expired once that instant has passed.
+    open_expired = bool(open_expiry is not None and _expiry_has_passed(open_expiry, moment))
+    return {
+        "current_symbol": current_symbol,
+        "next_symbol": next_symbol,
+        "expiry": expiry.isoformat(timespec="seconds"),
+        "expiry_date": expiry.date().isoformat(),
+        "expiry_label": expiry_label(current_symbol),
+        "next_expiry_label": expiry_label(next_symbol),
+        "seconds_to_expiry": round((expiry - moment).total_seconds()),
+        "days_to_expiry": (expiry.date() - moment.date()).days,
+        "expiring_today": calendar_expiry.date() == moment.date(),
+        # True once the engine has moved to the next month, which happens
+        # ROLLOVER_DAYS_BEFORE_EXPIRY days before the old contract expires.
+        "in_rollover_window": days_to_calendar_expiry <= ROLLOVER_DAYS_BEFORE_EXPIRY,
+        "rollover_days": ROLLOVER_DAYS_BEFORE_EXPIRY,
+        "calendar_symbol": f"NIFTY{calendar_expiry:%y}{_MONTH_NAMES[calendar_expiry.month]}FUT",
+        "calendar_expiry_date": calendar_expiry.date().isoformat(),
+        "days_to_calendar_expiry": days_to_calendar_expiry,
+        "open_symbol": open_symbol or None,
+        "open_expiry": open_expiry.isoformat() if open_expiry else None,
+        "open_expiry_label": expiry_label(open_symbol) if open_symbol else None,
+        "rolled": open_expired,
+        # A leg whose contract has stopped trading has no venue left, so it is an
+        # expiry to resolve by hand rather than something the bot can trade out
+        # of. New entries are blocked until it is squared off: opening the next
+        # month beside it would be two contracts at once, which is the double
+        # exposure the order manager refuses anyway.
+        "entries_blocked": open_expired,
+    }
+
+
+def future_symbol(
+    now: Optional[datetime] = None,
+    months_ahead: int = 0,
+    *,
+    rollover_days: int = ROLLOVER_DAYS_BEFORE_EXPIRY,
+) -> str:
     """Trading symbol for the Nifty futures contract (0 = current month).
 
     Must match the symbols in Kite's NFO instrument dump exactly, because the
     result is looked up there to resolve an instrument token.
+
+    ``rollover_days`` moves the switch earlier than the expiry itself: with the
+    default of 5, the last five days of the contract's life already resolve to
+    the *next* month. That is what makes "roll over on the next signal" work -
+    the engine simply stops naming the expiring contract, so a signal inside the
+    window opens the new month and the old position is closed by the normal flip
+    path rather than being carried into an expiry.
+
+    Pass ``rollover_days=0`` for the contract that is literally still trading
+    (the expiry calendar itself), which is what the rollover status and the
+    expiry gate need.
     """
     expiry = nearest_monthly_expiry(now)
+    if rollover_days > 0:
+        moment = now or datetime.now(IST)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=IST)
+        # Compare whole days: the window is a date range, not a countdown, so a
+        # signal at 09:20 and one at 15:20 on the same day agree.
+        if (expiry.date() - moment.date()).days <= rollover_days:
+            expiry = _expiry_after(expiry)
     for _ in range(max(0, months_ahead)):
         expiry = _expiry_after(expiry)
     return f"NIFTY{expiry:%y}{_MONTH_NAMES[expiry.month]}FUT"
@@ -386,6 +571,44 @@ class KiteClient:
             return contracts[months_ahead]
         return None
 
+    def front_month_symbol(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        rollover_days: Optional[int] = None,
+        months_ahead: int = 0,
+    ) -> str:
+        """Tradingsymbol of the contract LIVE should trade, from Kite's dump.
+
+        Composed from ``future_symbol`` rather than picked by index so that LIVE
+        and PAPER switch on the same rule: ``front_month_contract`` walks the
+        dump in expiry order, which never rolls early, so using it to choose the
+        contract made LIVE ride the front month to the cash close while PAPER had
+        already moved on.
+
+        The context is still pinned to the *calendar* front month, so the result
+        is the calendar contract or the next one - never a third month. That
+        matters because index 0 and index 1 of the dump coincide with the
+        calendar months only while no historical expiry lingers as unexpired;
+        deriving from the calendar makes the selection independent of that.
+
+        Returns an empty string when the calendar month is not in the dump, which
+        is how the caller detects a stale instrument cache rather than sending an
+        order for a contract the broker does not list.
+        """
+        if rollover_days is None:
+            rollover_days = ROLLOVER_DAYS_BEFORE_EXPIRY
+        moment = now or datetime.now(IST)
+        calendar_symbol = future_symbol(moment, rollover_days=0)
+        available = {
+            str(item.get("tradingsymbol"))
+            for item in self.nifty_future_instruments()
+            if item.get("tradingsymbol")
+        }
+        if calendar_symbol not in available:
+            return ""
+        return future_symbol(moment, months_ahead=months_ahead, rollover_days=rollover_days)
+
     # -- Market data -----------------------------------------------------
     def get_quote(self, symbol: str, max_age: float = QUOTE_CACHE_SECONDS) -> Optional[dict[str, Any]]:
         """Live LTP/OHLC for ``symbol``; ``None`` when unavailable.
@@ -428,6 +651,9 @@ class KiteClient:
         self._last_prices[symbol] = price
         self._last_quote_at = datetime.now(IST)
         ohlc = payload.get("ohlc", {}) or {}
+        # Depth is optional and, when present, drives the paper fill model. It is
+        # passed through verbatim - the fill module owns its normalisation.
+        depth = payload.get("depth")
         quote = {
             "symbol": symbol,
             "last_price": price,
@@ -436,6 +662,7 @@ class KiteClient:
             "low": ohlc.get("low"),
             "close": ohlc.get("close"),
             "volume": payload.get("volume"),
+            "depth": depth if isinstance(depth, dict) else None,
             "timestamp": payload.get("last_trade_time") or payload.get("timestamp"),
             "source": "KITE",
         }
@@ -489,6 +716,12 @@ class KiteClient:
         return self._last_prices.get(symbol)
 
     def latest_known_price(self, symbol: str) -> Optional[float]:
+        """Last cached price for ``symbol``, or None if none was ever seen.
+
+        Distinct from :meth:`get_ltp`, which goes to the quote endpoint first.
+        This is the in-memory cache only, so it answers "what did the market last
+        say about this contract" without a network call.
+        """
         return self._last_prices.get(symbol)
 
     def remember_tick(self, symbol: str, price: float) -> None:
@@ -532,9 +765,19 @@ class KiteClient:
         order_type: str = "MARKET",
         product: str = "NRML",
         tag: str = "niftybot",
+        mode: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Place a real order (LIVE) or return a mocked acknowledgement (PAPER)."""
-        if self.is_paper:
+        """Place a real order (LIVE) or return a mocked acknowledgement (PAPER).
+
+        ``mode`` is the *book's* mode, not the process's. This used to read only
+        ``self.mode``, so once one book could be live while another stayed in
+        paper, the paper book's order went to the broker for real: ``order_manager``
+        had already decided the order was simulated and booked it as such, while
+        this method submitted it. Defaulting to the client's mode keeps a caller
+        that does not know about books working as before.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
             order_id = f"PAPER-{datetime.now(IST):%Y%m%d%H%M%S}-{random.randint(1000, 9999)}"
             return {
                 "order_id": order_id,
@@ -542,6 +785,9 @@ class KiteClient:
                 "average_price": price,
                 "mode": PAPER,
                 "mocked": True,
+                # The paper fill model runs against the visible order book when it
+                # is available; the order path reads this back off the quote.
+                "depth": (self.get_quote(symbol, max_age=0) or {}).get("depth"),
                 "message": "Simulated order (paper mode)",
             }
         try:
@@ -612,10 +858,16 @@ class KiteClient:
                     return True
             return False
 
+        # Poll fast at first, then back off. A market order normally fills in
+        # well under 200 ms, so a flat 0.5 s interval added up to half a second
+        # of dead time to every entry - and this call blocks the engine thread,
+        # so that delay also held up the stop check behind it.
+        started = time.time()
         while time.time() < deadline:
             if update_history():
                 return last
-            time.sleep(0.5)
+            elapsed = time.time() - started
+            time.sleep(0.1 if elapsed < 2.0 else 0.5)
         if last["status"] in {"OPEN", "TRIGGER_PENDING"}:
             cancel_error: Optional[Exception] = None
             try:
@@ -638,8 +890,16 @@ class KiteClient:
             )
         return last
 
-    def positions(self) -> list[dict[str, Any]]:
-        if self.is_paper:
+    def positions(self, force: bool = False) -> list[dict[str, Any]]:
+        """Broker net positions.
+
+        ``force`` reads the broker even in PAPER. Reconciliation needs this: the
+        LIVE readiness gate runs *before* the mode switch, so a check that
+        short-circuits on ``is_paper`` can never pass and LIVE can never be
+        armed. Only the reconciliation paths pass ``force``; nothing on the
+        trading path does, so PAPER still never touches the broker's book.
+        """
+        if self.is_paper and not force:
             return []
         if not self.sdk_ready:
             raise RuntimeError(self._auth_error or "KiteConnect is not initialised")
@@ -659,6 +919,7 @@ class KiteClient:
         quantity: int,
         price: Optional[float] = None,
         product: str = "NRML",
+        force: bool = False,
     ) -> Optional[float]:
         """Exchange margin for one prospective order, or ``None`` when unknown.
 
@@ -666,8 +927,14 @@ class KiteClient:
         margin benefit from existing positions. Returning ``None`` rather than a
         guessed figure is deliberate: the static ``LOT_MARGIN`` setting cannot
         know SPAN, and a wrong number is worse than an explicit "unknown".
+
+        ``force=True`` reads the figure even while the bot is in PAPER. The
+        readiness report runs *before* the switch - a gate that only works once
+        you are already live is not a gate - and without this the margin check
+        could never see a number, so it reported "unknown" on every account and
+        the one precondition that protects real money was never verified.
         """
-        if self.is_paper or not self.sdk_ready:
+        if (self.is_paper and not force) or not self.sdk_ready:
             return None
         order: dict[str, Any] = {
             "exchange": self.kite.EXCHANGE_NFO,
@@ -708,16 +975,20 @@ class KiteClient:
                     continue
         return None
 
-    def net_position(self, symbol: str) -> Optional[int]:
+    def net_position(self, symbol: str, force: bool = False) -> Optional[int]:
         """Broker's net quantity for ``symbol``, or ``None`` when unreadable.
 
         A hard ``None`` (rather than 0) matters: assuming flat when the broker
         call failed is how a bot ends up doubling a real position.
+
+        ``force`` reads the broker even in PAPER, for the LIVE readiness gate -
+        see :meth:`positions`. Without it the gate always saw ``None`` and
+        blocked arming LIVE, which is the one thing it exists to permit.
         """
-        if self.is_paper:
+        if self.is_paper and not force:
             return None
         try:
-            rows = self.positions()
+            rows = self.positions(force=force)
         except Exception as exc:
             log.warning("Position read failed for %s: %s", symbol, exc)
             return None
@@ -763,5 +1034,9 @@ __all__ = [
     "market_status",
     "future_symbol",
     "nearest_monthly_expiry",
+    "contract_expiry",
+    "expiry_label",
+    "rollover_at",
+    "rollover_status",
     "IST",
 ]

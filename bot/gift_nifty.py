@@ -33,7 +33,7 @@ from typing import Any, Callable, Optional
 
 import database as db
 from config import settings
-from kite_client import IST, future_symbol, get_client
+from kite_client import IST, contract_expiry, future_symbol, get_client
 
 log = logging.getLogger("gift_nifty")
 
@@ -63,6 +63,35 @@ HISTORY_RETRY_BASE_SECONDS = 30.0
 HISTORY_RETRY_MAX_SECONDS = 300.0
 # How much history to request, so recursive indicators are fully converged.
 HISTORY_LOOKBACK_DAYS = 5
+
+
+def _merge_forming(
+    current: Optional["Candle"], forming: "Candle"
+) -> "Candle":
+    """Fold a Kite forming-bar snapshot into the live tick-built bar.
+
+    The exchange knows the bar's true open and the range it has traded, but the
+    tick feed knows how many ticks were actually observed. Keeping the larger
+    range and the newest close on one object is what stops a bar from closing at
+    a single price after ``refresh_history`` has replaced it.
+
+    ``ticks`` is carried across deliberately: it records that the bucket was
+    watched from its opening, which is what qualifies the bar for the indicator
+    series when Kite history is unavailable.
+    """
+    if current is None or current.start != forming.start:
+        return forming
+    merged = Candle(
+        start=current.start,
+        open=current.open,
+        high=max(current.high, forming.high),
+        low=min(current.low, forming.low),
+        close=forming.close,
+        volume=max(current.volume, forming.volume),
+        ticks=current.ticks,
+        partial=current.partial,
+    )
+    return merged
 
 
 @dataclass
@@ -138,9 +167,15 @@ class CandleBuilder:
 
     ``on_close`` fires with a finished bar. A bar closes when a tick arrives in
     a later bucket; the final bar of a session is flushed by :meth:`flush`.
+
+    ``interval`` is the Kite-style name of ``seconds``, carried here rather than
+    read from the feed: one feed can build several timeframes from the same
+    ticks, and a bar must be persisted under the timeframe it was built at or a
+    15-minute and a 60-minute bucket that share a start time collide.
     """
 
     seconds: int = 900
+    interval: str = ""
     on_close: Optional[Callable[[Candle], None]] = None
     current: Optional[Candle] = None
     closed: list[Candle] = field(default_factory=list)
@@ -216,6 +251,13 @@ class CandleBuilder:
         return finished
 
     def _store(self, candle: Candle) -> None:
+        # A bar that closed without a single tick of its own cannot be trusted as
+        # a price: ``refresh_history`` seeds ``current`` from Kite's partial row,
+        # and ``add_tick`` stores it unchanged when the bucket rolls over. A flat
+        # bar like that is what priced an entry ~84 points off the market, so
+        # flag it partial and keep it out of the indicator series.
+        if candle.ticks <= 0 and candle.partial == PARTIAL_NONE:
+            candle.partial = PARTIAL_GAP
         self.closed.append(candle)
         if len(self.closed) > self.max_history:
             del self.closed[:-self.max_history]
@@ -242,7 +284,15 @@ class GiftNiftyFeed:
         self.interval = interval or settings.gift_candle_interval
         self.seconds = interval_to_seconds(self.interval)
         self._lock = threading.RLock()
-        self._builder = CandleBuilder(seconds=self.seconds)
+        self._builder = CandleBuilder(seconds=self.seconds, interval=self.interval)
+        # A second timeframe built from the same ticks. The websocket is
+        # process-global and one-shot (Twisted's reactor cannot restart), so a
+        # GIFT book on a different interval cannot open its own feed - it would
+        # either raise ReactorNotRestartable or double-subscribe the token.
+        # Instead the one feed aggregates every tick into each requested
+        # timeframe. Keyed by interval name; empty until a book asks for one.
+        self._extra_builders: dict[str, CandleBuilder] = {}
+        self._extra_history: dict[str, list[dict[str, Any]]] = {}
         self._ticker: Any = None
         self._thread: Any = None
         self._stop = threading.Event()
@@ -420,7 +470,14 @@ class GiftNiftyFeed:
                 close=float(row["close"]),
                 volume=float(row.get("volume") or 0.0),
             )
-            if start >= current_start:
+            # A Kite bar is only closed once its own span has elapsed. Kite stamps
+            # bars at an offset (the 16:01->16:06 bucket is stamped 16:01) while
+            # ``bucket_start`` floors that to 16:00, so comparing floored starts
+            # alone calls a bar that is still forming "closed". A forming bar
+            # carries only the OHLC of its first tick, which is how a flat
+            # 25399.00 bar replaced a true 103-point range (25399 -> 25296) and
+            # booked an entry 84 points above the market.
+            if moment + timedelta(seconds=self.seconds) > now:
                 forming = candle
                 continue
             closed.append(candle.to_strategy_candle())
@@ -437,17 +494,81 @@ class GiftNiftyFeed:
             self._history_failures = 0
             self._history_retry_at = None
             if forming is not None:
-                # Kite's newest row is the bucket still in progress; keep it as
-                # the forming candle so the dashboard shows live values.
-                self._builder.current = forming
+                # Kite's newest row is the bucket still in progress. Merge it into
+                # whatever the tick feed has already accumulated for that bucket
+                # instead of replacing it: ``add_tick`` folds new ticks into
+                # ``current`` and closes it as-is without recomputing high/low, so
+                # assigning a bare snapshot here silently discards every tick seen
+                # so far and closes the bar at a single price.
+                self._builder.current = _merge_forming(self._builder.current, forming)
                 self._resume_candle = None
+        self._refresh_extra_history(now)
         log.info(
             "GIFT Nifty history refreshed from Kite: %d closed bars, forming=%s",
             len(closed), forming.start.strftime("%H:%M") if forming else "none",
         )
         return len(closed)
 
-    def _persist(self, candle: Candle) -> None:
+    def _refresh_extra_history(self, now: Optional[datetime] = None) -> None:
+        """Seed each secondary timeframe from Kite, like the primary series.
+
+        Without this a 15-minute book would run on tick-built bars while its
+        60-minute twin ran on exchange OHLC - a difference in data quality
+        masquerading as a difference in timeframe. Best effort: a failed fetch
+        leaves the tick-built series in place rather than emptying it, because an
+        empty list reads as "warming up" and would stop the book.
+        """
+        with self._lock:
+            intervals = list(self._extra_builders)
+        for interval in intervals:
+            self._seed_extra_history(interval, now)
+
+    def _seed_extra_history(
+        self, interval: str, now: Optional[datetime] = None
+    ) -> None:
+        """Fetch one secondary timeframe's history and hand it to the builder."""
+        now = now or datetime.now(IST)
+        token = self.token
+        if token is None:
+            return
+        try:
+            rows = get_client().historical_data(
+                instrument_token=token,
+                from_date=now - timedelta(days=HISTORY_LOOKBACK_DAYS),
+                to_date=now,
+                interval=interval,
+            )
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("No %s GIFT history: %s", interval, exc)
+            return
+        if not rows:
+            return
+        seconds = interval_to_seconds(interval)
+        closed: list[dict[str, Any]] = []
+        for row in rows:
+            moment = row["date"]
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=IST)
+            start = bucket_start(moment, seconds)
+            if start + timedelta(seconds=seconds) > now:
+                continue
+            closed.append({
+                "time": start.replace(tzinfo=None).isoformat(sep=" "),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            })
+        if closed:
+            self.interval_history(interval, closed)
+
+    def _persist(self, candle: Candle, interval: Optional[str] = None) -> None:
+        """Store one bar under the timeframe it was built at.
+
+        ``interval`` defaults to the feed's own, so the single-timeframe case is
+        unchanged. A second builder passes its own: the key is (start, interval),
+        and two timeframes share a start time at least once an hour.
+        """
         try:
             db.record_gift_candle(
                 start=candle.start.isoformat(timespec="seconds"),
@@ -458,14 +579,14 @@ class GiftNiftyFeed:
                 volume=candle.volume,
                 ticks=candle.ticks,
                 partial=candle.partial,
-                interval=self.interval,
+                interval=interval or self.interval,
             )
         except Exception as exc:  # pragma: no cover - best effort
             log.warning("Failed to persist GIFT candle: %s", exc)
 
     # -- candles ---------------------------------------------------------
-    def _on_bar_close(self, candle: Candle) -> None:
-        self._persist(candle)
+    def _on_bar_close(self, candle: Candle, interval: Optional[str] = None) -> None:
+        self._persist(candle, interval)
         with self._lock:
             authoritative = self._history_source == "kite"
         if authoritative:
@@ -498,6 +619,94 @@ class GiftNiftyFeed:
         """Chronological closed candles (oldest first)."""
         with self._lock:
             return list(self._history)
+
+    # -- additional timeframes -------------------------------------------
+    def ensure_interval(self, interval: str) -> None:
+        """Start building ``interval`` from the same ticks, if not already.
+
+        Idempotent, because every poll of every book calls it. A book on the
+        feed's own interval needs nothing - it reads ``candles()``.
+        """
+        if not interval or interval == self.interval:
+            return
+        with self._lock:
+            if interval in self._extra_builders:
+                return
+            seconds = interval_to_seconds(interval)
+            builder = CandleBuilder(seconds=seconds, interval=interval)
+            builder.on_close = lambda bar, _i=interval: self._on_extra_close(_i, bar)
+            self._extra_builders[interval] = builder
+            self._extra_history[interval] = []
+        log.info("GIFT feed now also building %s bars from the same ticks", interval)
+        # Seed it now rather than waiting for the next primary refresh. That
+        # refresh is throttled to HISTORY_REFRESH_SECONDS, so a timeframe
+        # registered just after one had already run would sit empty until the
+        # throttle expired - and an empty series reads as "warming up", so the
+        # book looked broken while its ticks were being aggregated correctly.
+        self._seed_extra_history(interval)
+
+    def interval_count(self, interval: Optional[str] = None) -> int:
+        """How many closed bars ``interval`` holds, without copying them.
+
+        The engine asks for this once per book per tick. ``interval_candles``
+        would answer it, but it returns a fresh list of every bar - a full copy
+        every 5 s for a number, on a path that runs whether or not a bar closed.
+        """
+        if not interval or interval == self.interval:
+            return len(self._history)
+        with self._lock:
+            return len(self._extra_history.get(interval, []))
+
+    def interval_candles(self, interval: Optional[str] = None) -> list[dict[str, Any]]:
+        """Closed candles at ``interval`` (default: this feed's own)."""
+        if not interval or interval == self.interval:
+            return self.candles()
+        with self._lock:
+            return list(self._extra_history.get(interval, []))
+
+    def interval_history(self, interval: str, rows: list[dict[str, Any]]) -> None:
+        """Seed a secondary series with exchange history.
+
+        The twin's bars come from Kite like the primary's, so both books run on
+        exchange OHLC rather than on tick-built approximations of differing
+        quality.
+
+        Merged, not replaced. Kite's history lags the tick feed by seconds to
+        minutes, so a straight assignment threw away a bar the ticks had already
+        closed and put an older series in its place. The engine keys off the
+        newest bar's timestamp, so it then saw the same bar it had already
+        evaluated and skipped - the signal sat unacted-on until Kite caught up.
+        Observed live: a 15-minute bar closed at 21:00 and the order was placed
+        at 21:04, four minutes later.
+
+        The merge keeps every bar the ticks produced and lets Kite's OHLC win
+        where the two overlap, which is the same rule the primary series uses.
+        """
+        with self._lock:
+            builder = self._extra_builders.get(interval)
+            if builder is None:
+                return
+            existing = self._extra_history.get(interval) or []
+            # Kite's rows are authoritative for the bars it has; anything newer
+            # than its newest row came from ticks and must survive.
+            by_time = {row["time"]: row for row in existing}
+            for row in rows:
+                by_time[row["time"]] = row
+            merged = [by_time[key] for key in sorted(by_time)]
+            self._extra_history[interval] = merged[-builder.max_history:]
+
+    def _on_extra_close(self, interval: str, candle: Candle) -> None:
+        """Persist and append a closed bar from a secondary timeframe."""
+        self._persist(candle, interval)
+        if candle.partial:
+            return
+        with self._lock:
+            series = self._extra_history.setdefault(interval, [])
+            series.append(candle.to_strategy_candle())
+            builder = self._extra_builders.get(interval)
+            limit = builder.max_history if builder else 2000
+            if len(series) > limit:
+                del series[:-limit]
 
     def candle_snapshot(self) -> tuple[list[dict[str, Any]], bool]:
         """Return closed candles plus the current candle, if one is forming."""
@@ -559,6 +768,9 @@ class GiftNiftyFeed:
                         # in time, so its OHLC is incomplete.
                         self._resume_candle = None
                 self._builder.add_tick(float(price), self.last_tick_at, volume=1.0)
+                for interval, builder in self._extra_builders.items():
+                    builder.on_close = lambda bar, _i=interval: self._on_extra_close(_i, bar)
+                    builder.add_tick(float(price), self.last_tick_at, volume=1.0)
 
     def _handle_connect(self, ws: Any, _response: Any) -> None:
         """Subscribe the GIFT Nifty index once the socket is up.
@@ -914,6 +1126,12 @@ class GiftNiftyFeed:
                 "exec": {
                     "symbol": self.exec_symbol or self.current_exec_symbol(),
                     "price": self.exec_last_price,
+                    # Derived from the symbol, not from a client call: this method
+                    # is polled every 1.5s and must not touch the network.
+                    "expiry": str(
+                        contract_expiry(self.exec_symbol or self.current_exec_symbol()) or ""
+                    )
+                    or None,
                     "last_tick_at": self.exec_last_tick_at.isoformat(timespec="seconds")
                     if self.exec_last_tick_at
                     else None,

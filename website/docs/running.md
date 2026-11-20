@@ -37,6 +37,8 @@ rather than root. That means **everything writable must be on a volume**:
 | `/data/paper_trading.db` | `bot-data` | Trading state |
 | `/data/bot.log` | `bot-data` | Logs |
 | `/data/nse_holidays.json` | `bot-data` | Holiday cache |
+| `/data/paper_mirror.db` | `bot-data` | Shadow paper book, when `PAPER_MIRROR=1` |
+| `/data/gift_book.db` | `bot-data` | GIFT Nifty index book, when `GIFT_BOOK=1` |
 | `/app/bot/.env` | bind mount | Credentials |
 
 `compose.yaml` sets `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` to point at
@@ -137,6 +139,8 @@ authenticating proxy, as the [Configuration](/configuration) warning says.
 
 ## Next
 
+- [Hosting](/hosting) — moving off a laptop to an always-on host
+- [Production](/production) — the unattended runbook
 - [Configuration](/configuration)
 - [Database operations](/database/operations)
 - [Docs site](/docs-site)

@@ -64,35 +64,37 @@ your machine, anyone who can send a request can panic the account.
 | `DEFAULT_LOTS` | `1` | Lots per entry |
 | `NIFTY_LOT_SIZE` | `65` | Fallback when Kite instruments are unavailable |
 | `MAX_OPEN_LOTS` | `4` | Hard cap on concurrent lots |
-| `STOP_LOSS_POINTS` | `0` | Close a position this many points against entry. `0` disables. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
 | `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT` |
-| `SLIPPAGE_TICKS` | `1.0` | |
+| `SLIPPAGE_TICKS` | `1.0` | Adverse-tick fallback for a paper fill with no order-book depth |
 | `TICK_SIZE` | `0.05` | Nifty futures tick |
 | `LOT_MARGIN` | `150000` | **Estimate** used when Kite's margin API is unavailable |
 | `TRADING_ALLOW_OFF_HOURS` | `0` | Testing escape hatch — bypasses the session gate |
 
 ## Strategy
 
+The strategy uses exactly two indicators: **SuperTrend (14-period ATR × 3)** and
+**Parabolic SAR (0.02 / 0.02 / 0.2)**. The SuperTrend is fixed in code rather than
+configured — a second instance would reintroduce the vote the strategy dropped —
+so only the PSAR inputs are settings.
+
 | Variable | Default | Notes |
 |---|---|---|
-| `STRATEGY_SUPERTRENDS` | `11:1,12:2,13:3` | `atr_length:multiplier` pairs, comma separated |
-| `STRATEGY_ST_MIN_AGREE` | `2` | How many SuperTrends must agree |
 | `STRATEGY_PSAR_START` | `0.02` | |
 | `STRATEGY_PSAR_INCREMENT` | `0.02` | |
 | `STRATEGY_PSAR_MAXIMUM` | `0.2` | |
 
-Changing `STRATEGY_SUPERTRENDS` moves the warm-up requirement automatically
-(`longest ATR period + 1`). Malformed entries are dropped rather than raising, so
-a typo cannot stop the bot from booting — if nothing usable remains, the default
-triple is used.
+The warm-up requirement follows the fixed SuperTrend: 14 ATR bars plus one to
+compare against, so **15 closed candles**. `STRATEGY_SUPERTRENDS` and
+`STRATEGY_ST_MIN_AGREE` are no longer read; leaving them in an old `.env` is
+harmless and cannot add an instance.
 
 ## Market data
 
 | Variable | Default | Notes |
 |---|---|---|
-| `GIFT_CANDLE_INTERVAL` | `15minute` | Must match the timeframe the strategy was tuned on |
+| `GIFT_CANDLE_INTERVAL` | `60minute` | Signal timeframe. See the tuning note below. |
 | `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop and closed-bar check cadence |
 | `QUOTE_POLL_SECONDS` | `5` | |
 | `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
@@ -107,16 +109,101 @@ triple is used.
 
 :::warning[Docker paths must be on the volume]
 The image is `read_only: true`. Any path inside the image cannot be written,
-so `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` must all point at `/data`.
+so `DB_PATH`, `LOG_FILE`, `HOLIDAY_CACHE_PATH`, `GIFT_BOOK_DB_PATH` and
+`PAPER_MIRROR_DB_PATH` must all point at `/data`.
 :::
 
+
+## GIFT Nifty index book
+
+| Variable | Default | Notes |
+|---|---|---|
+| `GIFT_BOOK` | `0` | Also settle every signal in a paper book on the GIFT Nifty index. |
+| `GIFT_BOOK_DB_PATH` | `bot/gift_book.db` | Docker: `/data/gift_book.db`. Separate file, so the index ledger is isolated. |
+| `GIFT_BOOK_UNITS` | `0` | Units per position. `0` means "use `NIFTY_LOT_SIZE`", so both books carry the same notional. |
+| `GIFT_BOOK_BALANCE` | `200000` | Virtual balance the index book starts with, applied only when its file is created. |
+
+GIFT Nifty is a non-tradeable index, so this book is **paper-only** by
+construction. See [Execution → Two books, one signal stream](./execution.md#two-books-one-signal-stream).
+State is on `/api/gift/*`, `/api/venues`, and under `gift_book` in `/api/status`.
+
+
+## Shadow paper book
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PAPER_MIRROR` | `0` | Mirror live positions into a parallel paper book. Only active with `EXECUTION_MODE=LIVE`. |
+| `PAPER_MIRROR_DB_PATH` | `bot/paper_mirror.db` | Docker: `/data/paper_mirror.db`. Separate file, so the shadow book can never touch the live ledger. |
+| `PAPER_MIRROR_BALANCE` | `200000` | Virtual balance the shadow book starts with, applied only when its file is created. |
+
+See [Execution → Shadow paper book](./execution.md#shadow-paper-book). State is
+on `/api/mirror` and under `mirror` in `/api/status`.
+
+
+## Strategy
+
+| Variable | Default | Notes |
+|---|---|---|
+| `GIFT_CANDLE_INTERVAL` | `60minute` | Bar interval for the signal feed. Kite's valid names are `minute`, `3minute`, `5minute`, `10minute`, `15minute`, `30minute`, `60minute`, `day` — `1minute` is rejected and silently returns no bars. |
+| `STRATEGY_EXIT` | `flip` | `flip` holds through a `NO_SIGNAL` bar and closes when the pair reverses; `flat` closes on the first disagreement. See [Strategy](./strategy.md#exit-rules). |
+| `STRATEGY_PSAR_START` | `0.02` | PSAR step. |
+| `STRATEGY_PSAR_INCREMENT` | `0.02` | PSAR increment. |
+| `STRATEGY_PSAR_MAXIMUM` | `0.2` | PSAR ceiling. |
+
+SuperTrend is fixed at 14×3 and is not configurable — a second instance would
+reintroduce the vote this strategy deliberately does not have.
+
+## Strategies
+
+One strategy runs by default, built from the flat keys above. Additional ones are
+added with `STRATEGY_<n>_*` — see [Running multiple strategies](./multi-strategy.md),
+which also explains why two strategies in one contract can cancel each other.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `STRATEGY_ID` | `Surikbs` | Which ledger book this process trades. Must match the rows in the database. |
+| `STRATEGY_<n>_SOURCE` | `gift` for 1; required above | `gift` or `nifty`. |
+| `STRATEGY_<n>_ID` | `Surikbs` for 1; required above | Ledger book; must be unique. |
+| `STRATEGY_<n>_INTERVAL` | `60minute` | Bar interval for that strategy. |
+| `STRATEGY_<n>_EXIT` | `flip` | `flip` or `flat`. |
+| `STRATEGY_<n>_LOTS` | `1` | Position size for that run. |
+| `STRATEGY_<n>_ENABLED` | `1` | `0` configures it without starting it. |
+| `STRATEGY_<n>_FILTER_ADX` | *(off)* | Only enter when ADX(14) exceeds this. |
+| `STRATEGY_<n>_FILTER_MA` | *(off)* | Only enter on the trend's side of this SMA. |
+
+**Neither filter is recommended.** Measured on three years of NIFTY 60-minute
+bars, ADX makes the net monotonically worse — ADX>15 drops it from ₹160,318 to
+₹92,221, and ADX>18 or higher loses money outright. It raises the win rate at
+high thresholds only by removing the large winners too. MA50 is the one filter
+that helped (₹247,679, 51.7% win) and it is still a fit rather than an edge:
+negative second half, a confidence interval that includes zero, and 48% of gross
+profit in a single trade. See [Backtesting](./backtesting.md) for the numbers.
+
+Both filters gate **entries only**. An open position is still closed by the exit
+rule, because a filter that blocked an exit would hold a losing trade through the
+very conditions it was meant to avoid. A filtered bar is reported as `NO_SIGNAL`
+with the reason in `filter_reason`, so the dashboard can say which gate refused
+rather than just showing no signal. `STRATEGY_<n>_FILTER_MA` also raises the
+warm-up requirement to `n + 1` bars, so the average is never tested on a window
+it does not have.
 
 ## Alerting
 
 | Variable | Default | Notes |
 |---|---|---|
-| `ALERT_WEBHOOK_URL` | *(empty)* | JSON webhook for watchdog alerts. Empty = log and dashboard only. |
+| `ALERT_ENABLED` | `0` | **Master switch.** `0` means nothing is sent, whatever the channel below says. Set `1` only while testing the channel. |
+| `ALERT_CHANNEL` | `generic` | `telegram`, `slack`, `discord`, `ntfy` or `generic`. The payload is built per channel. |
+
+| `ALERT_WEBHOOK_URL` | *(empty)* | Webhook for `slack`/`discord`/`ntfy`/`generic`. Empty = log and dashboard only. |
+| `ALERT_TELEGRAM_BOT_TOKEN` | *(empty)* | Bot token from @BotFather, for `ALERT_CHANNEL=telegram`. |
+| `ALERT_TELEGRAM_CHAT_ID` | *(empty)* | Chat id to send to. Message the bot once, then read it from `getUpdates`. |
+| `ALERT_ON_LIFECYCLE` | `1` | Send a message on start and stop. |
 | `WATCHDOG_INTERVAL_SECONDS` | `30` | How often trading health is checked |
+
+Nothing leaves the bot while `ALERT_ENABLED=0`, which is the default even when
+credentials are filled in. The bot is deliberately noisy — every fill and every
+signal flip is an event — so a phone is a poor place to read a session. Enable it
+to prove the channel end to end, then switch it back off.
 
 The watchdog alerts when the process is up but the trading is not: a stale feed,
 a disconnected feed during market hours, a risk breach, a paused strategy, or an
@@ -128,8 +215,15 @@ rate-limited to one per kind per 15 minutes. See
 ## Tuning notes
 
 **`GIFT_CANDLE_INTERVAL` must match the strategy's timeframe.** The indicators
-are only meaningful on the timeframe they were tuned for. Changing it without
-re-tuning the strategy changes the signals.
+are only meaningful on the timeframe they were tuned for. The shipped value is
+**60 minutes**: the strategy holds a position for a median of 26 bars, so a
+finer timeframe multiplies the charge count without improving accuracy. Check
+any change against [Backtesting](./backtesting.md) first — at 15 and 5 minutes
+the same rule lost more money per trade, not less.
+
+At 60 minutes the GIFT buckets close on the half hour (`08:30` closes at `09:30`),
+so the first bar that closes inside the NSE session is the `08:30` one. That is
+the bar the overnight reconcile runs on.
 
 It also decides how long warm-up takes, because it is bars - not time - that
 the indicators need: the longest SuperTrend wants 14 closed bars, which is
@@ -143,9 +237,31 @@ two series together.
 **`LOT_MARGIN` is an estimate.** LIVE prefers Kite's real margin API and reports
 when it falls back to this number. Set it conservatively.
 
-**`MAX_OPEN_LOTS` caps position size; `STOP_LOSS_POINTS` caps loss.** The strategy
-has no stop-loss of its own — it exits on an opposite signal or a manual
-square-off — so without this a position is unbounded between those two events.
-The limit latches: once tripped the bot squares off, pauses, and stays paused
-until you acknowledge the breach on the dashboard. See
-[Production deployment](./production.md#risk-limits).
+**There is no session loss cap.** It was removed: blocking new entries once the
+day's realised loss reached a limit sounds prudent, but it is a second, hidden
+strategy — it changes when the bot trades based on a number the strategy never
+looked at. The strategy's own signal is the only exit, and `MAX_OPEN_LOTS` is the
+only exposure limit.
+
+**`MAX_OPEN_LOTS` caps position size.** The strategy owns its own exit: a
+position is held while SuperTrend and PSAR agree and closed on the first bar they
+stop. There is no per-trade stop-loss, no trailing stop, and no profit target —
+see [Strategy](./strategy.md#what-the-strategy-does-not-have) for why, and for
+what the exit actually earns on real data.
+
+`STOP_LOSS_POINTS`, `TRAILING_STOP_ENABLED`, `TRAILING_INITIAL_POINTS`,
+`TRAILING_STEP_POINTS`, `TRAILING_TIGHTEN_AT_POINTS`, `TRAILING_TIGHT_POINTS`,
+`LARGE_CANDLE_ATR_MULTIPLIER` and `LARGE_CANDLE_MAX_POINTS` are **no longer
+read**. Leaving them in an old `.env` is harmless: they cannot arm a stop or
+suppress a signal.
+
+The signal exit is verified before it is reported: if the square-off did not
+fill, the position stays open and the exit is retried on the next bar rather than
+being forgotten. A position the bot believes it closed but did not is the worst
+state this path can produce, so the confirmation is a `closed_positions` count
+from the broker, not an assumption.
+
+Re-entry after an exit needs a **fresh signal**. The bar that merely still agrees
+with the previous one cannot open a trade, so the signal that was in force when
+the position closed is never re-used — the conditions have to form again from
+scratch. Nothing needs acknowledging for trading to continue.

@@ -1,0 +1,6 @@
+# Test and development tooling. Not installed into the runtime image - see the
+# Dockerfile, which installs requirements.txt only.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+pytest==9.2.0

@@ -15,6 +15,18 @@ __pycache__
 paper_trading.db
 paper_trading.db-shm
 paper_trading.db-wal
+# The index and shadow books default to the package directory when their
+# *_DB_PATH is unset, which is what a local (non-Docker) run does.
+gift_book.db
+gift_book.db-shm
+gift_book.db-wal
+# One book per strategy, so each appends its own id as a suffix:
+# gift_book.db.<strategy-id>. Without this, running locally leaves an untracked
+# ledger per strategy in the package directory.
+gift_book.db.*
+paper_mirror.db
+paper_mirror.db-shm
+paper_mirror.db-wal
 *.sqlite
 *.sqlite3
 bot/logs/

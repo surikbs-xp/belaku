@@ -21,9 +21,9 @@ const FEATURES: Feature[] = [
     body: "The library's psar diverged on ~30% of bars, so it is implemented here against the canonical Wilder definition instead.",
   },
   {
-    icon: '🧩',
-    title: 'Configurable SuperTrends',
-    body: 'Three instances as atr_length:multiplier pairs. The warm-up requirement follows the config automatically.',
+    icon: '🕯️',
+    title: 'Conditional large-candle stop',
+    body: 'A signal candle at least 1.5x ATR(14) wide arms its stop at the candle\'s own low or high, capped so one wide bar cannot outrun the session loss cap.',
   },
   {
     icon: '📊',
@@ -43,25 +43,34 @@ const FEATURES: Feature[] = [
 ];
 
 const STATS = [
-  {value: '2 of 3', label: 'SuperTrend agreement'},
-  {value: '14 bars', label: 'Warm-up required'},
+  {value: '2 of 2', label: 'Rules must agree'},
+  {value: '15 bars', label: 'Warm-up required'},
   {value: '1.00%', label: 'Average CPU'},
-  {value: '52', label: 'Tests passing'},
+  {value: '354', label: 'Tests passing'},
 ];
 
 const DOC_LINKS = [
+  {to: '/introduction', title: 'Introduction', body: 'What Belaku is, and the one idea behind it'},
   {to: '/setup', title: 'Setup', body: 'Install, Kite credentials, first run'},
+  {to: '/running', title: 'Running', body: 'Local and Docker, rebuilds, logs, stopping'},
+  {to: '/production', title: 'Production', body: 'Unattended runbook: daily token, backups, pre-flight'},
+  {to: '/hosting', title: 'Hosting', body: 'Choosing an always-on VM and deploying to it'},
+  {to: '/lightsail', title: 'Lightsail containers', body: 'The CI pipeline, and why it has no persistent disk'},
   {to: '/architecture', title: 'Architecture', body: 'How the pieces fit together'},
   {to: '/strategy', title: 'Strategy', body: 'The entry rules in detail'},
   {to: '/execution', title: 'Execution', body: 'Order path and every safety gate'},
   {to: '/database', title: 'Database', body: 'What is stored, and why'},
   {to: '/database/schema', title: 'Schema reference', body: 'Every table, column and index'},
+  {to: '/database/operations', title: 'Database operations', body: 'Backups, migrations, recovery'},
   {to: '/configuration', title: 'Configuration', body: 'Every environment variable'},
   {to: '/api', title: 'API', body: 'The JSON endpoints'},
+  {to: '/dashboard', title: 'Dashboard', body: 'Every panel and control'},
+  {to: '/testing', title: 'Testing', body: 'What the suite pins, and how to run it'},
   {to: '/performance', title: 'Performance', body: 'Measured resource use'},
+  {to: '/docs-site', title: 'Docs site', body: 'How this site is built and deployed'},
 ];
 
-const STRATEGY_CODE = `buyST   = supertrendBullCount >= 2      # 2 of 3 SuperTrends bullish
+const STRATEGY_CODE = `buyST   = supertrend is bullish        # single SuperTrend (14, 3)
 buyPSAR = close > psar                  # price above Parabolic SAR
 
 longCondition  = buyST and buyPSAR
@@ -71,18 +80,18 @@ shortCondition = sellST and sellPSAR
 buySignal = barstate.isconfirmed and longCondition and not longCondition[1]`;
 
 const LOG_CODE = `Indicator values source=NSEIX:GIFT NIFTY
-  interval_seconds=300
-  candle_at=2026-11-06T23:25:00+05:30
-  history_bars=1166
-  ohlc={"close": 24976.0, "high": 24977.5,
-        "low": 24961.5, "open": 24963.0}
-  indicators={"psar": 24926.5,
-              "st_11_1": 24985.26,
-              "st_12_2": 25014.33,
-              "st_13_3": 25043.42,
-              "supertrend_bull": 0,
-              "supertrend_bear": 3}
-  signal=NEUTRAL`;
+  interval_seconds=900
+  candle_at=2026-11-18T10:00:00+05:30
+  history_bars=239
+  ohlc={"close": 25275.0, "high": 25316.0,
+        "low": 25268.0, "open": 25293.5}
+  indicators={"psar": 25367.52,
+              "st_14_3": 25335.75,
+              "supertrend_bearish": true,
+              "atr": 45.2283,
+              "candle_range": 48.0,
+              "large_candle": false}
+  signal=BEAR`;
 
 function CodeBlock({label, code}: {label: string; code: string}) {
   return (
@@ -106,7 +115,7 @@ export default function Home(): React.ReactElement {
   return (
     <Layout
       title="Algorithmic execution for GIFT Nifty"
-      description="Belaku reads GIFT Nifty, evaluates a triple-SuperTrend + Parabolic SAR strategy on completed candles, and trades the front-month NFO Nifty future.">
+      description="Belaku reads GIFT Nifty, evaluates a SuperTrend (14x3) + Parabolic SAR strategy on completed candles, and trades the front-month NFO Nifty future.">
       <main className={styles.page}>
         <section className={styles.hero}>
           <div className={styles.wrap}>
@@ -119,7 +128,7 @@ export default function Home(): React.ReactElement {
               <span className={styles.grad}>GIFT Nifty</span>
             </h1>
             <p className={styles.lede}>
-              Belaku reads GIFT Nifty, evaluates a triple-SuperTrend + Parabolic SAR
+              Belaku reads GIFT Nifty, evaluates a SuperTrend (14×3) + Parabolic SAR
               strategy on completed candles, and trades the front-month NFO Nifty future.
               Indicators are computed locally and verified against the Pine reference — no
               TradingView in the loop.
@@ -222,10 +231,11 @@ export default function Home(): React.ReactElement {
             <div className={styles.warn}>
               <span className={styles.warnIcon}>⚠️</span>
               <p>
-                <strong>No stop-loss, no profit target.</strong> Exits are an opposite
-                signal or a manual square-off. Size positions accordingly — this is a
-                property of the strategy, not a missing feature. The dashboard is also
-                unauthenticated: keep it on loopback or behind an authenticating proxy.
+                <strong>Stops are opt-in, and there is no profit target.</strong> The
+                strategy exits on an opposite signal; the trailing stop and the fixed
+                point cap are off by default, so a position is unbounded until you arm
+                one. Size accordingly. The dashboard can arm LIVE trading and square off
+                positions, so set <code>DASHBOARD_PASSWORD</code> before exposing it.
               </p>
             </div>
           </div>

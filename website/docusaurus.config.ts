@@ -82,17 +82,32 @@ const config: Config = {
         {
           title: 'Docs',
           items: [
+            {label: 'Introduction', to: '/introduction'},
             {label: 'Setup', to: '/setup'},
-            {label: 'Architecture', to: '/architecture'},
-            {label: 'Database', to: '/database'},
+            {label: 'Running', to: '/running'},
+            {label: 'Production', to: '/production'},
+            {label: 'Hosting', to: '/hosting'},
+            {label: 'Lightsail containers', to: '/lightsail'},
           ],
         },
         {
           title: 'Reference',
           items: [
+            {label: 'Architecture', to: '/architecture'},
+            {label: 'Strategy', to: '/strategy'},
+            {label: 'Execution', to: '/execution'},
             {label: 'Configuration', to: '/configuration'},
             {label: 'API', to: '/api'},
+            {label: 'Dashboard', to: '/dashboard'},
+          ],
+        },
+        {
+          title: 'Development',
+          items: [
+            {label: 'Database', to: '/database'},
+            {label: 'Testing', to: '/testing'},
             {label: 'Performance', to: '/performance'},
+            {label: 'Docs site', to: '/docs-site'},
           ],
         },
         {

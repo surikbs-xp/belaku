@@ -26,7 +26,7 @@
     },
   };
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=trader-14" />
+<link rel="stylesheet" href="/static/styles.css?v=trader-40" />
 </head>
 
 <body class="bg-ink-950 text-slate-200 antialiased">
@@ -68,6 +68,9 @@
         <span id="pill-market" class="pill pill-idle">Market —</span>
         <span id="pill-feed" class="pill pill-idle">GIFT —</span>
         <span id="pill-loop" class="pill pill-idle">Loop —</span>
+        <!-- Front-month rollover. Hidden until the contract is close enough to
+             expiry to matter, so it is a quiet nudge rather than a banner. -->
+        <span id="pill-rollover" class="pill pill-idle hidden">Rollover —</span>
       </div>
       <div id="kite-manual" class="header-manual hidden">
         <input id="kite-token" type="text" class="field" placeholder="Paste request_token from the redirect URL" />
@@ -99,7 +102,7 @@
         <p class="pause-banner-sub" id="risk-banner-sub"></p>
       </div>
     </div>
-    <button id="btn-risk-clear" class="btn btn-warn">Acknowledge &amp; resume</button>
+    <button id="btn-risk-clear" class="btn btn-warn">Dismiss</button>
   </div>
 
   <!-- ── LIVE readiness ─────────────────────────────────────────────── -->
@@ -123,185 +126,165 @@
   <!-- ── View 1: Dashboard Monitor ──────────────────────────────────── -->
   <section id="view-monitor" class="view">
 
-    <!-- Signal hero: the decision, first thing a trader looks at -->
-    <div class="hero-grid">
-
-      <article class="panel panel-signal" id="signal-panel">
-        <div class="panel-head">
-          <p class="metric-label">Current signal</p>
-          <span id="pill-signal" class="pill pill-idle">Warming up</span>
-        </div>
-
-        <div class="signal-body">
-          <div class="signal-glyph" id="signal-glyph" aria-hidden="true">•</div>
-          <div class="signal-copy">
-            <p id="e-signal" class="signal-word">—</p>
-            <p id="e-signal-sub" class="metric-sub">Waiting for candles…</p>
-          </div>
-        </div>
-
-        <div class="warmup-track" role="progressbar" aria-label="Indicator warm-up progress" aria-valuemin="0" aria-valuemax="15" aria-valuenow="0">
-          <div id="warmup-progress" class="warmup-progress"></div>
-        </div>
-        <p class="metric-sub">Bars used for this signal: <span id="e-bars">—</span></p>
-      </article>
-
-      <article class="panel panel-candle">
-        <div class="panel-head">
-          <p class="metric-label"><span id="candle-interval-label">15-minute</span> candle</p>
-          <span id="candle-pill" class="pill pill-idle">—</span>
-        </div>
-        <p id="candle-countdown" class="candle-countdown">—:—</p>
-        <p id="candle-countdown-sub" class="metric-sub">until the next completed candle</p>
-        <div class="candle-meta">
-          <div>
-            <p class="metric-label">Candle open</p>
-            <p id="candle-open" class="metric-sub-inline">—</p>
-          </div>
-          <div>
-            <p class="metric-label">Signal bar</p>
-            <p id="candle-bar" class="metric-sub-inline">—</p>
-          </div>
-        </div>
-      </article>
-
-      <article class="panel panel-quote">
-        <div class="panel-head">
-          <p class="metric-label">GIFT Nifty · signal source</p>
-        </div>
-        <p id="e-gift-price" class="quote-price">—</p>
-        <p id="e-gift-timestamp" class="metric-sub">Last tick —</p>
-        <div id="gift-spark" class="spark" aria-hidden="true"></div>
-        <p id="e-gift-sub" class="metric-sub">—</p>
-
-        <!-- Execution future, beside the signal source so the basis between
-             the two is readable at a glance. -->
-        <div class="exec-quote">
-          <div class="exec-quote-head">
-            <span class="metric-label">Nifty ticks</span>
-            <span id="e-exec-symbol" class="exec-quote-symbol">—</span>
-          </div>
-          <div class="exec-quote-row">
-            <span id="e-exec-price" class="exec-quote-price">—</span>
-            <span id="e-exec-basis" class="exec-quote-basis">—</span>
-          </div>
-          <p id="e-exec-tick" class="metric-sub">Awaiting ticks…</p>
-        </div>
-      </article>
-
-      <article class="panel panel-exec">
-        <div class="panel-head">
-          <p class="metric-label">Nifty future · execution</p>
-        </div>
-        <p id="e-exec" class="quote-price quote-price-sm">—</p>
-        <p id="e-exec-sub" class="metric-sub">—</p>
-        <div class="exec-meta">
-          <div>
-            <p class="metric-label">Lots</p>
-            <p id="exec-lots" class="metric-sub-inline">—</p>
-          </div>
-          <div>
-            <p class="metric-label">Product</p>
-            <p id="exec-product" class="metric-sub-inline">—</p>
-          </div>
-        </div>
-      </article>
+    <!-- Summary strip: the numbers a trader checks before anything else, on one
+         row. This replaces nothing - every figure still exists further down -
+         but the answer to "am I up or down, what am I holding, is the bot
+         healthy" is now above the fold instead of 700px below it. -->
+    <div class="summary-strip">
+      <div class="summary-cell">
+        <span class="summary-label">Today's P&amp;L</span>
+        <span id="sum-pnl" class="summary-value">—</span>
+        <span id="sum-pnl-sub" class="summary-sub">—</span>
+      </div>
+      <div class="summary-cell">
+        <span class="summary-label">Unrealised</span>
+        <span id="sum-unrealised" class="summary-value">—</span>
+        <span id="sum-unrealised-sub" class="summary-sub">open legs</span>
+      </div>
+      <div class="summary-cell">
+        <span class="summary-label">Open</span>
+        <span id="sum-open" class="summary-value">—</span>
+        <span id="sum-open-sub" class="summary-sub">positions</span>
+      </div>
+      <div class="summary-cell">
+        <span class="summary-label">Closed today</span>
+        <span id="sum-closed" class="summary-value">—</span>
+        <span id="sum-closed-sub" class="summary-sub">—</span>
+      </div>
+      <div class="summary-cell">
+        <span class="summary-label">Books</span>
+        <span id="sum-books" class="summary-value">—</span>
+        <span id="sum-books-sub" class="summary-sub">—</span>
+      </div>
     </div>
 
-    <!-- Live indicator readout -->
-    <div class="panel">
+    <!-- Prices, as one compact row rather than two large quote cards. The GIFT
+         level, the future and the basis are three numbers; cards gave each a
+         third of the page and pushed the strategies off the first screen. -->
+    <div class="quote-row">
+      <div class="quote-item">
+        <span id="e-signal-source-label" class="quote-label">Signal source</span>
+        <span id="e-gift-price" class="quote-number">—</span>
+        <span id="e-gift-timestamp" class="quote-note">Last tick —</span>
+      </div>
+      <div class="quote-item">
+        <span class="quote-label">Nifty future</span>
+        <span id="e-exec-price" class="quote-number">—</span>
+        <span id="e-exec-tick" class="quote-note">Awaiting ticks…</span>
+      </div>
+      <div class="quote-item">
+        <span class="quote-label">Basis</span>
+        <span id="e-exec-basis" class="quote-number">—</span>
+        <span id="e-exec-symbol" class="quote-note">—</span>
+      </div>
+      <div class="quote-item quote-item-meta">
+        <span class="quote-label">Contract</span>
+        <span id="e-exec" class="quote-number quote-number-sm">—</span>
+        <span id="e-exec-sub" class="quote-note">—</span>
+      </div>
+      <div class="quote-item quote-item-meta">
+        <span class="quote-label">Delivery</span>
+        <span id="exec-product" class="quote-number quote-number-sm">—</span>
+        <span class="quote-note">
+          <span id="exec-lots">—</span> · expires <span id="exec-expiry">—</span> · rolls to <span id="exec-next">—</span>
+        </span>
+      </div>
+    </div>
+
+    <!-- Open positions, on the dashboard. A trader's first question after the
+         market strip is "what am I holding, and is it working" - making them
+         change tab to answer that put the live P&L two clicks away from the
+         signal that produced it. One row per leg, grouped by book, because the
+         books keep separate ledgers and can run in different modes: a live leg
+         and a paper leg are not the same exposure and must never be summed. -->
+    <div class="panel panel-open-positions">
+      <div class="panel-head panel-head-wrap">
+        <div>
+          <h2 class="section-title">Open positions</h2>
+          <p id="dash-positions-caption" class="metric-sub">—</p>
+        </div>
+        <div class="position-totals">
+          <span class="position-total">
+            <span class="position-total-label">Unrealised</span>
+            <span id="dash-positions-pnl" class="position-total-value">—</span>
+          </span>
+          <span class="position-total">
+            <span class="position-total-label">Notional</span>
+            <span id="dash-positions-exposure" class="position-total-value">—</span>
+          </span>
+        </div>
+      </div>
+      <div id="dash-positions" class="dash-positions">
+        <p class="condition-empty">Loading positions…</p>
+      </div>
+    </div>
+
+    <!-- One band per strategy book. Each band is a complete view of that book:
+         its signal, the levels behind it, its own indicators, its own rule
+         checks, its own positions, P&L and account. Two books are two
+         independent strategies, so a shared panel would have to be read twice
+         and would still not say which figure belonged to which. -->
+    <div class="book-bands-wrap">
+      <div id="book-bands" class="book-bands">
+        <p class="condition-empty">Loading strategies.</p>
+      </div>
+    </div>
+
+    <!-- Shadow paper book: only meaningful while trading LIVE. -->
+    <div class="panel hidden" id="mirror-panel">
       <div class="panel-head">
-        <h2 class="section-title">Live indicators</h2>
-        <span id="indicator-source" class="metric-sub">—</span>
+        <h2 class="section-title">Shadow paper book</h2>
+        <span id="mirror-sync" class="pill pill-idle">—</span>
       </div>
-
-      <div class="indicator-grid">
-        <div class="indicator-cell">
-          <p class="metric-label">SuperTrend vote</p>
-          <p id="e-st" class="indicator-value">—</p>
-          <div id="st-votes" class="vote-bar" aria-hidden="true"></div>
-          <div id="st-legend" class="vote-legend" aria-hidden="true"></div>
-          <p id="e-st-sub" class="metric-sub">—</p>
-          <p id="e-st-time" class="metric-sub">Timestamp unavailable</p>
-        </div>
-        <div class="indicator-cell">
-          <p class="metric-label">Parabolic SAR</p>
-          <p id="e-psar" class="indicator-value">—</p>
-          <div id="psar-votes" class="vote-bar" aria-hidden="true"></div>
-          <p id="e-psar-sub" class="metric-sub">Price above / below</p>
-          <p id="e-psar-time" class="metric-sub">Timestamp unavailable</p>
-        </div>
-        <div class="indicator-cell">
-          <p class="metric-label">Engine activity</p>
-          <p id="e-counters" class="indicator-value indicator-value-sm">—</p>
-          <p class="metric-sub">evaluations · signals · sent · held</p>
-        </div>
+      <p id="mirror-sub" class="metric-sub">—</p>
+      <div class="metric-strip">
+        <div class="strip-cell"><p class="metric-label">Live P&amp;L</p><p id="mirror-live-pnl" class="strip-value">—</p></div>
+        <div class="strip-cell"><p class="metric-label">Paper P&amp;L</p><p id="mirror-paper-pnl" class="strip-value">—</p></div>
+        <div class="strip-cell"><p class="metric-label">Model error</p><p id="mirror-gap" class="strip-value">—</p></div>
+        <div class="strip-cell"><p class="metric-label">Live trades</p><p id="mirror-live-trades" class="strip-value">—</p></div>
+        <div class="strip-cell"><p class="metric-label">Paper trades</p><p id="mirror-paper-trades" class="strip-value">—</p></div>
       </div>
+      <p class="panel-footnote" title="The paper book copies every live position and prices its own fill from the broker's actual fill, plus its slippage model. The gap is therefore the paper model's error, not a difference in market data. It can never place or close a real order.">
+        Mirrors each live fill plus the slippage model — the gap is model error, not market data.
+      </p>
     </div>
 
-    <!-- Account metrics -->
-    <div class="metric-grid">
-      <article class="panel panel-metric">
-        <p class="metric-label">Portfolio value</p>
-        <p id="m-equity" class="metric-value">—</p>
-        <p id="m-equity-sub" class="metric-sub">—</p>
-      </article>
-      <article class="panel panel-metric">
-        <p class="metric-label">Real-time PnL</p>
-        <p id="m-pnl" class="metric-value">—</p>
-        <p id="m-pnl-sub" class="metric-sub">—</p>
-      </article>
-      <article class="panel panel-metric">
-        <p class="metric-label">Margin available</p>
-        <p id="m-margin" class="metric-value">—</p>
-        <div class="meter">
-          <div id="m-margin-bar" class="meter-fill" style="width:0%"></div>
+    <!-- Alerting: a channel that is silently misconfigured looks exactly like a
+         quiet market, so it is testable on demand -->
+    <div class="panel" id="alerts-panel">
+      <div class="panel-head panel-head-wrap">
+        <div>
+          <h2 class="section-title">Alerting</h2>
+          <p id="alerts-target" class="metric-sub">—</p>
         </div>
-        <p id="m-margin-sub" class="metric-sub">—</p>
-      </article>
-      <article class="panel panel-metric">
-        <p class="metric-label">Active mode</p>
-        <p id="m-mode" class="metric-value">—</p>
-        <div class="metric-pill-row"><span id="m-mode-pill" class="pill pill-idle">—</span></div>
-      </article>
-    </div>
-
-    <div class="metric-strip">
-      <div class="strip-cell"><p class="metric-label">Realised today</p><p id="m-today" class="strip-value">—</p></div>
-      <div class="strip-cell"><p class="metric-label">Unrealised</p><p id="m-unreal" class="strip-value">—</p></div>
-      <div class="strip-cell"><p class="metric-label">Net realised</p><p id="m-realised" class="strip-value">—</p></div>
-      <div class="strip-cell"><p class="metric-label">Win rate</p><p id="m-winrate" class="strip-value">—</p></div>
-      <div class="strip-cell"><p class="metric-label">Profit factor</p><p id="m-pf" class="strip-value">—</p></div>
-    </div>
-
-    <!-- Positions -->
-    <div class="panel">
-      <div class="panel-head">
-        <h2 class="section-title">Open positions</h2>
-        <span id="pos-count" class="metric-sub">—</span>
+        <div class="trailing-actions">
+          <span id="alerts-state" class="pill pill-idle">—</span>
+          <button id="btn-alert-toggle" class="mode-toggle mode-toggle-compact alert-toggle" type="button" role="switch" aria-label="Alerting" aria-checked="false">
+            <span class="mode-switch-track"><span class="mode-switch-thumb"></span></span>
+            <span class="mode-toggle-copy">
+              <strong id="alert-toggle-label">OFF</strong>
+              <small id="alert-toggle-caption">Enable alerts</small>
+            </span>
+          </button>
+          <button id="btn-alerts-test" class="btn btn-ghost" type="button">Send test</button>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">LTP</th><th class="num">PnL</th><th class="num">Points</th><th>Mode</th></tr>
-          </thead>
-          <tbody id="positions-body"></tbody>
-        </table>
+      <div class="alert-grid">
+        <div class="alert-cell">
+          <p class="metric-label">Alerts sent</p>
+          <p id="alerts-sent" class="strip-value">—</p>
+        </div>
+        <div class="alert-cell">
+          <p class="metric-label">Last alert</p>
+          <p id="alerts-last" class="strip-value">—</p>
+        </div>
+        <div class="alert-cell">
+          <p class="metric-label">Watchdog</p>
+          <p id="alerts-health" class="strip-value">—</p>
+        </div>
       </div>
-    </div>
-
-    <!-- Live rule checks -->
-    <div class="panel">
-      <div class="panel-head">
-        <h2 class="section-title">Live rule checks</h2>
-        <span id="st-config-label" class="metric-sub">SuperTrend 11×1 · 12×2 · 13×3 with PSAR</span>
-      </div>
-      <div id="conditions" class="condition-grid">
-        <p class="condition-empty">Collecting closed candles before evaluating the rules.</p>
-      </div>
-      <p class="panel-footnote">
-        A signal fires on the first closed candle where both checks agree, and is not repeated while the
-        condition holds. Exits are on an opposite signal or manual — there is no stop-loss or profit target.
+      <p class="panel-footnote" title="Alerts fire on a stale or dead feed, a stop-out, a paused strategy, an engine error, a rejected order, an unconfirmed exit, an expired Kite token, and on start/stop. Each kind is rate-limited so a persistent fault does not page you every 30 seconds. Configure with ALERT_CHANNEL and its credentials in .env.">
+        Fires on feed loss, errors, rejected orders, and start/stop. Rate-limited.
       </p>
     </div>
 
@@ -309,6 +292,25 @@
 
   <!-- ── View 2: Order Logs ─────────────────────────────────────────── -->
   <section id="view-orders" class="view hidden">
+
+    <!-- Open positions, one row per book. The ledger was already fetched on
+         every poll and never shown, so a book holding a leg was invisible
+         outside its own band on the dashboard. -->
+    <div class="panel">
+      <div class="panel-head panel-head-wrap">
+        <div>
+          <h2 class="section-title">Open positions</h2>
+          <p id="positions-caption" class="metric-sub">—</p>
+        </div>
+        <div class="toolbar">
+          <span id="positions-summary" class="pill pill-idle">—</span>
+        </div>
+      </div>
+      <div id="positions-grid" class="position-grid">
+        <p class="condition-empty">Loading positions…</p>
+      </div>
+    </div>
+
     <div class="panel">
       <div class="panel-head panel-head-wrap">
         <div>
@@ -316,11 +318,21 @@
           <p id="orders-caption" class="metric-sub">—</p>
         </div>
         <div class="toolbar">
+          <select id="orders-venue" class="field field-compact" aria-label="Venue">
+            <option value="futures">Nifty future</option>
+            <option value="gift">GIFT Nifty index</option>
+          </select>
           <input id="orders-search" type="search" placeholder="Search symbol, status, order id…" class="field field-search" />
           <select id="orders-mode" class="field field-compact">
             <option value="">All modes</option>
             <option value="PAPER">Paper</option>
             <option value="LIVE">Live</option>
+          </select>
+          <!-- With several books writing one ledger, an order without its book
+               is unattributable: the reader cannot tell a 15m entry from a 60m
+               one, and the two are different trades. -->
+          <select id="orders-book" class="field field-compact" aria-label="Book">
+            <option value="">All books</option>
           </select>
           <button id="btn-orders-csv" class="btn btn-neutral">Export CSV</button>
         </div>
@@ -330,7 +342,7 @@
         <table class="data-table">
           <thead>
             <tr>
-              <th>Timestamp</th><th>Symbol</th><th>Action</th><th class="num">Qty</th>
+              <th>Timestamp</th><th>Book</th><th>Symbol</th><th>Action</th><th class="num">Qty</th>
               <th class="num">Price</th><th>Status</th><th>Mode</th><th>Source</th><th>Order ID</th><th>Note</th>
             </tr>
           </thead>
@@ -342,11 +354,11 @@
     <div class="panel">
       <div class="panel-head">
         <h2 class="section-title">Engine signals</h2>
-        <span class="metric-sub">Every evaluation that produced an action, and why it was placed or held</span>
+        <span id="signals-caption" class="metric-sub">Every evaluation that produced an action, and why it was placed or held</span>
       </div>
       <div class="table-wrap table-mid">
         <table class="data-table">
-          <thead><tr><th>Timestamp</th><th>Action</th><th>Placed</th><th>Reason</th><th>Detail</th></tr></thead>
+          <thead><tr><th>Timestamp</th><th>Book</th><th>Action</th><th>Placed</th><th>Reason</th><th>Detail</th></tr></thead>
           <tbody id="signals-body"></tbody>
         </table>
       </div>
@@ -355,11 +367,40 @@
 
   <!-- ── View 3: Performance ────────────────────────────────────────── -->
   <section id="view-analytics" class="view hidden">
+    <div class="panel panel-venue">
+      <div class="panel-head panel-head-wrap">
+        <div>
+          <h2 class="section-title">Venue</h2>
+          <p id="analytics-venue-note" class="metric-sub">—</p>
+        </div>
+        <div class="toolbar">
+          <select id="analytics-venue" class="field field-compact" aria-label="Venue">
+            <option value="futures">Nifty future</option>
+            <option value="gift">GIFT Nifty index</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
     <div class="metric-grid metric-grid-4">
       <div class="panel panel-metric"><p class="metric-label">Net profit</p><p id="a-net" class="metric-value">—</p></div>
       <div class="panel panel-metric"><p class="metric-label">Total return</p><p id="a-return" class="metric-value">—</p></div>
       <div class="panel panel-metric"><p class="metric-label">Max drawdown</p><p id="a-dd" class="metric-value">—</p></div>
       <div class="panel panel-metric"><p class="metric-label">Trades</p><p id="a-trades" class="metric-value">—</p></div>
+    </div>
+
+    <!-- Per book, side by side. The tiles above are venue-wide; this is the
+         comparison the four books exist for, and it cannot be read off a single
+         blended figure. Closed-trade stats only - open legs are on the Orders
+         tab and on each dashboard tile. -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="section-title">By book</h2>
+        <span class="metric-sub">Closed trades, each book on its own ledger</span>
+      </div>
+      <div id="books-performance" class="perf-books">
+        <p class="condition-empty">Loading book performance…</p>
+      </div>
     </div>
 
     <!-- P&L calendar -->
@@ -409,12 +450,12 @@
     <div class="panel">
       <div class="panel-head">
         <h2 class="section-title">Trade ledger</h2>
-        <span class="metric-sub">Settled round-trips with fees</span>
+        <span id="trades-caption" class="metric-sub">Settled round-trips with fees</span>
       </div>
       <div class="table-wrap table-tall">
         <table class="data-table">
           <thead>
-            <tr><th>Closed</th><th>Symbol</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
+            <tr><th>Closed</th><th>Book</th><th>Symbol</th><th>Direction</th><th class="num">Qty</th><th class="num">Entry</th>
                 <th class="num">Exit</th><th class="num">Points</th><th class="num">Gross</th><th class="num">Fees</th>
                 <th class="num">Net</th><th>Reason</th></tr>
           </thead>
@@ -489,6 +530,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=trader-14" defer></script>
+<script src="/static/app.js?v=trader-40" defer></script>
 </body>
 </html>

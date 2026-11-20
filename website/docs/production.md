@@ -60,6 +60,14 @@ If you cannot log in daily, this bot cannot run unattended. Plan for it.
 
 ## Host setup
 
+:::tip[Choosing and preparing the machine]
+
+This page assumes the host already exists. For picking one, hardening a fresh
+VM, reaching the dashboard without exposing the port, and migrating the database
+off a laptop, see [Hosting](./hosting.md).
+
+:::
+
 ### 1. Install Docker
 
 ```bash
@@ -82,8 +90,10 @@ Edit `bot/.env` and set at minimum:
 KITE_API_KEY=...
 KITE_API_SECRET=...
 DASHBOARD_PASSWORD=<a long random string>
-STOP_LOSS_POINTS=100        # choose deliberately; 0 disables
-ALERT_WEBHOOK_URL=          # optional, but strongly recommended
+ALERT_ENABLED=1             # 0 = silent; switch on only while testing
+ALERT_CHANNEL=telegram      # telegram | slack | discord | ntfy | generic
+ALERT_TELEGRAM_BOT_TOKEN=   # if telegram
+ALERT_TELEGRAM_CHAT_ID=
 ```
 
 Generate a password with:
@@ -167,30 +177,73 @@ question as "is it trading?". The watchdog covers the difference:
 | --- | --- |
 | `STALE_FEED` | Feed connected but no tick for 3 minutes during market hours |
 | `FEED_DOWN` | Feed not connected during market hours |
-| `RISK_BREACH` | A stop-loss or the daily loss cap fired |
+| `STOP_OUT` | A position was closed by the signal flipping (the strategy keeps running) |
 | `PAUSED` | Strategy paused and nobody resumed it |
 | `ENGINE_ERROR` | The engine recorded an error |
+| `ORDER_REJECTED` | The bot decided to trade and the order failed |
+| `EXIT_UNCONFIRMED` | A signal exit could not be confirmed — a position may still be open |
+| `TOKEN_EXPIRED` | Kite session is not authenticated; the bot cannot place orders |
+| `BOT_STARTED` / `BOT_STOPPED` | Lifecycle, so a silent restart is visible |
 
-Set `ALERT_WEBHOOK_URL` to a Slack, Discord or ntfy webhook so these reach your
-phone. Alerts are rate-limited to one per kind per 15 minutes, and only fire
-after three consecutive failing checks, so a single slow poll does not page you.
+Set `ALERT_ENABLED=1`, point `ALERT_CHANNEL` at `telegram`, `slack`, `discord`,
+`ntfy` or `generic`, and supply that channel's credentials. A fill and a signal
+flip are both events, so the bot messages a lot: enable it to verify the channel,
+then set `ALERT_ENABLED=0` again. **The channel must match the destination**:
+each service rejects a payload it does not recognise (Slack wants `text`,
+Discord `content`, ntfy a plain body), so a mismatched pair fails silently at the
+service while the bot believes it sent the alert.
 
-Watchdog state is on `/api/status` under `watchdog`.
+Verify it on demand with **Send test alert** on the dashboard, or:
+
+```bash
+curl -X POST http://127.0.0.1:9000/api/alerts/test
+```
+
+Alerts are rate-limited to one per kind per 15 minutes, and only fire after three
+consecutive failing checks, so a single slow poll does not page you. Watchdog
+state is on `/api/status` under `watchdog`; channel config is on
+`/api/alerts/status` (the token is never returned).
 
 ## Risk limits
 
-The strategy has **no stop-loss of its own**. It exits on an opposite signal or a
-manual square-off, so between those two events a position is unbounded.
+The strategy owns its own exit. A position is held for as long as SuperTrend and
+PSAR agree and closed on the first bar they stop — there is **no stop-loss, no
+trailing stop, and no profit target**. A fixed stop would exit on a price the
+strategy never looked at, which is a different strategy rather than a safety net
+around this one.
 
 | Setting | Effect |
 | --- | --- |
-| `STOP_LOSS_POINTS` | Close a position once it is this many index points against entry |
 | `MAX_OPEN_LOTS` | Reject any order that would exceed this many lots |
 
-The stop-loss latches: once tripped, the bot squares off the offending position,
-pauses, and stays paused until you acknowledge the breach on the dashboard. This
-is deliberate — a limit that clears itself when price recovers turns one bad day
-into a run of them.
+There is no session loss cap. It was removed because blocking entries on the day's
+realised loss is a second strategy the signal never looked at — it changes when
+the bot trades for a reason the strategy cannot see. `MAX_OPEN_LOTS` is the only
+exposure limit.
+
+The exit is verified before it is reported — if the square-off did not fill, the
+position stays open and the exit is retried on the next bar rather than being
+forgotten. A position the bot believes it closed but did not is the worst state
+this path can produce.
+
+Re-entry needs a **fresh signal**, not the state that was already in force. A bar
+that merely still agrees with the previous one cannot open a trade, so an exit is
+never undone by the same signal that caused it. The conditions have to form again
+from scratch: for a BUY, the combined SuperTrend-and-PSAR condition must become
+true again after the exit.
+
+:::warning[What the exit costs]
+Measured on 853 real 15-minute GIFT Nifty bars: 42 trades, 38% win rate, average
+win 106 points and average loss 61 points. Gross **+₹6,792**; after ₹40,539 of
+round-trip charges, **−₹33,747**. The old 100/30/5 trailing rule on the same bars
+produced −₹41,829 net, so the signal exit is the better of the two — but neither
+is profitable at one lot. The charge stack, not the exit rule, is the binding
+constraint. See [Performance](./performance.md).
+:::
+
+A signal that closes while the NSE is shut is *latched* as an owed entry and
+honoured on the first bar that can fill it. The latch is persisted, so a deferred
+entry survives a restart without anyone intervening.
 
 For Nifty, one point is ₹1 per unit, so 65 units × 100 points = ₹6,500.
 
@@ -238,8 +291,8 @@ it**, and set `secure=True` on the cookie once you do.
 
 - [ ] Kite API secret rotated
 - [ ] `DASHBOARD_PASSWORD` set to a long random value
-- [ ] `STOP_LOSS_POINTS` chosen deliberately
-- [ ] `ALERT_WEBHOOK_URL` set and tested
+- [ ] `ALERT_ENABLED=1`, `ALERT_CHANNEL` set, credentials supplied, and a test
+      alert received — then `ALERT_ENABLED=0` again for normal running
 - [ ] `scripts/backup-db.sh` scheduled and copied off-box
 - [ ] systemd unit installed and enabled
 - [ ] Log rotation confirmed (`/data/bot.log`, 5 MB × 5)

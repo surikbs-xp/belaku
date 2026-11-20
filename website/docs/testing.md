@@ -8,7 +8,7 @@ title: Testing
 .venv/bin/python -m pytest tests -q
 ```
 
-52 tests, no network access required.
+354 tests, no network access required.
 
 ## What is pinned
 
@@ -18,14 +18,13 @@ output.
 
 | Test | Pins |
 |---|---|
-| `test_supertrend_matches_the_pine_reference_on_a_long_series` | SuperTrend lines and directions, all three instances, 1119 bars |
+| `test_supertrend_matches_the_pine_reference_on_a_long_series` | SuperTrend lines and directions, 1119 bars |
 | `test_psar_matches_the_pine_reference_on_a_long_series` | Wilder PSAR, 1119 bars |
 | `test_psar_initializes_direction_from_first_close_change` | PSAR seeding rule |
 | `test_psar_follows_wilder_reversal_and_two_bar_clamp` | Reversal and clamp behaviour |
 | `test_pandas_ta_indicators_warm_up_from_real_candles` | Warm-up requirement and verdict shape |
-| `test_configured_supertrends_drive_the_vote_and_warmup` | Config drives vote count and warm-up |
-| `test_supertrend_config_is_parsed_from_the_environment` | `STRATEGY_SUPERTRENDS` parsing |
-| `test_supertrend_config_falls_back_when_the_spec_is_unusable` | Bad spec falls back |
+| `test_supertrend_is_fixed_at_14x3_and_not_configurable` | The single instance, and that a stale `STRATEGY_SUPERTRENDS` cannot add one |
+| `test_stale_vote_settings_cannot_reintroduce_a_second_supertrend` | A leftover `STRATEGY_ST_MIN_AGREE` cannot disarm the strategy |
 
 Both indicators match their references **exactly** — zero line differences and
 zero direction differences across 1119 real GIFT Nifty bars.

@@ -28,10 +28,14 @@ are never queued for the open.
 ## Quick start
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 test -f bot/.env || cp bot/.env.example bot/.env   # then edit bot/.env
 .venv/bin/python bot/bot.py
 ```
+
+`requirements-dev.txt` is the runtime file plus pytest; use `requirements.txt`
+alone for a deployment that does not run the tests. The container installs only
+the runtime file.
 
 Kite credentials are **required**, not optional — the GIFT Nifty feed runs on
 `KiteTicker`, so without a token there is no data and no strategy.
@@ -55,8 +59,11 @@ Docker volume layout, and health checks.
 | [Introduction](https://surikbs-xp.github.io/belaku/introduction) | What the bot does, precisely, and its honest limitations |
 | [Setup](https://surikbs-xp.github.io/belaku/setup) | Install, Kite credentials, getting an access token |
 | [Running](https://surikbs-xp.github.io/belaku/running) | Local and Docker, rebuilds, logs, stopping |
+| [Production](https://surikbs-xp.github.io/belaku/production) | Unattended runbook: daily token, backups, pre-flight checks |
+| [Hosting](https://surikbs-xp.github.io/belaku/hosting) | Choosing an always-on VM, deploying, remote access, migrating off a laptop |
+| [Lightsail containers](https://surikbs-xp.github.io/belaku/lightsail) | The GitHub Actions pipeline that builds, pushes and deploys to a Lightsail container service |
 | [Architecture](https://surikbs-xp.github.io/belaku/architecture) | Components, the two clocks, warm-up, signal lifecycle |
-| [Strategy](https://surikbs-xp.github.io/belaku/strategy) | Triple SuperTrend + PSAR, and why they are computed locally |
+| [Strategy](https://surikbs-xp.github.io/belaku/strategy) | SuperTrend 14×3 + PSAR, and why they are computed locally |
 | [Execution](https://surikbs-xp.github.io/belaku/execution) | Order path, safety gates, PAPER vs LIVE, margin, panic |
 | [Configuration](https://surikbs-xp.github.io/belaku/configuration) | Every environment variable |
 | [API](https://surikbs-xp.github.io/belaku/api) | The JSON endpoints |
@@ -74,8 +81,9 @@ Docker volume layout, and health checks.
 | `bot/bot.py` | **The bot.** Entrypoint: tick feed, engine, mark loop, API, dashboard |
 | `bot/gift_nifty.py` | GIFT Nifty instrument resolution, KiteTicker subscription, tick→candle aggregation |
 | `bot/engine.py` | Evaluates the strategy on GIFT Nifty bars; routes orders to the Nifty future |
-| `bot/strategy.py` | The Pine entry rules in Python (PSAR / triple SuperTrend) |
+| `bot/strategy.py` | The Pine entry rules in Python (PSAR / SuperTrend 14×3) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
+| `bot/fill.py` | Realistic paper fill model — walks the visible order book, partial fills, adverse-tick fallback |
 | `bot/kite_client.py` | KiteConnect wrapper; quotes, instrument lookup, mocked orders in PAPER |
 | `bot/kite_auth.py` | Kite login callback, request-token exchange, and access-token persistence |
 | `bot/database.py` | SQLite ledger: account, positions, orders, trades, equity curve, GIFT candles |
@@ -91,12 +99,11 @@ Docker volume layout, and health checks.
 | `BOT_NAME` | dashboard title and browser tab name (default `Belaku`) |
 | `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
-| `STRATEGY_SUPERTRENDS` | SuperTrend instances as `atr_length:multiplier` pairs (default `11:1,12:2,13:3`) |
-| `STRATEGY_ST_MIN_AGREE` | how many SuperTrends must agree before a signal is allowed |
-| `STRATEGY_PSAR_*` | Parabolic SAR start / increment / maximum |
+| `STRATEGY_PSAR_START` / `_INCREMENT` / `_MAXIMUM` | Parabolic SAR inputs (default `0.02` / `0.02` / `0.2`) |
 
-The warm-up requirement is derived from the configured SuperTrend periods
-(`longest ATR length + 1`), so it follows `STRATEGY_SUPERTRENDS` automatically.
+The strategy uses exactly two indicators — SuperTrend (14-period ATR × 3, fixed in
+code) and Parabolic SAR — so the warm-up requirement is a constant **15 closed
+bars**.
 
 If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 — the indicators are only meaningful on the timeframe they were tuned for.

@@ -1,10 +1,24 @@
-# Pinned exactly, resolved on Python 3.12 (the Dockerfile's base) — that is what
-# the container installs. Note pandas resolves to 2.3.x there, not 3.x.
-fastapi==0.162.0
+# Runtime dependencies only. Pinned exactly, resolved on Python 3.12 (the
+# Dockerfile's base) - that is what the container installs.
+#
+# Test tooling lives in requirements-dev.txt. It used to be here, which shipped
+# pytest and its plugins into the production image: ~4 MB of files and a slower
+# import for a package the bot never imports.
+#
+# `autobahn` is deliberately absent: kiteconnect pins it to `==19.11.2`, so it
+# cannot be upgraded without breaking the broker SDK. It is the one transitive
+# dependency that is not on its latest release.
+fastapi==0.165.0
+# [standard] pulls uvloop and httptools, which uvicorn selects automatically when
+# present. That is a real latency win on the dashboard's ~5 req/s poll, so the
+# extras stay - but see the Dockerfile, which drops the parts of the extra the
+# bot never uses.
 uvicorn[standard]==0.54.0
 httpx==0.28.1
 python-dotenv==1.2.4
 kiteconnect==5.2.2
-pandas==2.3.3
+pandas==3.1.1
 pandas-ta-classic==0.9.0
-pytest==9.2.0
+# Generates the TOTP code for the headless Kite login (bot/kite_autologin.py).
+# Only used when KITE_TOTP_SECRET is set; harmless otherwise.
+pyotp==2.12.1

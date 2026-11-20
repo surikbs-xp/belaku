@@ -8,8 +8,9 @@ sidebar_position: 1
 
 Algorithmic execution for **GIFT Nifty → Nifty Futures**.
 
-Belaku watches GIFT Nifty, evaluates a triple-SuperTrend + Parabolic SAR strategy
-on completed candles, and trades the front-month NFO Nifty future. No TradingView
+Belaku watches GIFT Nifty, evaluates a SuperTrend (14×3) + Parabolic SAR strategy
+on completed candles, and trades the NFO Nifty future (front month, rolled five
+days before expiry). No TradingView
 in the loop — the indicators are computed locally and verified against the Pine
 reference.
 
@@ -44,16 +45,28 @@ session rather than firing them late.
 |---|---|
 | **Signal source** | `NSEIX:GIFT NIFTY`, 15-minute bars from Kite history |
 | **Execution venue** | Front-month `NFO` Nifty future |
-| **Entry rule** | 2-of-3 SuperTrend agree **and** price on the correct side of PSAR |
-| **Warm-up** | 14 closed bars (longest SuperTrend ATR + 1) |
+| **Entry rule** | SuperTrend (14×3) agrees **and** price on the correct side of PSAR |
+| **Warm-up** | 15 closed bars (SuperTrend ATR length + 1) |
 | **Signal trigger** | First closed bar where the condition becomes true — not repeated while it holds |
-| **Exit** | Opposite signal, or manual. **There is no stop-loss or profit target.** |
+| **Exit** | The pair flips against the position, or manual. **No stop-loss and no profit target.** |
 | **Modes** | `PAPER` (simulated) and `LIVE` (real orders, explicit confirmation) |
 
-:::danger[No stop-loss]
-The strategy has no stop-loss and no profit target. Exits are an opposite signal
-or a manual square-off. Size positions accordingly — this is a deliberate
-property of the strategy, not a missing feature.
+:::note[The signal is the exit]
+There is no stop-loss, no trailing stop, and no profit target. A position is held
+until SuperTrend and PSAR flip the *other* way and then closed in full — that is
+the whole exit rule. A bar where the pair merely disagrees is held, not cut. The
+only exposure limit is `MAX_OPEN_LOTS`; there is no session loss cap, because
+blocking entries on the day's realised loss is a second strategy the signal never
+looked at.
+
+:::warning[Read the backtest before trading this]
+On three years of real GIFT Nifty 60-minute bars the strategy's gross profit
+factor is **0.98** — it wins roughly nothing in the market and gives the rest to
+the broker as charges, netting **−₹513,294 over 463 trades**. The one filtered
+configuration that clears costs fails walk-forward and is beaten by buy-and-hold.
+See [Backtesting](./backtesting.md) for the full result before trusting any
+signal this bot produces.
+:::
 :::
 
 ## Requirements
@@ -66,7 +79,7 @@ property of the strategy, not a missing feature.
 ## Quick start
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 cp bot/.env.example bot/.env          # then add KITE_API_KEY / KITE_API_SECRET
 .venv/bin/python bot/bot.py
 ```
@@ -85,7 +98,9 @@ See [Setup](/setup) for credentials and [Running](/running) for Docker details.
 
 These are real and worth knowing before you run it with money:
 
-- **No stop-loss.** A position is only closed by an opposite signal or by hand.
+- **Stops are off by default.** A position is closed by an opposite signal, by
+  hand, or by a stop you have explicitly enabled. Turning one on is a decision,
+  not a default.
 - **Single writer.** SQLite allows one writer; this is a single-instance bot.
 - **No holiday-aware LIVE deferral for GIFT.** GIFT Nifty trades on NSEIX
   holidays; the NSE F&O calendar gates *orders*, not signal evaluation.

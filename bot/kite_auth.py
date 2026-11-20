@@ -133,13 +133,18 @@ def write_token(access_token: str) -> bool:
     Rewrites in place rather than appending so repeated logins do not pile up
     duplicate keys. Returns False when .env is not writable - the in-memory
     token still works for this process.
+
+    When .env does not exist, only the token line is written. Seeding the whole
+    of ``.env.example`` would be worse than useless: that template carries
+    non-default values (``ALERT_CHANNEL=telegram``, ``WEBHOOK_HOST=127.0.0.1``)
+    which would then be loaded on the next start and silently change the
+    deployment's behaviour.
     """
     try:
         if ENV_PATH.exists():
             text = ENV_PATH.read_text(encoding="utf-8")
         else:
-            example = BASE_DIR / ".env.example"
-            text = example.read_text(encoding="utf-8") if example.exists() else ""
+            text = ""
     except OSError as exc:
         log.warning("Cannot read .env (%s); token kept in memory only", exc)
         return False

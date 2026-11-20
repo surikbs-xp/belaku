@@ -12,6 +12,7 @@ Design notes
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,9 +22,17 @@ from config import settings
 
 IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
+# The strategy every row written before multiple strategies existed belongs to.
+# Named rather than left as an empty string so an old ledger reads as one
+# coherent book rather than as unattributed rows.
+DEFAULT_STRATEGY_ID = "Surikbs"
+
 SCHEMA = """
+-- One row per strategy book. Each book carries its own virtual capital, so two
+-- strategies can be compared on their own equity rather than on a share of one
+-- blended number. The old single-row shape (id = 1) is migrated in _migrate.
 CREATE TABLE IF NOT EXISTS account (
-    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    strategy_id           TEXT PRIMARY KEY,
     initial_balance       REAL NOT NULL,
     balance               REAL NOT NULL,
     updated_at            TEXT NOT NULL
@@ -37,8 +46,16 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_price           REAL NOT NULL,
     entry_time            TEXT NOT NULL,
     last_price            REAL,
+    -- Retained for schema compatibility with ledgers written before the exit
+    -- became signal-driven. Nothing writes these any more: there is no stop-loss
+    -- and no trailing stop, so a position has no level to record.
     sl_price              REAL,
+    initial_sl_price      REAL,
     trailing_stop         REAL,
+    -- The best favourable price reached since entry: the high for a long, the
+    -- low for a short. Kept for schema compatibility; nothing reads it now that
+    -- the exit is signal-driven.
+    best_price            REAL,
     status                TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
     exit_price            REAL,
     exit_time             TEXT,
@@ -62,6 +79,10 @@ CREATE TABLE IF NOT EXISTS orders (
     product               TEXT NOT NULL,
     status                TEXT NOT NULL,
     mode                  TEXT NOT NULL,
+    -- Which strategy placed this. Two strategies trade the same contract, so
+    -- the id is what keeps one's orders and positions from being read as the
+    -- other's; see OrderManager._current_net_lots.
+    strategy_id           TEXT,
     source                TEXT NOT NULL,
     exchange_order_id     TEXT,
     position_id           INTEGER,
@@ -83,6 +104,7 @@ CREATE TABLE IF NOT EXISTS trades (
     fees                  REAL NOT NULL,
     net_pnl               REAL NOT NULL,
     mode                  TEXT NOT NULL,
+    strategy_id           TEXT,
     exit_reason           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades (exit_time DESC);
@@ -101,9 +123,19 @@ CREATE TABLE IF NOT EXISTS signals (
     action                TEXT NOT NULL,
     payload               TEXT,
     accepted              INTEGER NOT NULL,
+    strategy_id           TEXT,
     reason                TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
+
+-- Operator-editable settings that must survive a restart. The owed-entry latch
+-- lives here so a deferred signal survives a restart; .env supplies the defaults
+-- on first boot.
+CREATE TABLE IF NOT EXISTS settings (
+    key                   TEXT PRIMARY KEY,
+    value                 TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+);
 
 -- GIFT Nifty candles. Kite history is the source of truth; tick-built bars are
 -- a fallback. This table also lets the strategy survive a restart instead of
@@ -218,6 +250,70 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ON gift_candles (interval, start DESC)"
     )
 
+    # Columns added after a database was first created. `CREATE TABLE IF NOT
+    # EXISTS` above silently does nothing for an existing table, so these have to
+    # be applied here or an upgraded deployment would keep the old shape.
+    # Strategy attribution. Existing rows predate multiple strategies, so they
+    # all belong to the original one - backfilling rather than leaving NULL is
+    # what lets a strategy-scoped query keep returning the whole old history.
+    # ``signals`` has no mode column, so the two indexes differ.
+    for table, index_columns in (
+        ("positions", "(strategy_id, mode)"),
+        ("orders", "(strategy_id, mode)"),
+        ("trades", "(strategy_id, mode)"),
+        ("signals", "(strategy_id)"),
+    ):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "strategy_id" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN strategy_id TEXT")
+        conn.execute(
+            f"UPDATE {table} SET strategy_id = ? WHERE strategy_id IS NULL",
+            (DEFAULT_STRATEGY_ID,),
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_strategy "
+            f"ON {table} {index_columns}"
+        )
+
+    # The account table used to hold exactly one row (id = 1) for the whole
+    # process. Per-strategy capital needs one row per book, so the old row is
+    # rebuilt under the original strategy's id rather than dropped - its balance
+    # is real history, not a default.
+    account_columns = {row[1] for row in conn.execute("PRAGMA table_info(account)")}
+    if "id" in account_columns and "strategy_id" not in account_columns:
+        conn.execute("ALTER TABLE account RENAME TO account_old")
+        conn.execute(
+            """
+            CREATE TABLE account (
+                strategy_id     TEXT PRIMARY KEY,
+                initial_balance REAL NOT NULL,
+                balance         REAL NOT NULL,
+                updated_at      TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO account
+                (strategy_id, initial_balance, balance, updated_at)
+            SELECT ?, initial_balance, balance, updated_at FROM account_old WHERE id = 1
+            """,
+            (DEFAULT_STRATEGY_ID,),
+        )
+        conn.execute("DROP TABLE account_old")
+
+    position_columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+    if "initial_sl_price" not in position_columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN initial_sl_price REAL")
+    if "best_price" not in position_columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN best_price REAL")
+        # Seed it from the entry rather than leaving it NULL: the high-water mark
+        # starts at the fill, and a NULL would make the first mark look like the
+        # best price so far even if the trade had already run.
+        conn.execute(
+            "UPDATE positions SET best_price = entry_price WHERE best_price IS NULL"
+        )
+
 
 def _connect(path: Optional[str] = None) -> sqlite3.Connection:
     """Open a connection, creating the schema on first touch.
@@ -240,9 +336,10 @@ def _connect(path: Optional[str] = None) -> sqlite3.Connection:
             conn.executescript(SCHEMA)
             _migrate(conn)
             conn.execute(
-                "INSERT OR IGNORE INTO account (id, initial_balance, balance, updated_at) "
-                "VALUES (1, ?, ?, ?)",
+                "INSERT OR IGNORE INTO account "
+                "(strategy_id, initial_balance, balance, updated_at) VALUES (?, ?, ?, ?)",
                 (
+                    DEFAULT_STRATEGY_ID,
                     float(settings.virtual_balance),
                     float(settings.virtual_balance),
                     iso(),
@@ -253,89 +350,260 @@ def _connect(path: Optional[str] = None) -> sqlite3.Connection:
     return conn
 
 
+# Database files whose schema has already been created in this process. Re-running
+# the schema on every read cost ~650 us a call - more than every query it guarded
+# - and the schema only ever needs creating once. Keyed by resolved path so a
+# second ledger (the per-strategy index books) still gets its own.
+_schema_ready: set[str] = set()
+_schema_lock = threading.Lock()
+
+# Connections kept alive per database file, so a poll does not pay to open one
+# every time. SQLite connection setup re-reads the journal mode and, on this
+# code, re-runs the schema; at 1.5 s per poll across a dozen endpoints that cost
+# dominated every read. Thread-local because a sqlite3 connection may not be
+# shared between threads.
+_local = threading.local()
+
+
+def _cached_connection(path: Optional[str] = None) -> sqlite3.Connection:
+    """A connection reused across calls on this thread, opening on first use."""
+    key = str(Path(path or settings.db_path).resolve())
+    cache = getattr(_local, "connections", None)
+    if cache is None:
+        cache = _local.connections = {}
+    conn = cache.get(key)
+    if conn is None:
+        conn = _connect(path)
+        cache[key] = conn
+    return conn
+
+
+def close_connections() -> None:
+    """Drop this thread's cached connections, so a file can be removed or moved.
+
+    Called by the tests' teardown and by anything that re-points ``DB_PATH``.
+    A cached handle left open would keep writing to the old file.
+    """
+    cache = getattr(_local, "connections", None)
+    if cache:
+        for conn in cache.values():
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        cache.clear()
+    with _schema_lock:
+        _schema_ready.clear()
+
+
 @contextmanager
 def session(path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
-    conn = _connect(path)
+    """A write transaction.
+
+    ``BEGIN IMMEDIATE`` takes the write lock up front, which is right for a write
+    (it fails fast rather than mid-transaction) and wrong for a read: two readers
+    would serialise against each other for no reason. Use :func:`read_only` for
+    anything that does not write.
+    """
+    conn = _cached_connection(path)
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    finally:
-        conn.close()
+
+
+@contextmanager
+def read_only(path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    """A read with no write lock.
+
+    In WAL mode readers do not block writers and writers do not block readers, so
+    a read needs no transaction at all - and taking one made every dashboard poll
+    contend with the engine's writes. That contention, not the queries, is what
+    showed up as latency: the statements themselves run in microseconds.
+    """
+    conn = _cached_connection(path)
+    try:
+        yield conn
+    except sqlite3.ProgrammingError:
+        # A cached handle can be closed underneath us (close_connections from
+        # another thread's teardown). Re-open once rather than fail the read.
+        cache = getattr(_local, "connections", {})
+        key = str(Path(path or settings.db_path).resolve())
+        cache.pop(key, None)
+        yield _cached_connection(path)
+
 
 
 def init_db(path: Optional[str] = None, initial_balance: Optional[float] = None) -> None:
+    """Create the schema if this process has not already done so for this file.
+
+    Idempotent and cheap after the first call. The first call per file does the
+    real work, and the flag is only set once that succeeded - a failure must not
+    be remembered as success, or every later read would hit a missing table.
+    """
+    key = str(Path(path or settings.db_path).resolve())
+    with _schema_lock:
+        if key in _schema_ready:
+            return
     balance = float(initial_balance if initial_balance is not None else settings.virtual_balance)
     conn = _connect(path)
     try:
         conn.executescript(SCHEMA)
         _migrate(conn)
         conn.execute(
-            "INSERT OR IGNORE INTO account (id, initial_balance, balance, updated_at) "
-            "VALUES (1, ?, ?, ?)",
-            (balance, balance, iso()),
+            "INSERT OR IGNORE INTO account "
+            "(strategy_id, initial_balance, balance, updated_at) VALUES (?, ?, ?, ?)",
+            (DEFAULT_STRATEGY_ID, balance, balance, iso()),
         )
     finally:
         conn.close()
+    with _schema_lock:
+        _schema_ready.add(key)
 
 
 # ---------------------------------------------------------------------------
 # Account
 # ---------------------------------------------------------------------------
-def get_account(path: Optional[str] = None) -> dict[str, Any]:
+def get_account(
+    path: Optional[str] = None, strategy_id: Optional[str] = None
+) -> dict[str, Any]:
+    """One book's account, created on first read.
+
+    A strategy configured after the database was created has no row yet, so it is
+    seeded with the configured virtual balance rather than returning None - a
+    book that exists but reports no account looks broken.
+    """
     init_db(path)
+    key = strategy_id or DEFAULT_STRATEGY_ID
     with session(path) as conn:
-        row = conn.execute("SELECT * FROM account WHERE id = 1").fetchone()
+        row = conn.execute(
+            "SELECT * FROM account WHERE strategy_id = ?", (key,)
+        ).fetchone()
+        if row is None:
+            balance = float(settings.virtual_balance)
+            conn.execute(
+                "INSERT OR IGNORE INTO account "
+                "(strategy_id, initial_balance, balance, updated_at) VALUES (?, ?, ?, ?)",
+                (key, balance, balance, iso()),
+            )
+            row = conn.execute(
+                "SELECT * FROM account WHERE strategy_id = ?", (key,)
+            ).fetchone()
         return dict(row)
 
 
-def adjust_balance(delta: float, path: Optional[str] = None) -> float:
+def _aggregate_account(path: Optional[str] = None) -> dict[str, Any]:
+    """Every book's capital summed into one account.
+
+    Used where a figure covers all books at once. Summing is the only arithmetic
+    that makes the aggregate self-consistent: a total P&L drawn from every book's
+    trades has to be measured against every book's starting capital, or the
+    return it produces is meaningless.
+
+    Falls back to the seeded default row when no book has an account yet, so a
+    fresh database reports its configured balance rather than zero.
+    """
+    init_db(path)
+    rows = list(get_accounts(path).values())
+    if not rows:
+        return get_account(path)
+    return {
+        "strategy_id": "PORTFOLIO",
+        "initial_balance": sum(float(r.get("initial_balance") or 0.0) for r in rows),
+        "balance": sum(float(r.get("balance") or 0.0) for r in rows),
+        "updated_at": max((str(r.get("updated_at") or "") for r in rows), default=""),
+    }
+
+
+def get_accounts(path: Optional[str] = None) -> dict[str, dict[str, Any]]:
+    """Every book's account, keyed by strategy id."""
+    init_db(path)
+    with session(path) as conn:
+        rows = conn.execute("SELECT * FROM account").fetchall()
+        return {row["strategy_id"]: dict(row) for row in rows}
+
+
+def adjust_balance(
+    delta: float, path: Optional[str] = None, strategy_id: Optional[str] = None
+) -> float:
+    key = strategy_id or DEFAULT_STRATEGY_ID
+    get_account(path, key)  # seeds the row if this book is new
     with session(path) as conn:
         conn.execute(
-            "UPDATE account SET balance = balance + ?, updated_at = ? WHERE id = 1",
-            (delta, iso()),
+            "UPDATE account SET balance = balance + ?, updated_at = ? WHERE strategy_id = ?",
+            (delta, iso(), key),
         )
-        row = conn.execute("SELECT balance FROM account WHERE id = 1").fetchone()
+        row = conn.execute(
+            "SELECT balance FROM account WHERE strategy_id = ?", (key,)
+        ).fetchone()
         return float(row["balance"])
 
 
 def reset_account(
-    path: Optional[str] = None, initial_balance: Optional[float] = None
+    path: Optional[str] = None,
+    initial_balance: Optional[float] = None,
+    strategy_id: Optional[str] = None,
 ) -> None:
-    """Wipe all trading state and restore the virtual balance."""
+    """Wipe trading state and restore the virtual balance.
+
+    Scoped to one book when ``strategy_id`` is given, so resetting a strategy
+    under test does not erase the other book's history. Omitting it resets every
+    book, which is what a full wipe means.
+    """
     balance = float(initial_balance if initial_balance is not None else settings.virtual_balance)
     with session(path) as conn:
-        for table in ("positions", "orders", "trades", "equity_curve", "signals"):
-            conn.execute(f"DELETE FROM {table}")
-        conn.execute(
-            "UPDATE account SET initial_balance = ?, balance = ?, updated_at = ? WHERE id = 1",
-            (balance, balance, iso()),
-        )
+        if strategy_id:
+            for table in ("positions", "orders", "trades", "equity_curve", "signals"):
+                conn.execute(f"DELETE FROM {table} WHERE strategy_id = ?", (strategy_id,))
+            conn.execute(
+                "UPDATE account SET initial_balance = ?, balance = ?, updated_at = ? "
+                "WHERE strategy_id = ?",
+                (balance, balance, iso(), strategy_id),
+            )
+        else:
+            for table in ("positions", "orders", "trades", "equity_curve", "signals"):
+                conn.execute(f"DELETE FROM {table}")
+            conn.execute(
+                "UPDATE account SET initial_balance = ?, balance = ?, updated_at = ?",
+                (balance, balance, iso()),
+            )
 
 
 # ---------------------------------------------------------------------------
 # Positions
 # ---------------------------------------------------------------------------
 def get_open_positions(
-    path: Optional[str] = None, mode: Optional[str] = None
+    path: Optional[str] = None,
+    mode: Optional[str] = None,
+    strategy_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    """Open positions, optionally narrowed to one strategy or one mode.
+
+    ``strategy_id`` is what keeps two strategies trading the same contract from
+    reading each other's legs as their own. Omitting it returns every strategy's
+    rows, which is only correct for portfolio-wide views (PANIC, the mark loop,
+    the broker reconciliation) - never for a decision about one book.
+    """
     query = "SELECT * FROM positions WHERE status = 'OPEN'"
     params: list[Any] = []
     if mode:
         query += " AND mode = ?"
         params.append(mode)
+    if strategy_id is not None:
+        query += " AND strategy_id = ?"
+        params.append(strategy_id)
     query += " ORDER BY entry_time"
-    with session(path) as conn:
+    with read_only(path) as conn:
         return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
 def get_open_position(
     symbol: str, mode: str, path: Optional[str] = None
 ) -> Optional[dict[str, Any]]:
-    with session(path) as conn:
+    with read_only(path) as conn:
         row = conn.execute(
             "SELECT * FROM positions WHERE status = 'OPEN' AND symbol = ? AND mode = ? "
             "ORDER BY entry_time DESC LIMIT 1",
@@ -354,8 +622,16 @@ def open_position(symbol: str, quantity: int, price: float, path: Optional[str] 
         "last_price": price,
         "mode": extra.pop("mode", "PAPER"),
         "source": extra.pop("source", "WEBHOOK"),
-        "strategy": extra.pop("strategy", "Surikbs"),
+        # The display name, kept for the dashboard ("Surikbs").
+        "strategy": extra.pop("strategy", DEFAULT_STRATEGY_ID),
+        # The key every scoped query filters on. Distinct from ``strategy`` so a
+        # rename of the display name cannot silently orphan a book's history.
+        "strategy_id": extra.pop("strategy_id", DEFAULT_STRATEGY_ID),
         "sl_price": extra.pop("sl_price", None),
+        "initial_sl_price": extra.pop("initial_sl_price", None),
+        # The high-water mark starts at the fill, so the first mark can only ever
+        # move it in the favourable direction.
+        "best_price": extra.pop("best_price", price),
         "notes": extra.pop("notes", None),
     }
     cols.update(extra)
@@ -371,11 +647,104 @@ def open_position(symbol: str, quantity: int, price: float, path: Optional[str] 
 def update_position_price(
     position_id: int, price: float, path: Optional[str] = None
 ) -> None:
+    """Write a mark, advancing the high-water mark when it is a new best.
+
+    ``best_price`` is the high for a long and the low for a short, so the
+    comparison is direction-aware. It is still maintained so a ledger written by
+    an older build keeps a coherent column, even though nothing reads it now.
+    """
     with session(path) as conn:
         conn.execute(
-            "UPDATE positions SET last_price = ? WHERE id = ? AND status = 'OPEN'",
-            (price, position_id),
+            "UPDATE positions SET last_price = ?, "
+            "best_price = CASE "
+            "  WHEN best_price IS NULL THEN ? "
+            "  WHEN position_key = 1 THEN MAX(best_price, ?) "
+            "  ELSE MIN(best_price, ?) "
+            "END "
+            "WHERE id = ? AND status = 'OPEN'",
+            (price, price, price, price, position_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Operator settings
+# ---------------------------------------------------------------------------
+def get_settings(path: Optional[str] = None) -> dict[str, str]:
+    """Every stored setting, as a plain string map."""
+    with read_only(path) as conn:
+        return {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM settings")
+        }
+
+
+def set_settings(values: dict[str, Any], path: Optional[str] = None) -> None:
+    """Upsert settings in one transaction, so a partial write cannot happen."""
+    if not values:
+        return
+    stamp = iso()
+    with session(path) as conn:
+        conn.executemany(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            [(key, str(value), stamp) for key, value in values.items()],
+        )
+
+
+def delete_settings(keys: list[str], path: Optional[str] = None) -> None:
+    """Remove stored settings so their ``.env`` defaults apply again.
+
+    Deleting is not the same as storing an empty string: an empty string is a
+    value, and coercing it turns a boolean override into ``False`` rather than
+    falling back to the default.
+    """
+    if not keys:
+        return
+    with session(path) as conn:
+        conn.executemany(
+            "DELETE FROM settings WHERE key = ?", [(key,) for key in keys]
+        )
+
+
+def mark_open_positions(
+    mode: Optional[str] = None,
+    prices: Optional[dict[str, float]] = None,
+    path: Optional[str] = None,
+) -> int:
+    """Write ``prices`` onto the matching open positions. Returns rows touched.
+
+    The stop-loss compares ``last_price`` against the entry, so a mark that is
+    never written leaves the guard reading the entry price forever and it can
+    never trip. Kept as one connection for the whole sweep rather than a call per
+    position.
+
+    ``best_price`` is advanced in the same statement: it is the high for a long
+    and the low for a short. Nothing reads it now that the exit is signal-driven,
+    but keeping it in step costs nothing and leaves the column coherent.
+    """
+    if not prices:
+        return 0
+    touched = 0
+    with session(path) as conn:
+        for symbol, price in prices.items():
+            if price is None:
+                continue
+            query = (
+                "UPDATE positions SET last_price = ?, "
+                "best_price = CASE "
+                "  WHEN best_price IS NULL THEN ? "
+                "  WHEN position_key = 1 THEN MAX(best_price, ?) "
+                "  ELSE MIN(best_price, ?) "
+                "END "
+                "WHERE status = 'OPEN' AND symbol = ?"
+            )
+            params: list[Any] = [float(price), float(price), float(price), float(price), symbol]
+            if mode:
+                query += " AND mode = ?"
+                params.append(mode)
+            touched += conn.execute(query, params).rowcount or 0
+    return touched
 
 
 def close_position(
@@ -418,8 +787,9 @@ def close_position(
             )
         conn.execute(
             "INSERT INTO trades (position_id, symbol, direction, quantity, entry_price, "
-            "exit_price, entry_time, exit_time, gross_pnl, fees, net_pnl, mode, exit_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "exit_price, entry_time, exit_time, gross_pnl, fees, net_pnl, mode, "
+            "strategy_id, exit_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 position_id,
                 pos["symbol"],
@@ -433,12 +803,18 @@ def close_position(
                 fees,
                 net,
                 pos["mode"],
+                # Inherited from the position rather than passed in: the trade is
+                # the closing of that position, so it cannot belong to a
+                # different book.
+                pos.get("strategy_id") or DEFAULT_STRATEGY_ID,
                 exit_reason,
             ),
         )
+        # The closing trade credits the book that opened the position, not a
+        # global account: each strategy carries its own capital.
         conn.execute(
-            "UPDATE account SET balance = balance + ?, updated_at = ? WHERE id = 1",
-            (net, closed_at),
+            "UPDATE account SET balance = balance + ?, updated_at = ? WHERE strategy_id = ?",
+            (net, closed_at, pos.get("strategy_id") or DEFAULT_STRATEGY_ID),
         )
         return {
             "position_id": position_id,
@@ -468,6 +844,7 @@ def record_order(path: Optional[str] = None, **fields: Any) -> int:
         "product": fields.get("product", "NRML"),
         "status": fields.get("status", "COMPLETE"),
         "mode": fields.get("mode", "PAPER"),
+        "strategy_id": fields.get("strategy_id", DEFAULT_STRATEGY_ID),
         "source": fields.get("source", "WEBHOOK"),
         "exchange_order_id": fields.get("exchange_order_id"),
         "position_id": fields.get("position_id"),
@@ -501,12 +878,15 @@ def record_signal(
     accepted: bool,
     reason: str,
     path: Optional[str] = None,
+    strategy_id: Optional[str] = None,
 ) -> None:
     init_db(path)
     with session(path) as conn:
         conn.execute(
-            "INSERT INTO signals (ts, action, payload, accepted, reason) VALUES (?, ?, ?, ?, ?)",
-            (iso(), action, payload, int(accepted), reason),
+            "INSERT INTO signals (ts, action, payload, accepted, strategy_id, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (iso(), action, payload, int(accepted),
+             strategy_id or DEFAULT_STRATEGY_ID, reason),
         )
 
 
@@ -537,7 +917,7 @@ def get_equity_summary(path: Optional[str] = None) -> dict[str, Any]:
     opening sample plus the peak-to-trough drawdown. Reading 5000 rows to derive
     two numbers dominated the tick, so the drawdown is computed in SQL.
     """
-    with session(path) as conn:
+    with read_only(path) as conn:
         first = conn.execute(
             "SELECT equity FROM equity_curve ORDER BY ts, id LIMIT 1"
         ).fetchone()
@@ -625,14 +1005,20 @@ def get_gift_candles(
 
 def gift_candle_count(path: Optional[str] = None) -> int:
     init_db(path)
-    with session(path) as conn:
+    with read_only(path) as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM gift_candles").fetchone()
         return int(row["n"])
 
 
 def _fetch_all(query: str, params: Sequence[Any], path: Optional[str]) -> list[dict[str, Any]]:
+    """Every read goes through here, and every read is lock-free.
+
+    ``init_db`` is still called: it is what creates a fresh ``DB_PATH``, and a
+    read of a database that does not exist yet must not fail. It is cheap once
+    the schema is in place.
+    """
     init_db(path)
-    with session(path) as conn:
+    with read_only(path) as conn:
         return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
@@ -640,10 +1026,24 @@ def get_orders(limit: int = 500, path: Optional[str] = None) -> list[dict[str, A
     return _fetch_all("SELECT * FROM orders ORDER BY ts DESC, id DESC LIMIT ?", [limit], path)
 
 
-def get_trades(limit: int = 1000, path: Optional[str] = None) -> list[dict[str, Any]]:
-    return _fetch_all(
-        "SELECT * FROM trades ORDER BY exit_time DESC, id DESC LIMIT ?", [limit], path
-    )
+def get_trades(
+    limit: int = 1000,
+    path: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Closed round-trips, newest first.
+
+    ``mode`` scopes the result to one execution mode: a PAPER trade must never be
+    counted against a LIVE figure, and the two share one ledger table.
+    """
+    query = "SELECT * FROM trades"
+    params: list[Any] = []
+    if mode:
+        query += " WHERE mode = ?"
+        params.append(mode)
+    query += " ORDER BY exit_time DESC, id DESC LIMIT ?"
+    params.append(limit)
+    return _fetch_all(query, params, path)
 
 
 def get_signals(limit: int = 100, path: Optional[str] = None) -> list[dict[str, Any]]:
@@ -899,14 +1299,36 @@ def get_performance_metrics(
     open_positions: Optional[list[dict[str, Any]]] = None,
     prices: Optional[dict[str, float]] = None,
     mode: Optional[str] = None,
+    strategy_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Aggregate realised stats from the trade ledger plus live unrealised PnL."""
-    account = get_account(path)
+    """Aggregate realised stats from the trade ledger plus live unrealised PnL.
+
+    ``strategy_id`` scopes every figure to one book, including the account it
+    reads. Omitting it returns the whole portfolio, which is what the aggregate
+    header wants.
+
+    The aggregate account is the *sum* of every book's account, not the legacy
+    default row. Reading one book's capital beside the sum of every book's trades
+    made the headline disagree with itself: with three books funded and one of
+    them up Rs 1,924, the portfolio reported that profit against the legacy
+    ``Surikbs`` balance - so its return came out as 0.00% and its equity did not
+    move at all. The two figures are still reported separately, they are just
+    drawn from the same set of books.
+    """
+    account = _aggregate_account(path) if strategy_id is None else get_account(
+        path, strategy_id
+    )
     trade_query = "SELECT * FROM trades"
     trade_params: list[Any] = []
+    clauses = []
     if mode:
-        trade_query += " WHERE mode = ?"
+        clauses.append("mode = ?")
         trade_params.append(mode)
+    if strategy_id:
+        clauses.append("strategy_id = ?")
+        trade_params.append(strategy_id)
+    if clauses:
+        trade_query += " WHERE " + " AND ".join(clauses)
     trade_query += " ORDER BY exit_time"
     trades = _fetch_all(trade_query, trade_params, path)
     summary = (

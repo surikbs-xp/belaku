@@ -1,0 +1,170 @@
+name: Deploy to Lightsail
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'website/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      execution_mode:
+        description: 'EXECUTION_MODE for this deployment'
+        type: choice
+        options: [PAPER, LIVE]
+        default: PAPER
+
+# A deploy replaces the running container, so two in flight at once would race
+# for the same service. Queue one behind the other rather than cancelling: a
+# cancelled deploy can leave the service on a half-rolled-out image.
+concurrency:
+  group: lightsail-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC role assumption; unused when falling back to access keys
+
+env:
+  AWS_REGION: ap-south-1
+  SERVICE_NAME: belaku
+  CONTAINER_NAME: bot
+  CONTAINER_PORT: '9000'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # The test job needs the dev tooling; the image does not. requirements-dev
+      # includes the runtime file, so this installs both.
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Compile
+        run: python -m compileall -q bot tests
+
+      - name: Test
+        run: python -m pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: lightsail
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      # Set AWS_ROLE_ARN to use GitHub OIDC and skip the long-lived keys
+      # entirely. Empty means the access-key secrets are used instead.
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # The Lightsail CLI plugin is what lets `push-container-image` read the
+      # local Docker daemon. Without it the push fails with "exec: lightsailctl:
+      # executable file not found in $PATH".
+      - name: Install lightsailctl
+        run: |
+          curl -fsSL "https://s3.us-west-2.amazonaws.com/lightsailctl/latest/linux-amd64/lightsailctl" \
+            -o /usr/local/bin/lightsailctl
+          chmod +x /usr/local/bin/lightsailctl
+
+      - name: Configure AWS credentials (OIDC)
+        if: env.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Fallback for accounts without a GitHub OIDC provider. Long-lived keys are
+      # the weaker option; prefer AWS_ROLE_ARN and delete the key secrets.
+      - name: Configure AWS credentials (access keys)
+        if: env.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build image
+        run: |
+          IMAGE="belaku:${GITHUB_SHA::12}"
+          docker build -t "$IMAGE" .
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # Secrets are written to a file rather than passed as --build-arg or
+      # inline env so they never appear in the build log or the image layers.
+      - name: Write runtime environment
+        env:
+          KITE_API_KEY: ${{ secrets.KITE_API_KEY }}
+          KITE_API_SECRET: ${{ secrets.KITE_API_SECRET }}
+          KITE_ACCESS_TOKEN: ${{ secrets.KITE_ACCESS_TOKEN }}
+          KITE_USER_ID: ${{ secrets.KITE_USER_ID }}
+          KITE_PASSWORD: ${{ secrets.KITE_PASSWORD }}
+          KITE_TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          DASHBOARD_SESSION_SECRET: ${{ secrets.DASHBOARD_SESSION_SECRET }}
+          ALERT_CHANNEL: ${{ secrets.ALERT_CHANNEL }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          ALERT_TELEGRAM_BOT_TOKEN: ${{ secrets.ALERT_TELEGRAM_BOT_TOKEN }}
+          ALERT_TELEGRAM_CHAT_ID: ${{ secrets.ALERT_TELEGRAM_CHAT_ID }}
+          EXECUTION_MODE: ${{ inputs.execution_mode || 'PAPER' }}
+        run: |
+          umask 077
+          ENV_FILE="$RUNNER_TEMP/belaku.env"
+          : > "$ENV_FILE"
+          for name in KITE_API_KEY KITE_API_SECRET KITE_ACCESS_TOKEN \
+                      KITE_USER_ID KITE_PASSWORD KITE_TOTP_SECRET \
+                      DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET \
+                      ALERT_CHANNEL ALERT_WEBHOOK_URL \
+                      ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID \
+                      EXECUTION_MODE; do
+            value="$(printenv "$name" || true)"
+            # Skip unset secrets instead of writing "KEY=" and overriding the
+            # script's defaults with an empty string.
+            if [ -n "$value" ]; then
+              printf '%s=%s\n' "$name" "$value" >> "$ENV_FILE"
+            fi
+          done
+          echo "ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"
+
+      - name: Build deployment spec
+        run: |
+          python3 deploy/lightsail/build-spec.py \
+            --service-name "$SERVICE_NAME" \
+            --image "$IMAGE" \
+            --container-name "$CONTAINER_NAME" \
+            --container-port "$CONTAINER_PORT" \
+            --env-file "$ENV_FILE" \
+            --out "$RUNNER_TEMP/spec.json"
+
+      - name: Push and deploy
+        id: deploy
+        run: |
+          python3 deploy/lightsail/deploy.py \
+            --service-name "$SERVICE_NAME" \
+            --region "$AWS_REGION" \
+            --image "$IMAGE" \
+            --label "$CONTAINER_NAME" \
+            --spec "$RUNNER_TEMP/spec.json" \
+            --power micro \
+            --scale 1
+          URL="$(aws lightsail get-container-services \
+            --service-name "$SERVICE_NAME" --region "$AWS_REGION" \
+            --query 'containerServices[0].url' --output text)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          aws lightsail get-container-log \
+            --service-name "$SERVICE_NAME" \
+            --container-name "$CONTAINER_NAME" \
+            --region "$AWS_REGION" \
+            --output text | tail -n 200 || true
