@@ -1950,7 +1950,15 @@ class StrategyEngine:
         # if the loop thread has died, which is exactly when a rollover matters.
         if not payload.get("rollover"):
             try:
-                payload["rollover"] = rollover_status()
+                # The contract actually held, not the calendar, for the same
+                # reason ``enforce_rollover`` passes it: ``rolled`` is derived from
+                # the open position's expiry. Calling this with no `open_symbol`
+                # reported rolled=False always, so the red "entries blocked"
+                # banner never appeared on a first poll - the one moment it is
+                # read - even with a position stranded in a dead contract.
+                payload["rollover"] = rollover_status(
+                    open_symbol=self._open_contract_symbol()
+                )
                 payload["rollover_paused"] = bool(payload["rollover"]["rolled"])
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("Rollover status unavailable: %s", exc)

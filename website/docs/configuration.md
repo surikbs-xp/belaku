@@ -196,9 +196,27 @@ it does not have.
 
 | `ALERT_WEBHOOK_URL` | *(empty)* | Webhook for `slack`/`discord`/`ntfy`/`generic`. Empty = log and dashboard only. |
 | `ALERT_TELEGRAM_BOT_TOKEN` | *(empty)* | Bot token from @BotFather, for `ALERT_CHANNEL=telegram`. |
-| `ALERT_TELEGRAM_CHAT_ID` | *(empty)* | Chat id to send to. Message the bot once, then read it from `getUpdates`. |
+| `ALERT_TELEGRAM_CHAT_ID` | *(empty)* | Chat id to send to: the numeric id of the chat that messaged the bot, never the bot's own. Resolve it with `scripts/telegram-setup.py --test`. |
 | `ALERT_ON_LIFECYCLE` | `1` | Send a message on start and stop. |
 | `WATCHDOG_INTERVAL_SECONDS` | `30` | How often trading health is checked |
+
+A Telegram target must be a *chat* id, not the bot's identity. Telegram records a
+chat only after it has received a message from it, so send the bot any message
+from your own account first. Two values look configured and deliver nothing:
+
+| Value | Telegram's answer |
+|---|---|
+| the bot's username, e.g. `belaku_bot` | `400 Bad Request: chat not found` |
+| the bot's own numeric id | `403 Forbidden: the bot can't send messages to the bot` |
+
+`scripts/telegram-setup.py` reads the token from `bot/.env`, finds the chat that
+messaged the bot, writes the id back, and with `--test` sends a message so the
+delivery is confirmed rather than assumed:
+
+```bash
+scripts/telegram-setup.py --list     # what Telegram has seen
+scripts/telegram-setup.py --test     # write the id and send a test alert
+```
 
 Nothing leaves the bot while `ALERT_ENABLED=0`, which is the default even when
 credentials are filled in. The bot is deliberately noisy — every fill and every

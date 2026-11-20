@@ -115,6 +115,26 @@ def _post_webhook(url: str, payload: dict[str, Any], timeout: float = 5.0) -> bo
         return False
 
 
+def _undelivered_reason() -> str:
+    """Why the last alert did not arrive, as one short clause.
+
+    The sender returns a bare False for three different situations - the master
+    switch is off, the channel has no token/URL, or the service rejected the
+    message - and they need different fixes. Naming the cause here means the log
+    line is actionable instead of a generic "not delivered".
+    """
+    try:
+        import notifier
+
+        if not notifier.enabled():
+            return "alerting is switched off"
+        if not notifier.channel_ready():
+            return f"ALERT_CHANNEL={settings.alert_channel} is not configured"
+        return "the channel rejected the message; see the line above"
+    except Exception:  # pragma: no cover - defensive
+        return "delivery failed"
+
+
 class Watchdog:
     """Periodically checks trading health and alerts on sustained problems."""
 
@@ -381,35 +401,30 @@ class Watchdog:
             except Exception:  # pragma: no cover - defensive
                 payload["at_ist"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(moment))
             log.warning("ALERT %s: %s", alert.kind, alert.detail)
-            # The gate is "can the configured channel deliver", not "is a webhook
-            # URL set". Telegram is addressed by bot token and chat id and leaves
-            # ALERT_WEBHOOK_URL empty, so testing the URL meant every watchdog
-            # alert was logged and then dropped - the operator saw nothing on the
-            # phone while the log said ALERT. `notifier.send` already refuses when
-            # the channel is unconfigured or switched off, so this only has to
-            # avoid the pointless call.
-            try:
-                import notifier
-
-                deliverable = notifier.configured()
-            except Exception:  # pragma: no cover - defensive
-                deliverable = bool(self.webhook_url)
+            # Delivery is decided by the sender, never by a gate here. The gate
+            # used to be `notifier.configured()`, which answers "would a message
+            # go out right now" - so while alerting was switched off, or the
+            # channel was only partly configured, an *injected* sender was never
+            # called at all. That made `dispatch` untestable with a stub and,
+            # worse, made the watchdog report a live channel as broken: the
+            # default sender already refuses when the channel cannot deliver and
+            # returns False, so the gate only subtracted information. Calling it
+            # unconditionally keeps one place deciding, and the counters below
+            # still separate "fired" from "delivered".
             delivered = False
-            if deliverable:
-                # Guarded even though the default sender swallows its own
-                # errors: dispatch runs on the watchdog thread, and an
-                # exception here would kill the loop and silently stop all
-                # future alerting - the worst possible failure for a watchdog.
-                try:
-                    delivered = bool(self._sender(self.webhook_url, payload))
-                except Exception:
-                    log.exception("Alert sender raised for %s", alert.kind)
-            else:
+            # Guarded even though the default sender swallows its own errors:
+            # dispatch runs on the watchdog thread, and an exception here would
+            # kill the loop and silently stop all future alerting - the worst
+            # possible failure for a watchdog.
+            try:
+                delivered = bool(self._sender(self.webhook_url, payload))
+            except Exception:
+                log.exception("Alert sender raised for %s", alert.kind)
+            if not delivered:
                 log.warning(
-                    "ALERT %s not delivered: alerting is off or the channel is "
-                    "not configured (channel=%s)",
+                    "ALERT %s not delivered (%s)",
                     alert.kind,
-                    getattr(settings, "alert_channel", "?"),
+                    _undelivered_reason(),
                 )
             with self._lock:
                 # The cooldown is set either way. A message that could not be

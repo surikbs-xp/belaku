@@ -3398,10 +3398,18 @@ def test_rollover_status_marks_expiry_day_before_the_close() -> None:
     assert status["seconds_to_expiry"] > 0
 
 
-def test_engine_status_reports_rollover_before_the_first_loop_tick(monkeypatch) -> None:
+def test_engine_status_reports_rollover_before_the_first_loop_tick(monkeypatch, tmp_path) -> None:
     """The dashboard polls /api/status every 1.5s and the loop ticks every 5s, so
     the first poll must already carry the rollover state - otherwise the banner
-    is blank exactly when the operator opens the page."""
+    is blank exactly when the operator opens the page.
+
+    It must also carry the *held* contract. ``status`` used to call
+    ``rollover_status()`` with no ``open_symbol``, which reports ``rolled`` as
+    False by design - so a position stranded in an expired contract produced a
+    green banner, and ``rollover_paused`` stayed False, on every cold poll.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
     feed = GiftNiftyFeed("1minute")
     feed._history = [
         {
@@ -3428,9 +3436,23 @@ def test_engine_status_reports_rollover_before_the_first_loop_tick(monkeypatch) 
     payload = engine.StrategyEngine().status()
 
     # No loop tick has run, so this can only have come from status() itself.
-    assert payload["rollover"]["current_symbol"] == "NIFTY26NOVFUT"
+    assert payload["rollover"]["current_symbol"] == kite_client.future_symbol()
     assert payload["rollover"]["expiry_label"]
-    assert payload["rollover_paused"] is False
+    # The bug: the held contract has to reach rollover_status, or `rolled` can
+    # never be true here. One minute after the 15:30 close on expiry day the
+    # position has no venue left, so the dashboard must say so.
+    monkeypatch.setattr(
+        engine,
+        "rollover_status",
+        lambda **kwargs: kite_client.rollover_status(
+            datetime(2026, 11, 24, 15, 31, tzinfo=IST), **kwargs
+        ),
+    )
+    expired = engine.StrategyEngine().status()
+
+    assert expired["rollover"]["open_symbol"] == "NIFTY26NOVFUT"
+    assert expired["rollover"]["rolled"] is True
+    assert expired["rollover_paused"] is True
 
 
 def test_enforce_rollover_flags_a_position_in_an_expired_contract(monkeypatch, tmp_path) -> None:
@@ -7497,6 +7519,44 @@ def test_alert_status_reports_the_master_switch(monkeypatch, tmp_path) -> None:
     assert state["token_set"] is True, "the token is still set, just not in use"
 
 
+def test_a_bot_username_is_not_a_telegram_chat_id(monkeypatch) -> None:
+    """A non-empty chat id is not a valid one, and treating it as valid is what
+    made a permanently failing channel look armed.
+
+    ALERT_TELEGRAM_CHAT_ID was set to the bot's own username, which Telegram can
+    never resolve - a bot cannot message itself. Both fields were non-empty, so
+    ``configured()`` answered yes, the dashboard showed "Armed", and every alert
+    failed with ``400 chat not found``. Over a session that is one failed HTTP
+    round-trip and one warning line every 30s, with no alert ever arriving.
+    """
+    import dataclasses
+    import notifier
+    from config import settings
+
+    assert notifier.telegram_chat_id_valid("321056238") is True
+    assert notifier.telegram_chat_id_valid("-1001234567890") is True, "group ids are negative"
+    assert notifier.telegram_chat_id_valid("@belaku_alerts") is True, "public channel"
+    for bad in ("belaku_bot", "42x", "@", "", None, "-"):
+        assert notifier.telegram_chat_id_valid(bad) is False, bad
+
+    sent: list = []
+    monkeypatch.setattr(notifier, "_post_json",
+                        lambda url, body, timeout=8.0: sent.append(body) or True)
+    monkeypatch.setattr(notifier, "settings", dataclasses.replace(
+        settings,
+        alert_enabled=True,
+        alert_channel="telegram",
+        alert_telegram_bot_token="TOK",
+        alert_telegram_chat_id="belaku_bot",
+    ))
+
+    assert notifier.channel_ready() is False
+    assert notifier.configured() is False
+    assert notifier.status()["chat_id_valid"] is False
+    assert notifier.send({"kind": "TEST", "detail": "x"}) is False
+    assert sent == [], "an unusable target must not be called at all"
+
+
 def test_alert_delivery_failure_is_reported_not_raised(monkeypatch) -> None:
     """A dead channel must not take the watchdog down with it.
 
@@ -8835,6 +8895,13 @@ def test_a_reconnect_keeps_the_books_configured_interval(monkeypatch) -> None:
     """
     import gift_nifty
     import engine as engine_module
+
+    # The book's interval is configuration, so the test has to state it. It used
+    # to rely on the developer's own bot/.env setting STRATEGY_1_INTERVAL=15minute,
+    # which passed locally and failed in CI (where .env is not committed) with
+    # "60minute != 15minute" - reporting a reconnect bug that was not there.
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_INTERVAL", "15minute")
 
     first = gift_nifty.GiftNiftyFeed("60minute")
     monkeypatch.setattr(engine_module, "get_feed", lambda: first)
@@ -10327,7 +10394,11 @@ def test_panic_flattens_the_index_books_too(monkeypatch, tmp_path) -> None:
                 paused=True,
             ),
         )
-        monkeypatch.setattr(bot_app, "gift_books", lambda: [book])
+        # Patched on `gift_book`, not on `bot`: `api_panic` imports `gift_books`
+        # inside the function, so a `bot_app.gift_books` attribute is never read.
+        # The old patch therefore did nothing at all, and the test only passed
+        # where `.env` configured a strategy whose id happened to match the book.
+        monkeypatch.setattr(gift_book, "gift_books", lambda: [book])
 
         payload = TestClient(bot_app.app, base_url="http://localhost").post(
             "/api/panic", json={"confirm": True, "reason": "PANIC"}
