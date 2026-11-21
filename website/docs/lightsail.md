@@ -196,8 +196,8 @@ The bot reads its configuration from the environment, so every value that
 | `KITE_PASSWORD` | no | Headless login |
 | `KITE_TOTP_SECRET` | no | Headless login; the 2FA secret, not a code |
 | `DASHBOARD_SESSION_SECRET` | recommended | Keeps dashboard logins across a redeploy |
-| `ALERT_ENABLED` | optional | `1` sends alerts; leave unset/`0` to keep the bot silent |
-| `ALERT_CHANNEL` | recommended | `telegram` or `webhook` |
+| `ALERT_ENABLED` | recommended | `1` sends alerts. Set it as a secret, not only from the dashboard: the toggle is stored in SQLite under `/data`, which a redeploy wipes |
+| `ALERT_CHANNEL` | recommended | `telegram`, `slack`, `discord`, `ntfy` or `generic` |
 | `ALERT_WEBHOOK_URL` | if `webhook` | |
 | `ALERT_TELEGRAM_BOT_TOKEN` | if `telegram` | |
 | `ALERT_TELEGRAM_CHAT_ID` | if `telegram` | |
@@ -210,6 +210,20 @@ gh secret set KITE_API_SECRET
 
 Unset secrets are skipped rather than written as empty strings, so a missing
 `ALERT_CHANNEL` leaves the bot's own default in place instead of blanking it.
+
+:::warning[Set `ALERT_ENABLED` as a secret, not only from the dashboard]
+
+The dashboard's alerting toggle is stored in SQLite under `/data`, and `/data` is
+recreated from the image on every deployment. A toggle flipped in the browser
+therefore survives a restart but not a redeploy — the bot comes back silent. Set
+`ALERT_ENABLED=1` as a repository secret so the deployed default is "on":
+
+```bash
+gh secret set ALERT_ENABLED --body 1
+gh secret set ALERT_CHANNEL --body telegram
+```
+
+:::
 
 ### 4. The `lightsail` environment
 
