@@ -43,6 +43,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WEBHOOK_PORT=9000 \
     DB_PATH=/data/paper_trading.db
 
+# Build provenance, so the dashboard can answer "is the latest commit live?"
+# without shelling into the container. The CI build passes these; a local
+# `docker build` leaves them empty and the dashboard says so rather than
+# inventing a version.
+ARG BUILD_SHA=""
+ARG BUILD_TIME=""
+ARG BUILD_REF=""
+ENV BUILD_SHA=${BUILD_SHA} \
+    BUILD_TIME=${BUILD_TIME} \
+    BUILD_REF=${BUILD_REF}
+
 WORKDIR /app
 
 # Only the installed packages cross the stage boundary - no compiler, no headers,

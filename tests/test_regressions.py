@@ -2802,6 +2802,50 @@ def test_status_carries_the_mirror_block_and_survives_a_broken_mirror(
     assert "shadow book on fire" in payload["mirror"]["reason"]
 
 
+def test_status_reports_the_build_that_is_serving(monkeypatch, tmp_path) -> None:
+    """The dashboard must be able to answer "is the latest commit live?".
+
+    Provenance is baked into the image at build time, so it is read from the
+    environment rather than from git - the container has no repository. An image
+    built without it reports empty strings, which the dashboard renders as
+    "Build unknown" instead of inventing a version.
+    """
+    from fastapi.testclient import TestClient
+
+    import dataclasses
+
+    import bot as bot_app
+    from config import settings
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+
+    client = TestClient(bot_app.app)
+
+    monkeypatch.setattr(
+        bot_app, "settings",
+        dataclasses.replace(
+            settings,
+            build_sha="4ba5f00af39f1234567890abcdef1234567890ab",
+            build_time="2026-11-21T16:23:00Z",
+            build_ref="main",
+        ),
+    )
+    build = client.get("/api/status").json()["build"]
+    assert build["sha"] == "4ba5f00af39f1234567890abcdef1234567890ab"
+    assert build["short_sha"] == "4ba5f00af39f"
+    assert build["time"] == "2026-11-21T16:23:00Z"
+    assert build["ref"] == "main"
+
+    monkeypatch.setattr(
+        bot_app, "settings",
+        dataclasses.replace(settings, build_sha="", build_time="", build_ref=""),
+    )
+    build = client.get("/api/status").json()["build"]
+    assert build["sha"] == ""
+    assert build["short_sha"] == "", "no provenance must not become a fake version"
+
+
 # ---------------------------------------------------------------------------
 # GIFT Nifty index book
 #

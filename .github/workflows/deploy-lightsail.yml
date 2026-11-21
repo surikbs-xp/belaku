@@ -141,7 +141,13 @@ jobs:
       - name: Build image
         run: |
           IMAGE="belaku:${GITHUB_SHA::12}"
-          docker build -t "$IMAGE" .
+          # Provenance is baked into the image so the dashboard can report which
+          # commit is actually serving, not which one was meant to be.
+          docker build \
+            --build-arg BUILD_SHA="$GITHUB_SHA" \
+            --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg BUILD_REF="$GITHUB_REF_NAME" \
+            -t "$IMAGE" .
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
       # Secrets are written to a file rather than passed as --build-arg or

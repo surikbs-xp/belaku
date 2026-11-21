@@ -112,6 +112,12 @@ class Settings:
     webhook_port: int = _env_int("WEBHOOK_PORT", 9000)
     # Shown as the browser tab title and the dashboard header.
     bot_name: str = _env("BOT_NAME", "Belaku")
+    # Build provenance, baked into the image by the CI build (see Dockerfile).
+    # Empty for a local `docker build` or a bare `python bot/bot.py`, which the
+    # dashboard reports as "unknown" rather than inventing a version.
+    build_sha: str = _env("BUILD_SHA", "")
+    build_time: str = _env("BUILD_TIME", "")
+    build_ref: str = _env("BUILD_REF", "")
     # Host header allow-list. Without this a malicious page can DNS-rebind its
     # own hostname to 127.0.0.1 and talk to the API "same-origin" with no CORS
     # involvement at all.

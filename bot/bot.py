@@ -890,6 +890,15 @@ def api_status() -> dict[str, Any]:
         "mode": get_execution_mode(),
         "modes": [PAPER, LIVE],
         "bot_name": settings.bot_name,
+        # Which build is actually serving. The dashboard shows the short SHA so
+        # "is the latest commit live?" is answerable without shelling into the
+        # container; empty means the image was built without provenance.
+        "build": {
+            "sha": settings.build_sha,
+            "short_sha": settings.build_sha[:12],
+            "time": settings.build_time,
+            "ref": settings.build_ref,
+        },
         "live_configured": settings.is_live_configured,
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "started_at": STARTED_ISO,

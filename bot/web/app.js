@@ -397,6 +397,8 @@ function renderStatus(status) {
   $('footer-right').textContent =
     `Sync ${state.lastSync ? state.lastSync.toLocaleTimeString() : '—'} · ${state.failures ? `${state.failures} failed poll(s)` : 'healthy'}`;
 
+  renderBuild(status.build);
+
   renderExecutionMeta(status);
   renderMirror(status.mirror);
   renderRolloverPill(status.engine || {});
@@ -484,6 +486,32 @@ function renderMirror(mirror) {
 }
 
 /** Static execution facts a trader checks before trusting a fill. */
+/**
+ * Which build is serving, as a footer pill.
+ *
+ * The point is to answer "did my deploy actually land?" without shelling into
+ * the container. A short SHA is enough to compare against `git log`; the full
+ * SHA and build time go in the tooltip. An image built without provenance says
+ * so rather than showing a version that would be a guess.
+ */
+function renderBuild(build) {
+  const pill = $('pill-build');
+  if (!pill) return;
+  const sha = (build && build.short_sha) || '';
+  if (!sha) {
+    pill.textContent = 'Build unknown';
+    pill.className = 'pill pill-idle';
+    pill.title = 'This image was built without BUILD_SHA; a local build or a bare python run.';
+    return;
+  }
+  pill.textContent = `Build ${sha}`;
+  pill.className = 'pill pill-live';
+  const parts = [`commit ${build.sha}`];
+  if (build.ref) parts.push(`ref ${build.ref}`);
+  if (build.time) parts.push(`built ${build.time}`);
+  pill.title = parts.join(' · ');
+}
+
 function renderExecutionMeta(status) {
   const config = status.config || {};
   const symbol = status.symbol || {};

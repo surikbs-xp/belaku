@@ -71,6 +71,9 @@
         <!-- Front-month rollover. Hidden until the contract is close enough to
              expiry to matter, so it is a quiet nudge rather than a banner. -->
         <span id="pill-rollover" class="pill pill-idle hidden">Rollover —</span>
+        <!-- Which commit is actually serving, so a deploy can be confirmed
+             from the browser instead of the AWS console. -->
+        <span id="pill-build" class="pill pill-idle">Build —</span>
       </div>
       <div id="kite-manual" class="header-manual hidden">
         <input id="kite-token" type="text" class="field" placeholder="Paste request_token from the redirect URL" />
