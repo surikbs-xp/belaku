@@ -26,7 +26,11 @@ permissions:
   id-token: write # OIDC role assumption; unused when falling back to access keys
 
 env:
-  AWS_REGION: ap-south-1
+  # The organization's service control policy denies Lightsail container
+  # actions in most regions, ap-south-1 (Mumbai) included. ap-southeast-2 is
+  # one of the few where CreateContainerService and the registry/deploy calls
+  # are permitted, so the service lives there.
+  AWS_REGION: ap-southeast-2
   SERVICE_NAME: belaku
   CONTAINER_NAME: bot
   CONTAINER_PORT: '9000'

@@ -66,8 +66,19 @@ aws lightsail create-container-service \
   --service-name belaku \
   --power micro \
   --scale 1 \
-  --region ap-south-1
+  --region ap-southeast-2
 ```
+
+:::warning[Region is constrained by the organization's SCP]
+
+The account sits in an AWS Organization whose service control policy denies
+Lightsail container actions in most regions — `ap-south-1` (Mumbai) among them.
+`ap-southeast-2` (Sydney) is one of the few where `CreateContainerService` and
+the registry/deploy calls are permitted, so the workflow pins `AWS_REGION` to it.
+Changing the region without amending the SCP fails with
+`explicit deny in a service control policy`.
+
+:::
 
 `micro` is 1 GB RAM / 0.25 shared vCPU at $10/month, which is the floor this bot
 needs — pandas dominates startup. `scale 1` is correct: the bot is a single
@@ -234,7 +245,7 @@ The bot's public domain is assigned by Lightsail and is not known until the
 service exists, so this step comes *after* the first deploy. Read the URL:
 
 ```bash
-aws lightsail get-container-services --service-name belaku --region ap-south-1 \
+aws lightsail get-container-services --service-name belaku --region ap-southeast-2 \
   --query 'containerServices[0].url' --output text
 ```
 
@@ -303,17 +314,17 @@ The workflow also dumps the last 200 container log lines on failure.
 
 ```bash
 # Current state and public URL
-aws lightsail get-container-services --service-name belaku --region ap-south-1 \
+aws lightsail get-container-services --service-name belaku --region ap-southeast-2 \
   --query 'containerServices[0].{state:state,url:url,deployment:currentDeployment.state}'
 
 # Logs (stdout/stderr of the container)
 aws lightsail get-container-log --service-name belaku \
-  --container-name bot --region ap-south-1 --output text | tail -n 100
+  --container-name bot --region ap-southeast-2 --output text | tail -n 100
 
 # Roll back by hand to a previous deployment version
-aws lightsail get-container-service-deployments --service-name belaku --region ap-south-1
+aws lightsail get-container-service-deployments --service-name belaku --region ap-southeast-2
 aws lightsail create-container-service-deployment --service-name belaku \
-  --cli-input-json file://previous.json --region ap-south-1
+  --cli-input-json file://previous.json --region ap-southeast-2
 ```
 
 Lightsail keeps the last 50 deployment versions, so a bad release is recoverable
