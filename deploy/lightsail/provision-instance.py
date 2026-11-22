@@ -42,6 +42,21 @@ def aws(*args: str) -> dict:
     return json.loads(out) if out else {}
 
 
+def aws_optional(*args: str) -> dict | None:
+    """Run an ``aws`` command, returning None when the resource is absent.
+
+    ``get-static-ip`` answers with ``NotFoundException`` for a name that does
+    not exist, which is the normal "not created yet" case here rather than a
+    failure.
+    """
+    try:
+        return aws(*args)
+    except ProvisionError as exc:
+        if "NotFoundException" in str(exc):
+            return None
+        raise
+
+
 def instance(name: str, region: str) -> dict | None:
     """Return the instance, or None when it does not exist yet."""
     payload = aws(
@@ -142,26 +157,32 @@ def ensure_static_ip(name: str, target: str, region: str) -> str:
     Without this the instance's public IP changes on every stop/start, which
     would break the Kite redirect URL and the dashboard bookmark each time the
     box is cycled for cost.
+
+    The *singular* ``get-static-ip`` is used deliberately: some organizations
+    deny the plural ``GetStaticIps`` by service control policy in a region while
+    leaving the singular call allowed, and the plural is only a convenience for
+    listing. Asking for one name by name works either way.
     """
-    existing = aws(
-        "lightsail", "get-static-ips",
+    existing = aws_optional(
+        "lightsail", "get-static-ip",
+        "--static-ip-name", name,
         "--region", region,
         "--output", "json",
     )
-    for entry in existing.get("staticIps") or []:
-        if entry.get("name") == name:
-            if entry.get("attachedTo") == target:
-                print(f"  static IP {name} already attached ({entry.get('ipAddress')})")
-                return entry["ipAddress"]
-            print(f"  attaching existing static IP {name} to {target}")
-            aws(
-                "lightsail", "attach-static-ip",
-                "--static-ip-name", name,
-                "--instance-name", target,
-                "--region", region,
-                "--output", "json",
-            )
+    if existing is not None:
+        entry = existing["staticIp"]
+        if entry.get("attachedTo") == target:
+            print(f"  static IP {name} already attached ({entry.get('ipAddress')})")
             return entry["ipAddress"]
+        print(f"  attaching existing static IP {name} to {target}")
+        aws(
+            "lightsail", "attach-static-ip",
+            "--static-ip-name", name,
+            "--instance-name", target,
+            "--region", region,
+            "--output", "json",
+        )
+        return entry["ipAddress"]
 
     print(f"  allocating static IP {name}")
     payload = aws(

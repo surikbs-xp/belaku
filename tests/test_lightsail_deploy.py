@@ -349,10 +349,10 @@ def test_provisioning_is_idempotent_when_everything_exists(monkeypatch, tmp_path
             return {"keyPairs": [{"name": "belaku"}]}
         if args[1] == "get-instances":
             return {"instances": [{"name": "belaku", "state": {"name": "running"}}]}
-        if args[1] == "get-static-ips":
-            return {"staticIps": [
-                {"name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4"},
-            ]}
+        if args[1] == "get-static-ip":
+            return {"staticIp": {
+                "name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4",
+            }}
         return {}
 
     monkeypatch.setattr(provision, "aws", fake_aws)
@@ -385,8 +385,8 @@ def test_provisioning_waits_for_running_before_attaching_the_ip(monkeypatch, tmp
             return {"instances": [{"name": "belaku", "state": {"name": state}}]}
         if args[1] == "get-key-pairs":
             return {"keyPairs": [{"name": "belaku"}]}
-        if args[1] == "get-static-ips":
-            return {"staticIps": []}
+        if args[1] == "get-static-ip":
+            return None
         if args[1] == "allocate-static-ip":
             order.append("allocate")
             return {"staticIp": {"ipAddress": "1.2.3.4"}}
@@ -420,10 +420,10 @@ def test_the_firewall_is_replaced_with_ssh_only(monkeypatch, tmp_path) -> None:
             return {"instances": [{"name": "belaku", "state": {"name": "running"}}]}
         if args[1] == "get-key-pairs":
             return {"keyPairs": [{"name": "belaku"}]}
-        if args[1] == "get-static-ips":
-            return {"staticIps": [
-                {"name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4"},
-            ]}
+        if args[1] == "get-static-ip":
+            return {"staticIp": {
+                "name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4",
+            }}
         return {}
 
     monkeypatch.setattr(provision, "aws", fake_aws)
@@ -433,3 +433,57 @@ def test_the_firewall_is_replaced_with_ssh_only(monkeypatch, tmp_path) -> None:
     ports = [c for c in seen if c[1] == "put-instance-public-ports"]
     assert len(ports) == 1
     assert "fromPort=22,toPort=22,protocol=tcp" in ports[0]
+
+
+def test_the_static_ip_lookup_avoids_the_plural_list_call(monkeypatch, tmp_path) -> None:
+    """Some SCPs deny ``GetStaticIps`` in a region but allow ``GetStaticIp``.
+
+    The plural call is only a convenience for listing; asking for one name by
+    name works where the list is denied, so the script must not depend on it.
+    """
+    key = tmp_path / "belaku.pub"
+    key.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+
+    seen: list[str] = []
+
+    def fake_aws(*args: str) -> dict:
+        seen.append(args[1])
+        if args[1] == "get-instances":
+            return {"instances": [{"name": "belaku", "state": {"name": "running"}}]}
+        if args[1] == "get-key-pairs":
+            return {"keyPairs": [{"name": "belaku"}]}
+        if args[1] == "get-static-ip":
+            return {"staticIp": {
+                "name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4",
+            }}
+        return {}
+
+    monkeypatch.setattr(provision, "aws", fake_aws)
+
+    assert provision.main(["--public-key", str(key)]) == 0
+    assert "get-static-ips" not in seen
+    assert "get-static-ip" in seen
+
+
+def test_a_missing_static_ip_is_not_an_error(monkeypatch, tmp_path) -> None:
+    """``NotFoundException`` means "not created yet", not a failure."""
+    key = tmp_path / "belaku.pub"
+    key.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+
+    def fake_aws(*args: str) -> dict:
+        if args[1] == "get-instances":
+            return {"instances": [{"name": "belaku", "state": {"name": "running"}}]}
+        if args[1] == "get-key-pairs":
+            return {"keyPairs": [{"name": "belaku"}]}
+        if args[1] == "get-static-ip":
+            raise provision.ProvisionError(
+                "aws lightsail get-static-ip failed: An error occurred "
+                "(NotFoundException) when calling the GetStaticIp operation"
+            )
+        if args[1] == "allocate-static-ip":
+            return {"staticIp": {"ipAddress": "1.2.3.4"}}
+        return {}
+
+    monkeypatch.setattr(provision, "aws", fake_aws)
+
+    assert provision.main(["--public-key", str(key)]) == 0
