@@ -2846,6 +2846,79 @@ def test_status_reports_the_build_that_is_serving(monkeypatch, tmp_path) -> None
     assert build["short_sha"] == "", "no provenance must not become a fake version"
 
 
+def test_status_reports_the_broker_round_trip(monkeypatch, tmp_path) -> None:
+    """The dashboard must be able to show how far the host is from Kite.
+
+    The region choice is justified by this number, so it has to be measured
+    rather than assumed. It is a real round-trip, so it is cached: the UI polls
+    every 1.5s and must not add a broker call per poll.
+    """
+    from fastapi.testclient import TestClient
+
+    import bot as bot_app
+    import kite_client
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+
+    client = TestClient(bot_app.app)
+    # The client is process-global, so a sample from an earlier test would make
+    # the cache assertion below pass or fail for the wrong reason.
+    kite = kite_client.reset_client()
+
+    calls = []
+
+    class FakeKite:
+        def profile(self):
+            calls.append(1)
+            return {"user_id": "AB1234"}
+
+    monkeypatch.setattr(type(kite), "sdk_ready", property(lambda self: True))
+    monkeypatch.setattr(kite, "_kite", FakeKite())
+
+    latency = client.get("/api/status").json()["kite"]["latency"]
+    assert latency["available"] is True
+    assert latency["samples"] == 1
+    assert latency["median_ms"] >= 0
+
+    # A second poll inside the cache window must not add a sample. Counting
+    # profile() calls would not prove this: auth_status() calls it too.
+    client.get("/api/status")
+    latency = client.get("/api/status").json()["kite"]["latency"]
+    assert latency["samples"] == 1, "the latency probe must be cached, not per-poll"
+
+
+def test_latency_reports_unavailable_rather_than_zero(monkeypatch) -> None:
+    """No measurement must not look like a perfect one.
+
+    A zero would render as the best possible latency, which is the opposite of
+    the truth when the SDK is not ready or the token has expired.
+    """
+    import kite_client
+
+    kite = kite_client.KiteClient()
+    monkeypatch.setattr(type(kite), "sdk_ready", property(lambda self: False))
+
+    latency = kite.probe_latency()
+    assert latency["available"] is False
+    assert "median_ms" not in latency
+    assert latency["reason"]
+
+
+def test_latency_keeps_a_bounded_sample_window(monkeypatch) -> None:
+    """A long-running process must not grow the sample list without limit."""
+    import kite_client
+
+    kite = kite_client.KiteClient()
+    monkeypatch.setattr(type(kite), "sdk_ready", property(lambda self: True))
+    monkeypatch.setattr(kite, "_kite", type("K", (), {"profile": lambda self: {}})())
+
+    for _ in range(kite_client.LATENCY_SAMPLE_COUNT + 5):
+        kite.probe_latency(max_age=0)
+
+    assert len(kite._latency_samples) == kite_client.LATENCY_SAMPLE_COUNT
+
+
 # ---------------------------------------------------------------------------
 # GIFT Nifty index book
 #

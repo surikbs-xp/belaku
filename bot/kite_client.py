@@ -77,6 +77,12 @@ MARKET_CLOSE = (15, 30)
 PROFILE_CACHE_SECONDS = 15.0
 MARGINS_CACHE_SECONDS = 10.0
 QUOTE_CACHE_SECONDS = 2.0
+# The latency probe is a deliberate extra round-trip, so it runs far less often
+# than the poll that displays it. A minute is frequent enough to notice a region
+# change or a degraded path, and rare enough to be invisible in the API budget.
+LATENCY_CACHE_SECONDS = 60.0
+# Enough samples for a stable median without keeping a long history in memory.
+LATENCY_SAMPLE_COUNT = 20
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +383,11 @@ class KiteClient:
         self._margins_checked_at = 0.0
         # symbol -> (fetched_at, quote or None). A None entry is a cached failure.
         self._quote_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+        # Broker round-trip samples, newest last. Bounded so a long-running
+        # process cannot grow this without limit.
+        self._latency_samples: list[float] = []
+        self._latency_checked_at = 0.0
+        self._latency_error: Optional[str] = None
         self._init_sdk()
 
     # -- SDK bootstrap ---------------------------------------------------
@@ -734,6 +745,78 @@ class KiteClient:
 
     def data_source(self) -> str:
         return "KITE" if self._last_quote_at is not None else "CACHE"
+
+    # -- Latency ---------------------------------------------------------
+    def probe_latency(self, max_age: float = LATENCY_CACHE_SECONDS) -> dict[str, Any]:
+        """Time one broker round-trip, cached so a 1.5s poll costs no I/O.
+
+        ``kite.profile()`` is the cheapest authenticated call the SDK exposes,
+        so it measures the path to Kite's API without pulling a quote or
+        touching the order book. The number is wall-clock around the call: it
+        includes TLS reuse, the broker's own processing and the return trip,
+        which is what "how far is this box from Kite" actually means.
+
+        Samples are kept so the dashboard can show a median rather than a
+        single reading that a transient blip would misrepresent.
+        """
+        if not self.sdk_ready:
+            return {"available": False, "reason": "Kite SDK not ready"}
+
+        with self._lock:
+            if max_age > 0 and (time.time() - self._latency_checked_at) < max_age:
+                return self._latency_payload()
+
+        started = time.perf_counter()
+        try:
+            self.kite.profile()
+        except TokenException as exc:
+            self._latency_error = f"Access token invalid/expired: {exc}"
+            with self._lock:
+                self._latency_checked_at = time.time()
+            return self._latency_payload()
+        except (KiteException, NetworkException) as exc:
+            self._latency_error = f"Kite API error: {exc}"
+            with self._lock:
+                self._latency_checked_at = time.time()
+            return self._latency_payload()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._latency_error = f"Unexpected error: {exc}"
+            with self._lock:
+                self._latency_checked_at = time.time()
+            return self._latency_payload()
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        with self._lock:
+            self._latency_error = None
+            self._latency_samples.append(elapsed_ms)
+            del self._latency_samples[:-LATENCY_SAMPLE_COUNT]
+            self._latency_checked_at = time.time()
+        return self._latency_payload()
+
+    def _latency_payload(self) -> dict[str, Any]:
+        """The latency block, built from whatever samples exist.
+
+        Called with the lock held or from a path that already took it, so it
+        reads the list directly rather than re-acquiring.
+        """
+        samples = list(self._latency_samples)
+        if not samples:
+            return {
+                "available": False,
+                "reason": self._latency_error or "no successful round-trip yet",
+                "samples": 0,
+            }
+        ordered = sorted(samples)
+        median = ordered[len(ordered) // 2]
+        return {
+            "available": True,
+            "last_ms": round(samples[-1], 1),
+            "median_ms": round(median, 1),
+            "min_ms": round(ordered[0], 1),
+            "max_ms": round(ordered[-1], 1),
+            "samples": len(samples),
+            "error": self._latency_error,
+        }
 
     # -- Trading ---------------------------------------------------------
     def margins(self, max_age: float = MARGINS_CACHE_SECONDS) -> Optional[dict[str, Any]]:

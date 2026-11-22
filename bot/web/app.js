@@ -398,6 +398,7 @@ function renderStatus(status) {
     `Sync ${state.lastSync ? state.lastSync.toLocaleTimeString() : '—'} · ${state.failures ? `${state.failures} failed poll(s)` : 'healthy'}`;
 
   renderBuild(status.build);
+  renderLatency((status.kite || {}).latency);
 
   renderExecutionMeta(status);
   renderMirror(status.mirror);
@@ -510,6 +511,37 @@ function renderBuild(build) {
   if (build.ref) parts.push(`ref ${build.ref}`);
   if (build.time) parts.push(`built ${build.time}`);
   pill.title = parts.join(' · ');
+}
+
+/**
+ * Round-trip to Kite's API, as a header pill.
+ *
+ * This is the number the region choice actually buys: a host in Mumbai sits a
+ * few milliseconds from Kite's ticker, where a Sydney or US host pays a
+ * long-haul hop. Showing the median rather than the last sample keeps a single
+ * blip from looking like a trend.
+ */
+function renderLatency(latency) {
+  const pill = $('pill-latency');
+  if (!pill) return;
+  if (!latency || !latency.available) {
+    pill.textContent = 'Latency —';
+    pill.className = 'pill pill-idle';
+    pill.title = (latency && latency.reason) || 'No successful round-trip to Kite yet.';
+    return;
+  }
+  const median = latency.median_ms;
+  // Thresholds are about what the number means, not about being fast: under
+  // 50ms is a same-region path, under 150ms is a neighbouring region, and
+  // beyond that the host is a long way from the broker.
+  const variant = median < 50 ? 'live' : (median < 150 ? 'paper' : 'bad');
+  pill.textContent = `Latency ${median}ms`;
+  pill.className = `pill pill-${variant}`;
+  pill.title = [
+    `median ${median}ms over ${latency.samples} sample${latency.samples === 1 ? '' : 's'}`,
+    `last ${latency.last_ms}ms`,
+    `range ${latency.min_ms}–${latency.max_ms}ms`,
+  ].join(' · ');
 }
 
 function renderExecutionMeta(status) {

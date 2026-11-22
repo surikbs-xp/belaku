@@ -919,6 +919,9 @@ def api_status() -> dict[str, Any]:
                 if client.last_quote_at
                 else None
             ),
+            # How far this host is from Kite's API. Cached for a minute, so the
+            # 1.5s poll does not add a round-trip of its own.
+            "latency": client.probe_latency(),
         },
         "strategy": {
             "paused": manager.paused,

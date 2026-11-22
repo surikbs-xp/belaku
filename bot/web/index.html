@@ -74,6 +74,9 @@
         <!-- Which commit is actually serving, so a deploy can be confirmed
              from the browser instead of the AWS console. -->
         <span id="pill-build" class="pill pill-idle">Build —</span>
+        <!-- Round-trip to Kite's API. This is what the region choice buys, so
+             it is worth being able to see rather than assume. -->
+        <span id="pill-latency" class="pill pill-idle">Latency —</span>
       </div>
       <div id="kite-manual" class="header-manual hidden">
         <input id="kite-token" type="text" class="field" placeholder="Paste request_token from the redirect URL" />
