@@ -326,3 +326,110 @@ def test_a_push_without_a_reference_is_an_error(monkeypatch) -> None:
 
     with pytest.raises(deploy.DeployError, match="did not report an image reference"):
         deploy.push_image("belaku", "ap-south-1", "belaku:abc123", "bot")
+
+
+provision = _load("lightsail_provision_instance", "provision-instance.py")
+
+
+def test_provisioning_is_idempotent_when_everything_exists(monkeypatch, tmp_path) -> None:
+    """Re-running after a partial failure must not duplicate resources.
+
+    The script is meant to be safe to re-run, so every ``ensure_*`` step has to
+    look before it creates. This pins that: with all three resources already
+    present, no create/allocate/import call is made.
+    """
+    key = tmp_path / "belaku.pub"
+    key.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_aws(*args: str) -> dict:
+        calls.append(args)
+        if args[1] == "get-key-pairs":
+            return {"keyPairs": [{"name": "belaku"}]}
+        if args[1] == "get-instances":
+            return {"instances": [{"name": "belaku", "state": {"name": "running"}}]}
+        if args[1] == "get-static-ips":
+            return {"staticIps": [
+                {"name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4"},
+            ]}
+        return {}
+
+    monkeypatch.setattr(provision, "aws", fake_aws)
+
+    assert provision.main([
+        "--public-key", str(key),
+        "--region", "ap-south-1",
+    ]) == 0
+
+    created = [c[1] for c in calls if c[1].startswith(("create", "allocate", "import"))]
+    assert created == []
+
+
+def test_provisioning_waits_for_running_before_attaching_the_ip(monkeypatch, tmp_path) -> None:
+    """A pending instance has no public IP, so attach would fail.
+
+    The static IP is what keeps the Kite redirect URL stable across stop/start,
+    so it must be attached - but only once the instance is actually running.
+    """
+    key = tmp_path / "belaku.pub"
+    key.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+
+    states = ["pending", "pending", "running"]
+    order: list[str] = []
+
+    def fake_aws(*args: str) -> dict:
+        if args[1] == "get-instances":
+            state = states.pop(0) if states else "running"
+            order.append(f"instance:{state}")
+            return {"instances": [{"name": "belaku", "state": {"name": state}}]}
+        if args[1] == "get-key-pairs":
+            return {"keyPairs": [{"name": "belaku"}]}
+        if args[1] == "get-static-ips":
+            return {"staticIps": []}
+        if args[1] == "allocate-static-ip":
+            order.append("allocate")
+            return {"staticIp": {"ipAddress": "1.2.3.4"}}
+        if args[1] == "attach-static-ip":
+            order.append("attach")
+        return {}
+
+    monkeypatch.setattr(provision, "aws", fake_aws)
+    monkeypatch.setattr(provision.time, "sleep", lambda _: None)
+
+    assert provision.main(["--public-key", str(key)]) == 0
+
+    assert order.index("instance:running") < order.index("attach")
+
+
+def test_provisioning_refuses_a_missing_public_key(tmp_path, capsys) -> None:
+    assert provision.main(["--public-key", str(tmp_path / "nope.pub")]) == 2
+    assert "public key not found" in capsys.readouterr().err
+
+
+def test_the_firewall_is_replaced_with_ssh_only(monkeypatch, tmp_path) -> None:
+    """Lightsail opens port 80 by default; the bot needs no inbound ports."""
+    key = tmp_path / "belaku.pub"
+    key.write_text("ssh-ed25519 AAAA test\n", encoding="utf-8")
+
+    seen: list[tuple[str, ...]] = []
+
+    def fake_aws(*args: str) -> dict:
+        seen.append(args)
+        if args[1] == "get-instances":
+            return {"instances": [{"name": "belaku", "state": {"name": "running"}}]}
+        if args[1] == "get-key-pairs":
+            return {"keyPairs": [{"name": "belaku"}]}
+        if args[1] == "get-static-ips":
+            return {"staticIps": [
+                {"name": "belaku-ip", "attachedTo": "belaku", "ipAddress": "1.2.3.4"},
+            ]}
+        return {}
+
+    monkeypatch.setattr(provision, "aws", fake_aws)
+
+    assert provision.main(["--public-key", str(key)]) == 0
+
+    ports = [c for c in seen if c[1] == "put-instance-public-ports"]
+    assert len(ports) == 1
+    assert "fromPort=22,toPort=22,protocol=tcp" in ports[0]

@@ -87,7 +87,9 @@ login. Pay for uptime and location, nothing else.
 
 ## 1. Provision and harden the VM
 
-Create an Ubuntu 24.04 LTS instance with your SSH public key. Then:
+Create an Ubuntu 24.04 LTS instance with your SSH public key. On Lightsail this
+is scripted — see [Provisioning on Lightsail](#provisioning-on-lightsail) below.
+Then:
 
 ```bash
 # Only SSH is reachable; the bot needs no inbound ports at all.
@@ -371,6 +373,67 @@ at the service. Send a test from the dashboard (**Send test alert**) or
 
 Watchdog state is on `/api/status` under `watchdog`; channel config is on
 `/api/alerts/status`.
+
+## Provisioning on Lightsail
+
+`deploy/lightsail/provision-instance.py` creates the instance, imports your SSH
+key, attaches a static IP and closes the firewall down to SSH. It is idempotent,
+so re-running after a partial failure resumes instead of duplicating.
+
+```bash
+# Your public key, e.g. ~/.ssh/belaku.pub
+python3 deploy/lightsail/provision-instance.py \
+  --public-key ~/.ssh/belaku.pub \
+  --region ap-south-1 \
+  --zone ap-south-1a
+```
+
+It prints the static IP and the `ssh ubuntu@…` line. Then continue from
+[Install Docker](#2-install-docker).
+
+The static IP matters more than it looks: without one the public address changes
+on every stop/start, which breaks both the Kite redirect URL and the dashboard
+bookmark each time the box is cycled for cost.
+
+:::warning[The SCP may not allow the region you want]
+
+Lightsail instance actions are governed by the organization's service control
+policy, which can deny them per region. If `create-instances` fails with
+`explicit deny in a service control policy`, the region is blocked regardless of
+what the IAM identity policy allows — the SCP is evaluated first and wins. Ask
+the organization admin to allow `lightsail:*Instance*` (and `lightsail:*KeyPair*`,
+`lightsail:*StaticIp*`) in that region, or pick a region the policy already
+permits.
+
+:::
+
+The script needs these actions on the identity that runs it:
+
+```json title="belaku-provision-permissions.json"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "lightsail:GetInstances",
+        "lightsail:CreateInstances",
+        "lightsail:GetKeyPairs",
+        "lightsail:ImportKeyPair",
+        "lightsail:GetStaticIps",
+        "lightsail:AllocateStaticIp",
+        "lightsail:AttachStaticIp",
+        "lightsail:PutInstancePublicPorts"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Add `lightsail:ReleaseStaticIp` and `lightsail:DeleteInstance` too, or you will
+not be able to undo a mistake: an **unattached static IP is billed**, and a
+policy that can allocate but not release leaves you paying for it.
 
 ## Checklist
 
