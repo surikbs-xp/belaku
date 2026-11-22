@@ -26,11 +26,11 @@ permissions:
   id-token: write # OIDC role assumption; unused when falling back to access keys
 
 env:
-  # The organization's service control policy denies Lightsail container
-  # actions in most regions, ap-south-1 (Mumbai) included. ap-southeast-2 is
-  # one of the few where CreateContainerService and the registry/deploy calls
-  # are permitted, so the service lives there.
-  AWS_REGION: ap-southeast-2
+  # Mumbai is the closest region to NSE and to Kite's ticker, which is what the
+  # bot talks to. The organization's service control policy permits Lightsail
+  # container actions in ap-south-1, ap-southeast-2 and us-east-1; the guard
+  # step below fails fast if this is ever pointed at a region it does not.
+  AWS_REGION: ap-south-1
   SERVICE_NAME: belaku
   CONTAINER_NAME: bot
   CONTAINER_PORT: '9000'
@@ -144,7 +144,7 @@ jobs:
       - name: Check the region allows container services
         run: |
           if ! aws lightsail get-container-services --region "$AWS_REGION" >/dev/null 2>&1; then
-            echo "::error::lightsail:GetContainerServices is denied in $AWS_REGION. The organization's service control policy permits container services only in ap-southeast-2 and us-east-1. See website/docs/lightsail.md."
+            echo "::error::lightsail:GetContainerServices is denied in $AWS_REGION. The organization's service control policy permits container services only in ap-south-1, ap-southeast-2 and us-east-1. See website/docs/lightsail.md."
             exit 1
           fi
           echo "Container services are permitted in $AWS_REGION"
