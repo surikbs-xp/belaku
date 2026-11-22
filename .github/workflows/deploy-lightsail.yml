@@ -138,6 +138,17 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The organization's SCP denies every container action in most regions, so
+      # a wrong AWS_REGION fails deep inside the deploy after a four-minute
+      # image build. Ask the one cheap question up front instead.
+      - name: Check the region allows container services
+        run: |
+          if ! aws lightsail get-container-services --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "::error::lightsail:GetContainerServices is denied in $AWS_REGION. The organization's service control policy permits container services only in ap-southeast-2 and us-east-1. See website/docs/lightsail.md."
+            exit 1
+          fi
+          echo "Container services are permitted in $AWS_REGION"
+
       - name: Build image
         run: |
           IMAGE="belaku:${GITHUB_SHA::12}"
