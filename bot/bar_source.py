@@ -1,21 +1,16 @@
 """Where closed bars come from, independent of which strategy reads them.
 
 The engine used to assume exactly one answer to "what is the signal series": the
-GIFT Nifty feed. A second strategy needs a second series, so the assumption is
-made explicit here as a small protocol that both sources satisfy.
+GIFT Nifty feed. That feed is gone, so the assumption is made explicit here as a
+small protocol a source satisfies.
 
-Keeping the sources behind one interface is what lets :class:`strategy.StrategyVerdict`
+Keeping the source behind one interface is what lets :class:`strategy.StrategyVerdict`
 and the engine's decision logic stay unchanged: every source yields the same
 ``{time, open, high, low, close}`` dicts, oldest first, newest bar last.
 
-The two implementations differ in one way that matters, and it is a real
-difference rather than an accident:
-
-* :class:`GiftBarSource` wraps the live tick feed, which also carries a websocket
-  and a forming bar. It reads ~20 hours a day.
-* :class:`NiftyBarSource` reads Kite history only - there is no tick subscription
-  for the index. It therefore has no forming bar and no live path, which is
-  exactly right for an NSE-hours strategy: a bar appears when it closes.
+:class:`NiftyBarSource` reads Kite history only - there is no tick subscription
+for the index. It therefore has no forming bar and no live path, which is
+exactly right for an NSE-hours strategy: a bar appears when it closes.
 
 Nothing here places orders. A source produces candles; the engine and the order
 manager decide what to do with them.
@@ -31,9 +26,35 @@ from typing import Any, Optional, Protocol, runtime_checkable
 import database as db
 import kite_client
 from config import settings
-from gift_nifty import HISTORY_REFRESH_SECONDS, interval_to_seconds
 
 log = logging.getLogger("bar_source")
+
+# Kite history is authoritative; refresh it at most this often unless forced.
+HISTORY_REFRESH_SECONDS = 30.0
+
+
+def interval_to_seconds(interval: str) -> int:
+    """Map a Kite-style interval string to seconds (``5minute`` -> 300)."""
+    text = (interval or "").strip().lower().replace(" ", "")
+    units = {
+        "minute": 60,
+        "minutes": 60,
+        "min": 60,
+        "hour": 3600,
+        "hours": 3600,
+        "day": 86400,
+    }
+    for unit, factor in units.items():
+        if text.endswith(unit):
+            head = text[: -len(unit)]
+            try:
+                return max(60, int(head or "1") * factor)
+            except ValueError:
+                break
+    try:
+        return max(60, int(text) * 60)
+    except ValueError:
+        return 900
 
 # NIFTY 50 spot on NSE. Not tradeable, but it is the index the futures track, so
 # its bars are the signal series for a NIFTY-based strategy.
@@ -64,128 +85,6 @@ class BarSource(Protocol):
     def status(self) -> dict[str, Any]: ...
 
 
-class GiftBarSource:
-    """The existing GIFT Nifty feed, behind the protocol.
-
-    A thin adapter rather than a rewrite: the feed owns a websocket, a tick
-    builder and a persisted candle series, and none of that changes. This class
-    exists so the engine can hold it beside another source without caring which
-    is which.
-    """
-
-    def __init__(self, feed: Any = None, interval: Optional[str] = None) -> None:
-        self._feed = feed
-        # The timeframe this book reads. None means the feed's own, which is the
-        # single-timeframe case every deployment had before. A book asking for a
-        # different one gets it built from the same ticks by the same feed - the
-        # websocket is process-global and cannot be opened twice.
-        self.interval = interval
-
-    @property
-    def feed(self) -> Any:
-        """The GIFT feed, resolved on every read.
-
-        Deliberately not cached. ``gift_nifty.get_feed`` is the process
-        singleton and can be reset (a reconnect does exactly that), so holding
-        the first instance would pin this source to a feed that has been
-        replaced - and the strategy would quietly read a stopped series.
-        """
-        if self._feed is not None:
-            return self._feed
-        from gift_nifty import get_feed
-
-        return get_feed()
-
-    @property
-    def key(self) -> str:
-        return "NSEIX:GIFT NIFTY"
-
-    @property
-    def seconds(self) -> int:
-        self._ensure_interval()
-        # The book's own interval wins only when the feed declares one and it
-        # differs. A feed with no `interval` at all is a tick-only stub, and its
-        # `seconds` is the only statement of bar length available - reading the
-        # configured name there would report a length the stub is not building.
-        feed_interval = getattr(self.feed, "interval", None)
-        if self.interval and feed_interval and self.interval != feed_interval:
-            from gift_nifty import interval_to_seconds
-
-            return interval_to_seconds(self.interval)
-        return int(self.feed.seconds)
-
-    def _ensure_interval(self) -> None:
-        """Ask the feed to build this timeframe if it is not the feed's own.
-
-        Called from ``candles`` as well as from ``seconds``: every reader of this
-        book must find the series being built, and ``seconds`` is what the engine
-        asks before it evaluates. Leaving it only in ``candles`` meant a book
-        could report a 900s bar length while the feed had not yet been told to
-        build it, so the first evaluations read an empty series.
-        """
-        if not self.interval:
-            return
-        ensure = getattr(self.feed, "ensure_interval", None)
-        if ensure is not None:
-            ensure(self.interval)
-
-    def refresh_history(self, force: bool = False) -> int:
-        """Ask the feed to refresh. Never raises - see the protocol note.
-
-        The feed's own signature varies (a tick-only stub may take no arguments
-        and expose no count), so both are called defensively: a refresh that
-        cannot run must degrade to the series already in hand rather than take
-        the engine loop down.
-        """
-        feed = self.feed
-        try:
-            try:
-                feed.refresh_history(force=force)
-            except TypeError:
-                feed.refresh_history()
-        except Exception as exc:  # pragma: no cover - defensive
-            log.warning("GIFT history refresh failed: %s", exc)
-        # The count the protocol promises, without candles()' full copy. The
-        # engine calls this once per book per tick - every 5 s, whether or not a
-        # bar closed - and it used to return bar_count(), which duplicated the
-        # whole series for a value the engine then discarded.
-        counter = getattr(self.feed, "interval_count", None)
-        if counter is not None:
-            try:
-                return int(counter(self.interval))
-            except Exception:  # pragma: no cover - defensive
-                pass
-        return len(self.candles())
-
-    def candles(self) -> list[dict[str, Any]]:
-        self._ensure_interval()
-        reader = getattr(self.feed, "interval_candles", None)
-        if reader is not None:
-            return list(reader(self.interval) or [])
-        return list(self.feed.candles() or [])
-
-    def bar_count(self) -> int:
-        return len(self.candles())
-
-    def start(self) -> bool:
-        return bool(self.feed.start())
-
-    def stop(self, timeout: float = 5.0) -> None:
-        self.feed.stop(timeout=timeout)
-
-    def status(self) -> dict[str, Any]:
-        state = self.feed.status()
-        state["source"] = type(self).__name__
-        state["symbol"] = self.key
-        # The feed reports its *own* timeframe, which is not this book's when the
-        # book asked for a different one. Reporting it verbatim made a 15-minute
-        # book show "60minute" on the dashboard - the one field a reader uses to
-        # confirm which series they are looking at.
-        if self.interval:
-            state["interval"] = self.interval
-            state["interval_seconds"] = self.seconds
-        return state
-
 
 class NiftyBarSource:
     """Closed NIFTY 50 bars from Kite history.
@@ -209,7 +108,7 @@ class NiftyBarSource:
         bars: int = HISTORY_BARS,
         client: Any = None,
     ) -> None:
-        self.interval = interval or settings.gift_candle_interval
+        self.interval = interval or settings.candle_interval
         self.key = key
         self._token = token
         self._bars = max(50, int(bars))
@@ -373,18 +272,17 @@ def build_source(kind: str, interval: Optional[str] = None) -> BarSource:
     config should fail at startup, not trade the wrong instrument.
     """
     name = (kind or "").strip().lower()
-    if name in {"gift", "gift_nifty", "nseix:gift nifty"}:
-        return GiftBarSource()
     if name in {"nifty", "nifty50", "nse:nifty 50"}:
         return NiftyBarSource(interval)
-    raise ValueError(f"Unknown bar source {kind!r}; expected 'gift' or 'nifty'")
+    raise ValueError(f"Unknown bar source {kind!r}; expected 'nifty'")
 
 
 __all__ = [
     "BarSource",
-    "GiftBarSource",
     "NiftyBarSource",
     "build_source",
+    "interval_to_seconds",
+    "HISTORY_REFRESH_SECONDS",
     "NIFTY_SPOT_TOKEN",
     "NIFTY_SPOT_KEY",
 ]

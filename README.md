@@ -1,9 +1,9 @@
-# Belaku — GIFT Nifty → Nifty Futures execution bot
+# Belaku — NIFTY 50 → Nifty Futures execution bot
 
 Single-process algorithmic trading bot for the `Surikbs` Pine strategy
-(`bot/st.pine`). It subscribes to **GIFT Nifty** ticks, builds candles, evaluates
-the Pine conditions itself, and trades the **NFO Nifty future**. No TradingView
-in the loop.
+(`bot/st.pine`). It reads **NIFTY 50** candles from Kite history, evaluates the
+Pine conditions itself, and trades the **NFO Nifty future**. No TradingView in
+the loop.
 
 Requires Python 3.12 or newer.
 
@@ -11,18 +11,17 @@ Requires Python 3.12 or newer.
 
 ## The one idea that explains the design
 
-GIFT Nifty trades ~20 hours a day and is the standard pre-market proxy for
-Nifty 50 — but it is an *index*, and cannot be traded. So Belaku reads signals
-from GIFT Nifty and places orders on the NFO Nifty future. Everything else
-follows from that split.
+NIFTY 50 is the index the Nifty future tracks — but it is an *index*, and cannot
+be traded. So Belaku reads signals from NIFTY 50 and places orders on the NFO
+Nifty future. Everything else follows from that split.
 
 | Window | Behaviour |
 |---|---|
-| GIFT Nifty session (~20 h) | evaluate the strategy on every closed bar |
+| NSE session (09:15–15:30 IST) | evaluate the strategy on every closed bar |
 | NSE F&O session (09:15–15:30 IST) | LIVE orders may be placed; PAPER uses available prices |
-| Outside NSE F&O hours | PAPER signals may simulate at the completed GIFT close; LIVE signals are **deferred and dropped** |
+| Outside NSE F&O hours | PAPER signals may simulate at the completed close; LIVE signals are **deferred and dropped** |
 
-A signal computed on a 02:00 bar is not a signal at 09:15, so deferred signals
+A signal computed on a pre-open bar is not a signal at 09:15, so deferred signals
 are never queued for the open.
 
 ## Quick start
@@ -37,8 +36,8 @@ test -f bot/.env || cp bot/.env.example bot/.env   # then edit bot/.env
 alone for a deployment that does not run the tests. The container installs only
 the runtime file.
 
-Kite credentials are **required**, not optional — the GIFT Nifty feed runs on
-`KiteTicker`, so without a token there is no data and no strategy.
+Kite credentials are **required**, not optional — the strategy reads NIFTY
+history from Kite, so without a token there is no data and no strategy.
 `EXECUTION_MODE=PAPER` mocks *orders*, not market data.
 
 Dashboard: <http://127.0.0.1:9000>
@@ -78,15 +77,15 @@ Docker volume layout, and health checks.
 
 | File | Role |
 |---|---|
-| `bot/bot.py` | **The bot.** Entrypoint: tick feed, engine, mark loop, API, dashboard |
-| `bot/gift_nifty.py` | GIFT Nifty instrument resolution, KiteTicker subscription, tick→candle aggregation |
-| `bot/engine.py` | Evaluates the strategy on GIFT Nifty bars; routes orders to the Nifty future |
+| `bot/bot.py` | **The bot.** Entrypoint: engine, mark loop, API, dashboard |
+| `bot/bar_source.py` | NIFTY 50 history source and the bar-source protocol |
+| `bot/engine.py` | Evaluates the strategy on NIFTY bars; routes orders to the Nifty future |
 | `bot/strategy.py` | The Pine entry rules in Python (PSAR / SuperTrend 14×3) |
 | `bot/order_manager.py` | Validation, margin, sizing, paper/live execution, pause/panic |
 | `bot/fill.py` | Realistic paper fill model — walks the visible order book, partial fills, adverse-tick fallback |
 | `bot/kite_client.py` | KiteConnect wrapper; quotes, instrument lookup, mocked orders in PAPER |
 | `bot/kite_auth.py` | Kite login callback, request-token exchange, and access-token persistence |
-| `bot/database.py` | SQLite ledger: account, positions, orders, trades, equity curve, GIFT candles |
+| `bot/database.py` | SQLite ledger: account, positions, orders, trades, equity curve |
 | `bot/config.py` | `.env` loading, `EXECUTION_MODE` toggle, all tunables |
 | `bot/web/` | Chart-free vanilla-JS dashboard, served by `bot/bot.py` |
 | `tests/` | Focused automated regression tests |
@@ -97,7 +96,7 @@ Docker volume layout, and health checks.
 | Setting | Effect |
 |---|---|
 | `BOT_NAME` | dashboard title and browser tab name (default `Belaku`) |
-| `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
+| `CANDLE_INTERVAL` | bar size for the NIFTY series (`5minute`, `15minute`…) |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
 | `STRATEGY_PSAR_START` / `_INCREMENT` / `_MAXIMUM` | Parabolic SAR inputs (default `0.02` / `0.02` / `0.2`) |
 
@@ -105,8 +104,8 @@ The strategy uses exactly two indicators — SuperTrend (14-period ATR × 3, fix
 code) and Parabolic SAR — so the warm-up requirement is a constant **15 closed
 bars**.
 
-If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
-— the indicators are only meaningful on the timeframe they were tuned for.
+If you change the timeframe in `st.pine`, change `CANDLE_INTERVAL` to match —
+the indicators are only meaningful on the timeframe they were tuned for.
 
 ## Tests
 
@@ -124,7 +123,7 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 | Duplicate/replayed signals rejected | `order_manager._already_processed` |
 | Stale signals rejected (default 300 s) | `order_manager._signal_age_seconds` |
 | `MAX_OPEN_LOTS` and `LOT_MARGIN` enforced before every entry | `order_manager._execute_directional` |
-| LIVE orders only placed inside the NSE F&O session; after-hours PAPER uses the GIFT close | `engine.StrategyEngine.execute` |
+| LIVE orders only placed inside the NSE F&O session; after-hours PAPER uses the completed close | `engine.StrategyEngine.execute` |
 | Unresolved orders and broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
 | Panic reports partial or failed square-offs instead of claiming success | `order_manager.OrderManager.square_off` |
 | Panic pauses new entries | `order_manager.pause` / `OrderManager.paused` |

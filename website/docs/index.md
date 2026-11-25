@@ -6,9 +6,9 @@ sidebar_position: 1
 
 # Belaku
 
-Algorithmic execution for **GIFT Nifty → Nifty Futures**.
+Algorithmic execution for **NIFTY 50 → Nifty Futures**.
 
-Belaku watches GIFT Nifty, evaluates a SuperTrend (14×3) + Parabolic SAR strategy
+Belaku watches NIFTY 50, evaluates a SuperTrend (14×3) + Parabolic SAR strategy
 on completed candles, and trades the NFO Nifty future (front month, rolled five
 days before expiry). No TradingView
 in the loop — the indicators are computed locally and verified against the Pine
@@ -16,7 +16,7 @@ reference.
 
 ```mermaid
 graph LR
-  K[KiteTicker<br/>NSEIX:GIFT NIFTY] -->|ticks| F[gift_nifty.py<br/>tick → candles]
+  K[KiteConnect<br/>NSE:NIFTY 50 history] -->|bars| F[bar_source.py]
   F -->|bars| DB[(SQLite)]
   F -->|bars| E[engine.py<br/>strategy]
   E -->|BULL / BEAR| OM[order_manager]
@@ -30,20 +30,19 @@ graph LR
 
 **The signal source is not the execution venue.**
 
-GIFT Nifty trades ~20 hours a day on NSEIX and is the standard pre-market proxy
-for Nifty 50 — it reacts to overnight global moves hours before NSE opens. But it
-is an index, not a tradeable contract. So Belaku reads signals from GIFT Nifty and
-places orders on the NFO Nifty future.
+NIFTY 50 is the index the Nifty future tracks, but it is an index, not a
+tradeable contract. So Belaku reads signals from NIFTY 50 and places orders on
+the NFO Nifty future.
 
-Everything else follows from that split: two market clocks, a warm-up that runs
-around the clock, and a LIVE path that defers signals arriving outside the NSE
-session rather than firing them late.
+Everything else follows from that split: a warm-up that runs on closed bars, and
+a LIVE path that defers signals arriving outside the NSE session rather than
+firing them late.
 
 ## What it does, precisely
 
 | | |
 |---|---|
-| **Signal source** | `NSEIX:GIFT NIFTY`, 15-minute bars from Kite history |
+| **Signal source** | `NSE:NIFTY 50`, 60-minute bars from Kite history |
 | **Execution venue** | Front-month `NFO` Nifty future |
 | **Entry rule** | SuperTrend (14×3) agrees **and** price on the correct side of PSAR |
 | **Warm-up** | 15 closed bars (SuperTrend ATR length + 1) |
@@ -60,7 +59,7 @@ blocking entries on the day's realised loss is a second strategy the signal neve
 looked at.
 
 :::warning[Read the backtest before trading this]
-On three years of real GIFT Nifty 60-minute bars the strategy's gross profit
+On three years of real NIFTY 60-minute bars the strategy's gross profit
 factor is **0.98** — it wins roughly nothing in the market and gives the rest to
 the broker as charges, netting **−₹513,294 over 463 trades**. The one filtered
 configuration that clears costs fails walk-forward and is beaten by buy-and-hold.
@@ -102,7 +101,7 @@ These are real and worth knowing before you run it with money:
   hand, or by a stop you have explicitly enabled. Turning one on is a decision,
   not a default.
 - **Single writer.** SQLite allows one writer; this is a single-instance bot.
-- **No holiday-aware LIVE deferral for GIFT.** GIFT Nifty trades on NSEIX
-  holidays; the NSE F&O calendar gates *orders*, not signal evaluation.
+- **No holiday-aware LIVE deferral.** The NSE F&O calendar gates *orders*, not
+  signal evaluation.
 - **`bot/.env` is tracked in git.** It should not be — see
   [Setup](/setup#credentials).

@@ -181,10 +181,6 @@ jobs:
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
           ALERT_TELEGRAM_BOT_TOKEN: ${{ secrets.ALERT_TELEGRAM_BOT_TOKEN }}
           ALERT_TELEGRAM_CHAT_ID: ${{ secrets.ALERT_TELEGRAM_CHAT_ID }}
-          # GIFT_BOOK defaults to 0 in config.py, and this allowlist is the only
-          # way a setting reaches the container. Without it the deployed bot ran
-          # with no index book at all, however the operator's .env was set.
-          GIFT_BOOK: ${{ secrets.GIFT_BOOK }}
           # Escape hatch for settings the allowlist does not name - the
           # STRATEGY_<n>_* family, sizing, filters. A multiline KEY=VALUE block
           # appended verbatim after the named secrets.
@@ -199,7 +195,6 @@ jobs:
                       DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET \
                       ALERT_ENABLED ALERT_CHANNEL ALERT_WEBHOOK_URL \
                       ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID \
-                      GIFT_BOOK \
                       EXECUTION_MODE; do
             value="$(printenv "$name" || true)"
             # Skip unset secrets instead of writing "KEY=" and overriding the
