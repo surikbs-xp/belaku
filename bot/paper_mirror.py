@@ -227,6 +227,14 @@ class PaperMirror:
             quote = get_client().get_ltp(symbol)
         except Exception:  # pragma: no cover - network
             quote = None
+        if not quote:
+            try:
+                from gift_nifty import get_feed
+
+                status = get_feed().status()
+                quote = status.get("exec_last_price") or status.get("last_candle_close")
+            except Exception:  # pragma: no cover - defensive
+                quote = None
         try:
             price = float(quote) if quote else 0.0
         except (TypeError, ValueError):

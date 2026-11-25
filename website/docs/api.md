@@ -98,20 +98,28 @@ no longer shows them. Kept because they are still served.
 
 | Method | Path | Body | Purpose |
 |---|---|---|---|
-| `POST` | `/api/toggle-mode` | `{"mode":"PAPER\|LIVE","confirm":bool}` | Switch execution mode |
-| `POST` | `/api/pause` | `{"paused":bool,"reason":str}` | Pause new entries |
-| `POST` | `/api/panic` | `{"confirm":true,"reason":str}` | Square off and pause |
-`/api/risk/trailing` was removed along with the trailing stop, and the session
-loss cap was removed with it. There is no per-trade stop and no session limit to
-configure: the exit is the pair flipping, and `MAX_OPEN_LOTS` is the only
-exposure limit. Both are read from the environment rather than edited at runtime.
+| `POST` | `/api/toggle-mode` | `{"mode":"PAPER\|LIVE","confirm":bool}` | Switch the process-wide execution mode |
+| `POST` | `/api/pause` | `{"paused":bool,"reason":str}` | Pause new entries for every book |
+| `POST` | `/api/panic` | `{"confirm":true,"reason":str}` | Square off every book and pause |
+| `POST` | `/api/books/mode` | `{"strategy_id":str,"mode":"PAPER\|LIVE","confirm":bool}` | Switch one book's mode |
+| `POST` | `/api/books/pause` | `{"strategy_id":str,"paused":bool,"reason":str}` | Pause or resume one book |
+| `POST` | `/api/books/square-off` | `{"strategy_id":str,"confirm":true,"reason":str}` | Square off one book, then pause it |
+
+The per-book endpoints are what the two strategy panels use. Each is scoped to
+one `strategy_id`, so pausing or squaring off one book never touches the other's
+leg in the same contract. `/api/books/mode` refuses `LIVE → PAPER` while that
+book still holds a live position, and requires `confirm=true` to arm `LIVE`.
+
+Stops are configured per strategy with `STRATEGY_<n>_STOP_LOSS` and the trail
+keys, read from the environment rather than edited at runtime.
 
 ## Guards
 
 Enforced server-side, not just in the UI:
 
-- Switching to `LIVE` requires `confirm=true` **and** complete Kite credentials.
-- `/api/panic` requires `confirm=true`.
+- Switching to `LIVE` (globally or per book) requires `confirm=true` **and**
+  complete Kite credentials, and passes the pre-flight report.
+- `/api/panic` and `/api/books/square-off` require `confirm=true`.
 - A state-changing request (`POST`/`PUT`/`DELETE`) whose `Origin` is not the
   bot itself gets `403`.
 - A `Host` outside `ALLOWED_HOSTS` gets `400`.

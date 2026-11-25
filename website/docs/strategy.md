@@ -172,15 +172,14 @@ identifiable after the fact rather than silently trusted.
 
 ## What the strategy does not have
 
-:::warning[No stop-loss and no profit target]
-There is no stop-loss, no trailing stop, and no profit target. The exit is the
-signal flipping, or a manual square-off. Performance is expressed in rupees and
-raw index points, not in R-multiples.
-
-This is deliberate. A fixed stop exits on a price the strategy never looked at,
-which makes it a different strategy rather than a safety net around this one. The
-only exposure limit is `MAX_OPEN_LOTS` — see
-[Risk limits](/production#risk-limits).
+:::note[Signal exit plus a protective stop]
+The primary exit is the signal flipping, or a manual square-off. Each book also
+carries a protective stop-loss and trailing stop, measured on the **futures
+execution price** and configured per strategy — see
+[Running multiple strategies](./multi-strategy.md#the-two-strategies) for the
+levels. The stop is the backstop that caps a single loss; the signal is still what
+closes a winning trend. Performance is expressed in rupees and raw index points,
+not in R-multiples.
 :::
 
 :::note[What this costs]

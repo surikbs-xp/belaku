@@ -1,16 +1,17 @@
-"""NIFTY 50 execution bot - one process, one runtime, no TradingView.
+"""GIFT Nifty execution bot - one process, one runtime, no TradingView.
 
     python bot.py
 
 This single process owns everything:
 
-* the **strategy engine** - evaluates the ``st.pine`` conditions on NIFTY 50
-  candles loaded from Kite history and sends orders to the NFO Nifty future
-  (`engine.py`);
+* the **GIFT Nifty tick feed** - a KiteTicker websocket subscription that
+  builds OHLCV candles from live ticks (`gift_nifty.py`);
+* the **strategy engine** - evaluates the ``st.pine`` conditions on those
+  candles and sends orders to the NFO Nifty future (`engine.py`);
 * the **mark loop** - marks positions to market and samples the equity curve;
 * the **JSON API** and the **dashboard** - `web/` served as static files.
 
-Signals and execution are deliberately different instruments: NIFTY 50 is
+Signals and execution are deliberately different instruments: GIFT Nifty is
 quote-only on Kite (it cannot be traded), so it is used as the *signal* source
 and the front-month Nifty future as the *execution* venue.
 
@@ -62,6 +63,8 @@ from config import (
     validate,
 )
 from engine import get_engine
+from gift_nifty import GIFT_KEY, get_feed, reset_feed
+from gift_book import get_gift_book, gift_books
 from kite_client import expiry_label, future_symbol, get_client, market_status
 from market_calendar import get_calendar
 from order_manager import get_order_manager
@@ -291,7 +294,11 @@ def _connect_kite_on_startup() -> None:
                 status = {"state": "valid", "valid": True}
 
     if status.get("valid"):
-        log.info("Kite token is valid; market data is available")
+        feed = _start_gift_feed()
+        if feed["start_requested"]:
+            log.info("Kite token is valid; GIFT Nifty feed startup requested")
+        else:
+            log.error("Kite token is valid but the GIFT feed failed to start: %s", feed.get("error"))
         return
 
     if status.get("state") not in {"no_token", "expired"}:
@@ -356,6 +363,7 @@ def token_keeper_loop(stop: threading.Event, interval: Optional[float] = None) -
         try:
             if kite_autologin.ensure_token():
                 log.info("Kite token refreshed by the token keeper")
+                _start_gift_feed(reconnect=True)
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("Token keeper check failed: %s", exc)
 
@@ -378,6 +386,11 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             engine["last_tick_at"] = db.iso()
             engine["interval_seconds"] = period
         try:
+            # Keep the execution future's price fresh for the dashboard. Priced
+            # here, at the mark cadence, rather than in the status endpoint,
+            # which the dashboard polls every 1.5s - Kite's quote API is rate
+            # limited and that would be ~16k calls a session.
+            get_feed().refresh_exec_quote()
             # Mark both books from the one price map: the shadow book must value a
             # position exactly as the live book does, or the comparison measures
             # the pricing difference instead of the model's error.
@@ -390,6 +403,29 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
                     get_mirror().mark(prices)
                 except Exception:  # pragma: no cover - defensive
                     log.exception("Shadow book mark failed")
+                # Protective stops run on the live futures price, not on a bar
+                # close, and are not gated on the pause switch: pausing blocks
+                # entries, and a position already on must stay protected.
+                try:
+                    get_engine().check_stops(prices)
+                except Exception:  # pragma: no cover - defensive
+                    log.exception("Stop check failed")
+            # The index book is marked on its own level: there is no basis, which
+            # is exactly what makes the comparison interesting.
+            try:
+                from gift_book import gift_books
+
+                feed = get_feed()
+                feed_status = feed.status()
+                quote = feed_status.get("last_candle_close") or feed_status.get("price")
+                # Every strategy's index book, not just the default one. One mark
+                # per book: a single-book mark left the other books' open legs
+                # valued at their entry, so their unrealised P&L read zero while
+                # the index moved.
+                for book in gift_books():
+                    book.mark(quote)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("GIFT index book mark failed")
         except Exception as exc:  # pragma: no cover - network
             log.warning("Execution quote refresh failed: %s", exc)
         try:
@@ -453,6 +489,36 @@ class BookPauseRequest(BaseModel):
     )
 
 
+class BookModeRequest(BaseModel):
+    """Switch one book's LIVE/PAPER mode."""
+
+    strategy_id: str = Field(
+        ..., min_length=1, max_length=64, description="The book to switch"
+    )
+    mode: str = Field(..., description="PAPER or LIVE")
+    confirm: bool = Field(
+        default=False,
+        description="Must be true to arm LIVE; guards against a stray click.",
+    )
+
+
+class BookSquareOffRequest(BaseModel):
+    """Square off one book's positions."""
+
+    strategy_id: str = Field(
+        ..., min_length=1, max_length=64, description="The book to flatten"
+    )
+    confirm: bool = Field(
+        default=False, description="Must be true; this closes real positions in LIVE."
+    )
+    reason: str = Field(
+        default="MANUAL",
+        max_length=200,
+        pattern=r"^[\w \-.:/@()\[\]]*$",
+        description="Audit label",
+    )
+
+
 class PanicRequest(BaseModel):
     confirm: bool = Field(
         default=False,
@@ -486,11 +552,18 @@ async def lifespan(app: FastAPI):
     with STATUS_LOCK:
         STATUS.update(running=True, started_at=db.iso(), heartbeat_ts=time.time())
 
-    # 1. Kite session. The engine reads NIFTY history from Kite, so a valid
-    #    token is what makes market data available at all.
+    # 1. GIFT Nifty tick feed -> candles (warmup carried over from SQLite).
+    feed = get_feed()
+    restored = feed.load_persisted()
     _connect_kite_on_startup()
+    # Kite serves GIFT Nifty history, so warm the indicators from it instead of
+    # waiting hours for tick-built candles.
+    try:
+        restored = feed.refresh_history(force=True) or restored
+    except Exception as exc:  # pragma: no cover - network
+        log.warning("Initial GIFT Nifty history load failed: %s", exc)
 
-    # 2. Strategy engine: evaluates NIFTY bars, trades the NFO future.
+    # 2. Strategy engine: evaluates GIFT Nifty bars, trades the NFO future.
     engine = get_engine()
     engine.start()
 
@@ -511,10 +584,10 @@ async def lifespan(app: FastAPI):
     token_keeper.start()
 
     log.info(
-        "Bot ready - mode=%s db=%s signals=%s (%ss bars) "
+        "Bot ready - mode=%s db=%s signals=%s (%ss bars, %d restored) "
         "execution=%s dashboard=http://%s:%s/",
-        get_execution_mode(), settings.db_path, engine.run.symbol,
-        engine.run.seconds, future_symbol(),
+        get_execution_mode(), settings.db_path, GIFT_KEY,
+        feed.seconds, restored, future_symbol(),
         settings.webhook_host, settings.webhook_port,
     )
     # A start message makes a silent crash distinguishable from a quiet market:
@@ -529,6 +602,7 @@ async def lifespan(app: FastAPI):
         _lifecycle_alert("BOT_STOPPED", "Belaku is shutting down", "warning")
         watchdog.stop()
         engine.stop()
+        feed.stop()
         marks.join(timeout=5)
         log.info("Bot stopped")
 
@@ -620,10 +694,10 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 app = FastAPI(
-    title="NIFTY Execution Bot",
+    title="GIFT Nifty Execution Bot",
     version="3.0.0",
     description=(
-        "Single-process bot: st.pine strategy engine on NIFTY 50, "
+        "Single-process bot: GIFT Nifty tick feed, st.pine strategy engine, "
         "Nifty futures execution, JSON API and dashboard."
     ),
     lifespan=lifespan,
@@ -758,6 +832,48 @@ def _mirror_status() -> dict[str, Any]:
         }
 
 
+def _gift_book_status() -> dict[str, Any]:
+    """Index-book status that can never break ``/api/status``.
+
+    Every strategy's book, keyed by strategy id, plus an aggregate. One book per
+    strategy means a single status object would report one book and hide the
+    rest; ``books`` is the per-strategy view and the top-level numbers are the
+    sum across them.
+    """
+    try:
+        from gift_book import gift_books
+
+        books = {}
+        for book in gift_books():
+            try:
+                books[book.strategy_id] = book.status()
+            except Exception as exc:  # pragma: no cover - defensive
+                books[book.strategy_id] = {"enabled": False, "reason": str(exc)}
+        if not books:
+            return {"enabled": False, "configured": False, "books": {}}
+        enabled = {k: v for k, v in books.items() if v.get("enabled")}
+        if not enabled:
+            return {"enabled": False, "configured": False, "books": books}
+        return {
+            "enabled": True,
+            "configured": True,
+            "books": books,
+            "symbol": next(iter(enabled.values())).get("symbol"),
+            "net_pnl": round(sum(float(v.get("net_pnl") or 0.0) for v in enabled.values()), 2),
+            "unrealized_pnl": round(
+                sum(float(v.get("unrealized_pnl") or 0.0) for v in enabled.values()), 2
+            ),
+            "equity": round(sum(float(v.get("equity") or 0.0) for v in enabled.values()), 2),
+            "trades": sum(int(v.get("trades") or 0) for v in enabled.values()),
+            "realized_today": round(
+                sum(float(v.get("realized_today") or 0.0) for v in enabled.values()), 2
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("GIFT index book status unavailable: %s", exc)
+        return {"enabled": False, "configured": False, "reason": f"status unavailable: {exc}"}
+
+
 def _lifecycle_alert(kind: str, detail: str, severity: str = "info") -> None:
     """Send a start/stop notice. Never raises, never blocks startup.
 
@@ -861,6 +977,7 @@ def api_status() -> dict[str, Any]:
         "watchdog": get_watchdog().state.to_dict(),
         "alerts": {"alerting": notifier.status()},
         "mirror": _mirror_status(),
+        "gift_book": _gift_book_status(),
         "strategy_config": strategy_summary(),
         "market": market,
         "symbol": {
@@ -959,7 +1076,10 @@ def _enrich_positions(
 ) -> list[dict[str, Any]]:
     """Attach mark price and per-position PnL to raw ledger rows.
 
-    ``prices`` defaults to the futures book's map.
+    ``prices`` defaults to the futures book's map. The GIFT index book passes its
+    own, because the two books hold different instruments: pricing the index off
+    the future would fold the basis into the index book's PnL and make the two
+    books look like one position.
     """
     client = get_client()
     if prices is None:
@@ -1324,6 +1444,474 @@ def api_orders(
     return {"orders": rows, "count": len(rows)}
 
 
+# ---------------------------------------------------------------------------
+# GIFT Nifty index book
+#
+# Separate endpoints rather than a flag on the futures ones: the two books live in
+# different databases, and GIFT Nifty is a non-tradeable index, so its rows can
+# never be returned alongside a real contract's.
+# ---------------------------------------------------------------------------
+def _gift_books_for(strategy_id: Optional[str] = None) -> list[Any]:
+    """The index books an endpoint should report on.
+
+    ``strategy_id`` narrows to one book; omitting it reports every configured
+    strategy's book. There is one book per strategy, so a single-book default
+    would show one strategy's GIFT leg and silently hide the rest - which reads
+    as "the other strategies never traded the index".
+
+    A deployment with no strategy configured for the index leg still gets the
+    default book, so a pre-multi-strategy ``.env`` returns exactly what it did.
+    """
+    if strategy_id:
+        return [get_gift_book(strategy_id)]
+    books = gift_books()
+    return books or [get_gift_book()]
+
+
+def _tag_gift(rows: list[dict[str, Any]], book: Any) -> list[dict[str, Any]]:
+    """Stamp each row with the strategy whose book it came from.
+
+    Without it an aggregate row cannot be traced back to a strategy, and with
+    two books on one index the operator cannot tell which leg is which.
+    """
+    return [{**row, "strategy_id": book.strategy_id, "venue": "GIFT"} for row in rows]
+
+
+@app.get("/api/gift/positions", tags=["gift"])
+def api_gift_positions(
+    status: str = Query("all", pattern="^(all|open|closed)$"),
+    limit: int = Query(200, ge=1, le=2000),
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """GIFT Nifty index-book positions (paper only - the index cannot be traded)."""
+    books = _gift_books_for(strategy_id)
+    rows: list[dict[str, Any]] = []
+    for book in books:
+        book_rows = book.positions(status=status, limit=limit)
+        # Priced off the index's own mark, never the futures map: the two books
+        # hold different instruments and must not be valued as one position.
+        mark = book.mark_price()
+        rows.extend(_tag_gift(_enrich_positions(book_rows, {book.symbol: mark} if mark else {}), book))
+    positions = sorted(rows, key=lambda r: r.get("entry_time") or "", reverse=True)[:limit]
+    return {
+        "positions": positions,
+        "count": len(positions),
+        "open_count": sum(1 for p in positions if p["status"] == "OPEN"),
+        "enabled": any(book.enabled for book in books),
+        "symbol": books[0].symbol if books else None,
+        "books": [book.strategy_id for book in books],
+        "tradeable": False,
+    }
+
+
+@app.get("/api/gift/trades", tags=["gift"])
+def api_gift_trades(
+    limit: int = Query(500, ge=1, le=5000),
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """Settled round trips in the GIFT Nifty index book."""
+    rows: list[dict[str, Any]] = []
+    books = _gift_books_for(strategy_id)
+    for book in books:
+        rows.extend(_tag_gift(book.trades(limit=limit), book))
+    rows = sorted(rows, key=lambda r: r.get("exit_time") or "", reverse=True)[:limit]
+    return {
+        "trades": rows,
+        "count": len(rows),
+        "books": [book.strategy_id for book in books],
+        "tradeable": False,
+    }
+
+
+@app.get("/api/gift/orders", tags=["gift"])
+def api_gift_orders(
+    limit: int = Query(500, ge=1, le=5000),
+    search: Optional[str] = Query(None, description="Case-insensitive substring filter"),
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """Order log for the GIFT Nifty index book."""
+    rows: list[dict[str, Any]] = []
+    books = _gift_books_for(strategy_id)
+    for book in books:
+        rows.extend(_tag_gift(book.orders(limit=limit), book))
+    if search:
+        needle = search.strip().lower()
+        rows = [r for r in rows if needle in " ".join(str(v) for v in r.values()).lower()]
+    rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)[:limit]
+    return {
+        "orders": rows,
+        "count": len(rows),
+        "books": [book.strategy_id for book in books],
+        "tradeable": False,
+    }
+
+
+@app.get("/api/gift/signals", tags=["gift"])
+def api_gift_signals(
+    limit: int = Query(100, ge=1, le=1000),
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """Signal audit trail for the GIFT Nifty index book.
+
+    A separate endpoint for the same reason as the other ``/api/gift/*`` routes:
+    the index book keeps its own database, so its decisions cannot be read out of
+    the futures ``signals`` table without reporting the wrong book.
+    """
+    rows: list[dict[str, Any]] = []
+    books = _gift_books_for(strategy_id)
+    for book in books:
+        if not book.enabled:
+            continue
+        rows.extend(_tag_gift(book.signals(limit=limit), book))
+    rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)[:limit]
+    return {
+        "signals": rows,
+        "count": len(rows),
+        "enabled": any(book.enabled for book in books),
+        "books": [book.strategy_id for book in books],
+        "tradeable": False,
+    }
+
+
+@app.get("/api/gift/summary", tags=["gift"])
+def api_gift_summary(
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """Index-book health and metrics, including why it is off when it is."""
+    books = _gift_books_for(strategy_id)
+    enabled = [book for book in books if book.enabled]
+    if not enabled:
+        return {
+            "enabled": False,
+            "configured": bool(settings.gift_book),
+            "symbol": books[0].symbol if books else None,
+            "books": [book.strategy_id for book in books],
+            "tradeable": False,
+            "reason": "GIFT_BOOK is off",
+        }
+    summaries = {book.strategy_id: book.summary() for book in enabled}
+    if len(summaries) == 1:
+        return {**next(iter(summaries.values())), "configured": True}
+    return {
+        "enabled": True,
+        "configured": True,
+        "books": summaries,
+        "tradeable": False,
+    }
+
+
+@app.get("/api/gift/analytics", tags=["gift"])
+def api_gift_analytics(
+    limit: int = Query(5000, ge=1, le=20000),
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """Post-close statistics for the index book.
+
+    A separate endpoint rather than a ``venue`` parameter on ``/api/analytics``:
+    the two books are different databases, and a query parameter that silently
+    switched ledgers would make a wrong number look like a real one.
+
+    With more than one book the result is *merged* into the same shape a single
+    book returns, with the per-strategy figures alongside under ``books``. The
+    Performance tab reads ``days`` and ``summary`` off the top level, so leaving
+    them undefined for a multi-book deployment would blank the calendar - a
+    consolidation that silently removes the page it was meant to enrich.
+    """
+    books = _gift_books_for(strategy_id)
+    enabled = [book for book in books if book.enabled]
+    if not enabled:
+        return {"enabled": False, "reason": "GIFT_BOOK is off", "tradeable": False}
+    per_book = {book.strategy_id: book.analytics(limit=limit) for book in enabled}
+    if len(per_book) == 1:
+        return {"enabled": True, "tradeable": False, **next(iter(per_book.values()))}
+    return {
+        "enabled": True,
+        "tradeable": False,
+        **_merge_analytics(list(per_book.values())),
+        "books": per_book,
+    }
+
+
+def _merge_analytics(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold several books' analytics into one report of the same shape.
+
+    Sums where the figure is additive (trades, P&L, points, fees) and recomputes
+    where it is not: a win rate is wins over trades across the whole set, and a
+    profit factor is total gross win over total gross loss. Averaging the
+    per-book ratios would let a book with two trades outweigh one with two
+    hundred.
+
+    The shape matches a single book's report because the Performance tab reads
+    ``days`` and ``summary`` off the top level - returning only a per-book map
+    would blank the calendar, which is the page this consolidation is meant to
+    enrich.
+    """
+    def _s(report: dict[str, Any], key: str) -> float:
+        return float((report.get("summary") or {}).get(key) or 0.0)
+
+    def _bucket(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        out = {
+            key: sum(float(row.get(key) or 0.0) for row in rows)
+            for key in ("trades", "wins", "losses", "net_pnl", "gross_pnl", "fees", "points")
+        }
+        for key in ("trades", "wins", "losses"):
+            out[key] = int(out[key])
+        out["win_rate"] = (out["wins"] / out["trades"] * 100.0) if out["trades"] else 0.0
+        return out
+
+    summary = _bucket([
+        # The summary carries no per-row fields _bucket reads beyond these, so
+        # passing it straight through is what makes the merged figures add up.
+        dict(report.get("summary") or {})
+        for report in reports
+    ])
+    gross_win = sum(_s(r, "gross_win") for r in reports)
+    gross_loss = abs(sum(_s(r, "gross_loss") for r in reports))
+    trades = summary["trades"]
+    summary.update({
+        "gross_win": gross_win,
+        "gross_loss": -gross_loss,
+        "profit_factor": (
+            (gross_win / gross_loss) if gross_loss > 0
+            else (float("inf") if gross_win > 0 else 0.0)
+        ),
+        "largest_win": max((_s(r, "largest_win") for r in reports), default=0.0),
+        "largest_loss": min((_s(r, "largest_loss") for r in reports), default=0.0),
+        "avg_win": (gross_win / summary["wins"]) if summary["wins"] else 0.0,
+        "avg_loss": (-gross_loss / summary["losses"]) if summary["losses"] else 0.0,
+        "expectancy": (summary["net_pnl"] / trades) if trades else 0.0,
+        "avg_points": (summary["points"] / trades) if trades else 0.0,
+        "breakeven": trades - summary["wins"] - summary["losses"],
+        # The longest single hold across the books: there is no meaningful
+        # average of two books' average holds, and the longest is the one that
+        # tells an operator how much capital sat in one trade.
+        "avg_hold_minutes": max((_s(r, "avg_hold_minutes") for r in reports), default=0.0),
+    })
+
+    # Daily buckets keyed by date and summed, not concatenated: two books trading
+    # the same day is one day carrying both books' trades.
+    days: dict[str, list[dict[str, Any]]] = {}
+    for report in reports:
+        for day in report.get("days") or []:
+            days.setdefault(str(day.get("date")), []).append(day)
+    running = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    ordered_days = []
+    for date in sorted(days):
+        bucket = {"date": date, **_bucket(days[date])}
+        running += bucket["net_pnl"]
+        peak = max(peak, running)
+        max_dd = min(max_dd, running - peak)
+        bucket["cumulative"] = running
+        bucket["drawdown"] = running - peak
+        ordered_days.append(bucket)
+
+    def _merged(field: str, key_name: str) -> list[dict[str, Any]]:
+        grouped: dict[Any, list[dict[str, Any]]] = {}
+        for report in reports:
+            for row in report.get(field) or []:
+                grouped.setdefault(row.get(key_name), []).append(row)
+        out = [{key_name: key, **_bucket(rows)} for key, rows in grouped.items()]
+        return sorted(out, key=lambda row: str(row.get(key_name) or ""))
+
+    by_direction = {
+        side: _bucket([
+            (report.get("by_direction") or {}).get(side) or {}
+            for report in reports
+        ])
+        for side in ("LONG", "SHORT")
+    }
+
+    return {
+        "mode": PAPER,
+        "summary": summary,
+        "streaks": {
+            # "Current" is a per-book fact and there is no honest single answer
+            # for a set, so it is reported as none while the maxima are kept.
+            "current_kind": "none",
+            "current_run": 0,
+            "max_win": max(
+                (int((r.get("streaks") or {}).get("max_win") or 0) for r in reports),
+                default=0,
+            ),
+            "max_loss": max(
+                (int((r.get("streaks") or {}).get("max_loss") or 0) for r in reports),
+                default=0,
+            ),
+        },
+        "days": ordered_days,
+        "by_weekday": _merged("by_weekday", "weekday"),
+        "by_hour": _merged("by_hour", "hour"),
+        "by_exit_reason": _merged("by_exit_reason", "reason"),
+        "by_direction": by_direction,
+        "max_drawdown": max_dd,
+        "max_drawdown_pct": (max_dd / peak * 100.0) if peak > 0 else 0.0,
+    }
+
+@app.get("/api/gift/portfolio", tags=["gift"])
+def api_gift_portfolio(
+    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
+) -> dict[str, Any]:
+    """Index-book account metrics, in the same shape as ``/api/portfolio``.
+
+    The Performance tab's headline tiles are fed from here when the index venue
+    is selected, so the two venues are compared on identical arithmetic.
+
+    Aggregated across strategies when none is named: each book has its own
+    virtual balance, so the totals are sums rather than one book's numbers
+    presented as the venue's.
+    """
+    books = _gift_books_for(strategy_id)
+    enabled = [book for book in books if book.enabled]
+    if not enabled:
+        return {"enabled": False, "reason": "GIFT_BOOK is off", "tradeable": False}
+    metrics_rows = [(book, book.summary().get("metrics") or {}) for book in enabled]
+
+    def _total(key: str) -> float:
+        return round(sum(float(metrics.get(key) or 0.0) for _, metrics in metrics_rows), 2)
+
+    initial = _total("initial_balance")
+    equity = _total("equity")
+    realized_total = _total("realized_total")
+    unrealized = _total("unrealized_pnl")
+    return {
+        "enabled": True,
+        "tradeable": False,
+        "mode": PAPER,
+        "currency": "INR",
+        "symbol": enabled[0].symbol,
+        "books": [book.strategy_id for book in enabled],
+        "initial_balance": initial,
+        "balance": _total("balance"),
+        "equity": equity,
+        "unrealized_pnl": unrealized,
+        "realized_today": _total("realized_today"),
+        "realized_total": realized_total,
+        "total_pnl": round(realized_total + unrealized, 2),
+        "total_return_pct": (
+            round((realized_total + unrealized) / initial * 100.0, 2) if initial else 0.0
+        ),
+        "max_drawdown_pct": max(
+            (round(float(m.get("max_drawdown_pct") or 0.0), 2) for _, m in metrics_rows),
+            default=0.0,
+        ),
+        "total_trades": sum(int(m.get("total_trades") or 0) for _, m in metrics_rows),
+        "win_rate": (
+            round(
+                sum(float(m.get("win_rate") or 0.0) * int(m.get("total_trades") or 0)
+                    for _, m in metrics_rows)
+                / max(1, sum(int(m.get("total_trades") or 0) for _, m in metrics_rows)),
+                2,
+            )
+        ),
+        "profit_factor": (
+            None
+            if any(m.get("profit_factor") == float("inf") for _, m in metrics_rows)
+            else round(
+                sum(float(m.get("profit_factor") or 0.0) for _, m in metrics_rows)
+                / max(1, len(metrics_rows)),
+                2,
+            )
+        ),
+        "open_position_count": sum(len(book.open_positions()) for book in enabled),
+    }
+
+
+@app.get("/api/venues", tags=["gift"])
+def api_venues(limit: int = Query(2000, ge=2, le=20000)) -> dict[str, Any]:
+    """Futures venue beside the GIFT Nifty index venue, on the same signals.
+
+    Only meaningful when ``GIFT_BOOK`` is on; otherwise the index side reports
+    itself disabled rather than returning an empty book that looks like a losing
+    strategy. The index side is aggregated across every strategy's book, because
+    there is one book per strategy and each keeps its own ledger file.
+    """
+    books = [book for book in gift_books() if book.enabled]
+    futures_mode = get_execution_mode()
+    futures_metrics = db.get_performance_metrics(
+        open_positions=db.get_open_positions(mode=futures_mode),
+        prices=get_order_manager().price_map(),
+        mode=futures_mode,
+    )
+    index_metrics = None
+    if books:
+        # Summed from each book's own summary, not recomputed against the main
+        # ledger: the index books are separate database files, so reading their
+        # positions through the futures path would value them on the wrong
+        # prices and report a P&L that belongs to neither venue.
+        summaries = [book.summary().get("metrics") or {} for book in books]
+        index_metrics = {
+            "realized_total": sum(float(m.get("realized_total") or 0.0) for m in summaries),
+            "realized_today": sum(float(m.get("realized_today") or 0.0) for m in summaries),
+            "unrealized_pnl": sum(float(m.get("unrealized_pnl") or 0.0) for m in summaries),
+            "equity": sum(float(m.get("equity") or 0.0) for m in summaries),
+            "total_trades": sum(int(m.get("total_trades") or 0) for m in summaries),
+            "win_rate": (
+                round(
+                    sum(float(m.get("win_rate") or 0.0) * int(m.get("total_trades") or 0)
+                        for m in summaries)
+                    / max(1, sum(int(m.get("total_trades") or 0) for m in summaries)),
+                    2,
+                )
+            ),
+            "profit_factor": (
+                None
+                if any(m.get("profit_factor") == float("inf") for m in summaries)
+                else round(
+                    sum(float(m.get("profit_factor") or 0.0) for m in summaries)
+                    / max(1, len(summaries)),
+                    2,
+                )
+            ),
+        }
+
+    def _view(metrics: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not metrics:
+            return None
+        return {
+            "net_pnl": round(float(metrics.get("realized_total") or 0.0), 2),
+            "realized_today": round(float(metrics.get("realized_today") or 0.0), 2),
+            "unrealized_pnl": round(float(metrics.get("unrealized_pnl") or 0.0), 2),
+            "equity": round(float(metrics.get("equity") or 0.0), 2),
+            "trades": int(metrics.get("total_trades") or 0),
+            "win_rate": metrics.get("win_rate"),
+            "profit_factor": metrics.get("profit_factor"),
+        }
+
+    futures_view = _view(futures_metrics)
+    index_view = _view(index_metrics)
+    # One index venue across strategies, so the labels come from whichever book
+    # is enabled rather than from a single book that may not exist.
+    index_symbol = books[0].symbol if books else None
+    index_units = books[0].units if books else 0
+    return {
+        "signal_source": GIFT_KEY,
+        "futures": {
+            "label": "Nifty future",
+            "mode": futures_mode,
+            "symbol": get_order_manager().current_symbol(),
+            "tradeable": True,
+            "metrics": futures_view,
+        },
+        "gift_index": {
+            "label": "GIFT Nifty index",
+            "mode": PAPER,
+            "symbol": index_symbol,
+            "tradeable": False,
+            "enabled": bool(books),
+            "books": [book.strategy_id for book in books],
+            "units": index_units,
+            "metrics": index_view,
+        },
+        "net_pnl_gap": (
+            round((index_view or {}).get("net_pnl", 0.0) - (futures_view or {}).get("net_pnl", 0.0), 2)
+            if index_view and futures_view
+            else None
+        ),
+    }
+
+
 @app.get("/api/equity", tags=["analytics"])
 def api_equity(limit: int = Query(2000, ge=2, le=20000)) -> dict[str, Any]:
     """Cumulative equity curve, oldest first, with realised-PnL fallback."""
@@ -1529,6 +2117,116 @@ def api_book_pause(request: BookPauseRequest) -> dict[str, Any]:
     }
 
 
+def _find_run(strategy_id: str) -> Any:
+    """The engine run for ``strategy_id``, or 404."""
+    for run in get_engine().runs:
+        if run.id == strategy_id:
+            return run
+    raise HTTPException(status_code=404, detail=f"Unknown strategy {strategy_id!r}")
+
+
+@app.post("/api/books/mode", tags=["control"])
+def api_book_mode(request: BookModeRequest) -> dict[str, Any]:
+    """Switch one book between PAPER and LIVE, independently of the other.
+
+    Arming LIVE requires ``confirm=true`` and the same pre-flight the global
+    switch enforces, because it is the same act: real orders will be placed. The
+    choice is persisted, so a restart resumes it.
+
+    Switching PAPER -> LIVE never executes an existing paper position: the paper
+    ledger is a different book, and the live book starts flat and waits for its
+    own fresh signal. Switching LIVE -> PAPER is refused while the live book
+    still holds a position - the position must be squared off or reconciled
+    first, or the operator would be left with a real position the bot no longer
+    manages.
+    """
+    run = _find_run(request.strategy_id)
+    target = request.mode.strip().upper()
+    if target not in (PAPER, LIVE):
+        raise HTTPException(status_code=400, detail=f"mode must be one of {[PAPER, LIVE]}")
+    previous = run.mode()
+    if target == previous:
+        return {"ok": True, "strategy_id": run.id, "previous": previous, "mode": target}
+
+    if target == LIVE:
+        if not request.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="Switching to LIVE requires confirm=true - real orders will be placed.",
+            )
+        if not settings.is_live_configured:
+            raise HTTPException(
+                status_code=409,
+                detail="LIVE mode requires KITE_API_KEY, KITE_API_SECRET and KITE_ACCESS_TOKEN.",
+            )
+        report = _live_readiness()
+        if not report.get("ready"):
+            blocking = [
+                c for c in report.get("checks", [])
+                if c.get("blocking") and not c.get("ok")
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail="LIVE refused: " + "; ".join(
+                    f"{c['key']}: {c['detail']}" for c in blocking
+                ),
+            )
+    else:
+        # LIVE -> PAPER: refuse while the live book still holds a position.
+        open_live = db.get_open_positions(mode=LIVE, strategy_id=run.id)
+        if open_live:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{run.id} still holds {len(open_live)} live position(s); "
+                    "square it off before switching to PAPER."
+                ),
+            )
+
+    run.set_mode(target)
+    # The bookkeeping around the rules is per-mode, so the switch is a clean
+    # start for this book: it evaluates its own first bar and needs its own fresh
+    # signal. Open positions are untouched.
+    get_engine().reset_for_mode(target, strategy_id=run.id)
+    log.warning("Book %s mode %s -> %s", run.id, previous, target)
+    return {"ok": True, "strategy_id": run.id, "previous": previous, "mode": target}
+
+
+@app.post("/api/books/square-off", tags=["control"])
+def api_book_square_off(request: BookSquareOffRequest) -> dict[str, Any]:
+    """Square off one book's positions, then pause it.
+
+    Scoped to ``strategy_id`` so it can never touch the other book's leg in the
+    same contract. In LIVE the exit orders go to the broker and the result is
+    verified before success is reported; in PAPER only the simulated position is
+    closed. The book is paused afterwards, so a square-off is not immediately
+    undone by the next signal.
+    """
+    if not request.confirm:
+        raise HTTPException(status_code=400, detail="Square off requires confirm=true")
+    run = _find_run(request.strategy_id)
+    manager = get_order_manager()
+    mode = run.mode()
+    result = manager.square_off(
+        request.reason or "MANUAL",
+        source="API_SQUARE_OFF",
+        mode=mode,
+        strategy_id=run.id,
+    )
+    if result.ok:
+        manager.pause_book(run.id, "SQUARED_OFF")
+    payload = result.to_dict()
+    payload.update({
+        "strategy_id": run.id,
+        "mode": mode,
+        "paused": manager.book_paused(run.id),
+    })
+    log.warning(
+        "Square off %s (%s): ok=%s %s", run.id, mode, result.ok, result.reason
+    )
+    return payload
+
+
 @app.post("/api/risk/clear", tags=["control"])
 def api_risk_clear() -> dict[str, Any]:
     """Dismiss the reported stop-out notice.
@@ -1559,7 +2257,30 @@ def api_panic(request: PanicRequest) -> dict[str, Any]:
     payload = result.to_dict()
     payload["paused"] = manager.paused
 
-    log.warning("PANIC via API: ok=%s %s", result.ok, result.reason)
+    # The index book is a separate database, so the futures square-off above
+    # cannot reach it. An emergency stop that leaves index positions open is the
+    # one state it must never leave behind, so every book is flattened too.
+    index_books: dict[str, Any] = {}
+    try:
+        from gift_book import gift_books
+
+        for book in gift_books():
+            try:
+                closed = book.flatten(request.reason or "PANIC")
+                if closed is not None:
+                    index_books[book.strategy_id] = closed
+            except Exception as exc:  # pragma: no cover - defensive
+                log.exception("Could not flatten the index book for %s", book.strategy_id)
+                index_books[book.strategy_id] = {"error": str(exc)}
+    except Exception as exc:  # pragma: no cover - defensive
+        log.exception("Could not enumerate the index books for PANIC")
+        index_books = {"error": str(exc)}
+    payload["index_books"] = index_books
+
+    log.warning(
+        "PANIC via API: ok=%s %s; index books flattened: %s",
+        result.ok, result.reason, sorted(index_books) or "none",
+    )
     return payload
 
 
@@ -1657,10 +2378,10 @@ def _strategy_accounts(modes: Any) -> dict[str, dict[str, Any]]:
     from config import strategy_configs
 
     # Every configured book must appear, not only the ones that already have a
-    # row. A fresh database has a single legacy row ("Surikbs"), so a book
-    # configured under another id found no account and rendered a blank equity -
-    # the book is running, it just has no ledger yet. `get_account` seeds a
-    # missing row, which is what the first read should do.
+    # row. A fresh database has a single legacy row ("Surikbs"), so with
+    # gift-flip / nifty-flip configured neither band found an account and both
+    # rendered a blank equity - the book is running, it just has no ledger yet.
+    # `get_account` seeds a missing row, which is what the first read should do.
     for configured in strategy_configs():
         db.get_account(strategy_id=configured.id)
 
@@ -1812,6 +2533,18 @@ def _leg_performance(modes: Any) -> dict[str, dict[str, dict[str, Any]]]:
             continue
         _add(key, "futures", row)
 
+    # The index legs live in their own ledger, one file per strategy.
+    try:
+        from gift_book import gift_books
+
+        for book in gift_books():
+            if not book.enabled:
+                continue
+            for row in book.trades(limit=5000):
+                _add(book.strategy_id, "gift", row)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Could not read the index legs' trades: %s", exc)
+
     for book in out.values():
         for entry in book.values():
             n = entry["trades"]
@@ -1913,6 +2646,22 @@ def api_kite_status() -> dict[str, Any]:
     status["redirect_url"] = kite_auth.callback_url()
     status["note"] = kite_auth.token_age_note()
     status["api_key_present"] = bool(settings.api_key and settings.api_secret)
+    status["feed"] = get_feed().status()
+    return status
+
+
+def _start_gift_feed(*, reconnect: bool = False) -> dict[str, Any]:
+    feed = reset_feed() if reconnect else get_feed()
+    if feed.bar_count() == 0:
+        feed.load_persisted()
+    # Resolve the execution future and hand it to the feed before start(), so
+    # _handle_connect can subscribe it in the same pass as GIFT Nifty. A failure
+    # here is not fatal: refresh_exec_quote() polls instead.
+    symbol = get_order_manager().current_symbol()
+    feed.set_exec_token(symbol, feed._resolve_exec_token(symbol))
+    started = feed.start()
+    status = feed.status()
+    status["start_requested"] = started
     return status
 
 
@@ -1939,13 +2688,31 @@ def api_kite_session(request: TokenRequest) -> dict[str, Any]:
     except kite_auth.KiteAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    feed = _start_gift_feed()
+
     return {
         "ok": True,
         "user_id": result.get("user_id"),
         "user_name": result.get("user_name"),
         "persisted": result.get("persisted"),
         "env_path": result.get("env_path"),
+        "feed_started": feed["start_requested"],
+        "feed": feed,
     }
+
+
+@app.post("/api/kite/feed/reconnect", tags=["kite"])
+def api_kite_feed_reconnect() -> dict[str, Any]:
+    """Reconnect the GIFT Nifty websocket using the current valid access token."""
+    client = get_client()
+    profile = client.profile()
+    if not profile.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail=profile.get("error") or "Kite access token is not valid; sign in again.",
+        )
+    feed = _start_gift_feed(reconnect=True)
+    return {"ok": feed["start_requested"], "feed": feed}
 
 
 def _callback_page(
@@ -2025,16 +2792,23 @@ def kite_callback(
             code=str(exc),
         )
 
+    feed = _start_gift_feed()
+
     persisted = result.get("persisted")
     return _callback_page(
         True,
         f"Connected as {result.get('user_id') or 'Kite user'}",
-        "Kite login succeeded; NIFTY history is available to the strategy.",
+        (
+            "Kite login succeeded and GIFT Nifty ticks are arriving."
+            if feed["connected"] and feed["last_tick_at"]
+            else "Kite login succeeded; the GIFT Nifty feed is still connecting. Check its status on the dashboard."
+        ),
         (
             "Token saved to bot/.env — it survives a restart."
             if persisted
             else "Token is active for this process only (bot/.env was not writable)."
-        ),
+        )
+        + (" Check the dashboard for the GIFT feed connection status."),
     )
 
 

@@ -58,6 +58,7 @@
         <div class="header-connection">
           <span id="kite-note" class="header-kite-note">Checking Kite…</span>
           <button id="btn-kite-login" class="btn btn-neutral header-control-button" title="Connect or refresh Kite login">Connect</button>
+          <button id="btn-feed-reconnect" class="btn btn-neutral header-control-button hidden" title="Reconnect GIFT market data">Reconnect</button>
         </div>
         <button id="btn-pause" class="btn btn-neutral header-control-button">Pause</button>
         <button id="btn-panic" class="btn btn-danger header-control-button" title="Emergency square-off all open positions">Square off</button>
@@ -65,7 +66,7 @@
       </div>
       <div class="header-status-row">
         <span id="pill-market" class="pill pill-idle">Market —</span>
-        <span id="pill-feed" class="pill pill-idle">Feed —</span>
+        <span id="pill-feed" class="pill pill-idle">GIFT —</span>
         <span id="pill-loop" class="pill pill-idle">Loop —</span>
         <!-- Front-month rollover. Hidden until the contract is close enough to
              expiry to matter, so it is a quiet nudge rather than a banner. -->
@@ -163,14 +164,14 @@
       </div>
     </div>
 
-    <!-- Prices, as one compact row rather than two large quote cards. The index
+    <!-- Prices, as one compact row rather than two large quote cards. The GIFT
          level, the future and the basis are three numbers; cards gave each a
          third of the page and pushed the strategies off the first screen. -->
     <div class="quote-row">
       <div class="quote-item">
         <span id="e-signal-source-label" class="quote-label">Signal source</span>
-        <span id="e-signal-price" class="quote-number">—</span>
-        <span id="e-signal-timestamp" class="quote-note">Last tick —</span>
+        <span id="e-gift-price" class="quote-number">—</span>
+        <span id="e-gift-timestamp" class="quote-note">Last tick —</span>
       </div>
       <div class="quote-item">
         <span class="quote-label">Nifty future</span>
@@ -323,6 +324,10 @@
           <p id="orders-caption" class="metric-sub">—</p>
         </div>
         <div class="toolbar">
+          <select id="orders-venue" class="field field-compact" aria-label="Venue">
+            <option value="futures">Nifty future</option>
+            <option value="gift">GIFT Nifty index</option>
+          </select>
           <input id="orders-search" type="search" placeholder="Search symbol, status, order id…" class="field field-search" />
           <select id="orders-mode" class="field field-compact">
             <option value="">All modes</option>
@@ -373,6 +378,12 @@
         <div>
           <h2 class="section-title">Venue</h2>
           <p id="analytics-venue-note" class="metric-sub">—</p>
+        </div>
+        <div class="toolbar">
+          <select id="analytics-venue" class="field field-compact" aria-label="Venue">
+            <option value="futures">Nifty future</option>
+            <option value="gift">GIFT Nifty index</option>
+          </select>
         </div>
       </div>
     </div>

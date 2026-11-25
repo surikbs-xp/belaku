@@ -1,4 +1,4 @@
-"""Central configuration for the NIFTY 50 -> Nifty Futures execution bot.
+"""Central configuration for the GIFT Nifty -> Nifty Futures execution bot.
 
 All values are sourced from the environment (.env) with safe defaults so the
 system boots in PAPER mode without any credentials.
@@ -179,6 +179,19 @@ class Settings:
     # distinguishable from a quiet market.
     alert_on_lifecycle: bool = _env_bool("ALERT_ON_LIFECYCLE", True)
 
+    # --- GIFT Nifty index book --------------------------------------------
+    # GIFT Nifty is a non-tradeable index on Kite, so it cannot be bought in LIVE
+    # mode at all. This runs the same signals through a separate paper book on the
+    # index level, which is the only way to see whether trading the index would
+    # have beaten trading the future. Off by default.
+    gift_book: bool = _env_bool("GIFT_BOOK", False)
+    # Own SQLite file, so the index ledger can never touch the futures ledger.
+    gift_book_db_path: str = _env_path("GIFT_BOOK_DB_PATH", str(BASE_DIR / "gift_book.db"))
+    # Units per position. Defaults to one NIFTY_LOT_SIZE, so the two books carry
+    # the same notional exposure and their P&L is directly comparable.
+    gift_book_units: int = _env_int("GIFT_BOOK_UNITS", 0)
+    gift_book_balance: float = _env_float("GIFT_BOOK_BALANCE", 200_000.0)
+
     # --- Shadow paper book ------------------------------------------------
     # While EXECUTION_MODE=LIVE, mirror every live position into a paper book
     # kept in its own database, so the fill the model would have given can be
@@ -217,15 +230,16 @@ class Settings:
     # must match the rows already in the database or the bot will look flat when
     # it is not. Defaults to the id every pre-existing row carries.
     strategy_id: str = _env("STRATEGY_ID", "Surikbs").strip() or "Surikbs"
-    # --- Signal feed ------------------------------------------------------
-    # The engine loads NIFTY 50 candles from Kite history and evaluates st.pine
-    # on them. This interval must match the timeframe the Pine strategy was
-    # tuned on.
-    candle_interval: str = _env("CANDLE_INTERVAL", "60minute")
+    # --- GIFT Nifty signal feed -------------------------------------------
+    # The engine loads GIFT Nifty candles from Kite history (the source of
+    # truth) and falls back to building them from live NSEIX ticks only while
+    # history is unavailable, then evaluates st.pine on them. This interval must
+    # match the timeframe the Pine strategy was tuned on.
+    gift_candle_interval: str = _env("GIFT_CANDLE_INTERVAL", "60minute")
 
     # --- Engine loop ------------------------------------------------------
     # How often the mark loop updates PnL/equity and the strategy engine checks
-    # whether a new bar has closed.
+    # whether a new GIFT Nifty bar has closed.
     engine_interval_seconds: float = _env_float("ENGINE_INTERVAL_SECONDS", 5.0)
 
     # --- Storage ----------------------------------------------------------
@@ -235,11 +249,11 @@ class Settings:
 
     # ------------------------------------------------------------------
     @property
-    def candle_interval_seconds(self) -> int:
-        """Bar length in seconds, derived from ``CANDLE_INTERVAL``."""
-        import bar_source  # local: bar_source imports this module
+    def gift_candle_interval_seconds(self) -> int:
+        """Bar length in seconds, derived from ``GIFT_CANDLE_INTERVAL``."""
+        import gift_nifty  # local: gift_nifty imports this module
 
-        return bar_source.interval_to_seconds(self.candle_interval)
+        return gift_nifty.interval_to_seconds(self.gift_candle_interval)
 
     @property
     def is_live_configured(self) -> bool:
@@ -311,8 +325,8 @@ def validate() -> list[str]:
         warnings.append(f"Unknown EXECUTION_MODE {mode!r}; falling back to PAPER.")
     if not _env("KITE_ACCESS_TOKEN", settings.access_token):
         warnings.append(
-            "KITE_ACCESS_TOKEN is empty - the bot needs it to read NIFTY history "
-            "and cannot evaluate the strategy until it is set."
+            "KITE_ACCESS_TOKEN is empty - the GIFT Nifty feed needs it and the bot "
+            "cannot evaluate the strategy until it is set."
         )
     if mode == LIVE and not settings.is_live_configured:
         warnings.append("EXECUTION_MODE=LIVE but Kite credentials are incomplete.")
@@ -346,11 +360,61 @@ class StrategyConfig:
     filter_ma: int = 0
     # Whether this book places real orders once the bot is switched to LIVE.
     #
-    # A per-run switch rather than a global one, so a book that has not said so
-    # explicitly stays in paper. Defaulting to False is the safe direction: an
-    # unset flag must never be what puts real money on a signal the operator has
-    # not thought about.
+    # A per-run switch rather than a global one, because the two books are not
+    # equivalent instruments. GIFT Nifty is a *non-tradeable index* on Kite, so
+    # its signal can never be filled as itself - a LIVE order from the GIFT book
+    # becomes a Nifty-futures order, which is a different instrument from the one
+    # the strategy read. The NIFTY book reads the Nifty index and can genuinely
+    # trade it. Defaulting to False keeps a book that has not said so explicitly
+    # in paper, which is the safe direction: an unset flag must never be what
+    # puts real money on a signal the operator has not thought about.
     live: bool = False
+    # Which execution legs this strategy places orders on. A signal is generated
+    # from one series; executing it is a separate decision, and the two are not
+    # always the same instrument. ``gift`` is the *paper* index book - GIFT Nifty
+    # is quote-only on Kite, so a leg there can never reach a broker.
+    #
+    # Parsed from ``STRATEGY_<n>_LEGS=gift,futures``. An empty tuple means "not
+    # configured", and ``resolved_legs`` then answers with what that source did
+    # before this setting existed, so an .env written earlier trades exactly as
+    # before.
+    legs: tuple[str, ...] = ()
+    # Protective stop, in index points, measured on the *futures* execution
+    # price. ``stop_loss`` is the initial distance from the fill; the trail
+    # activates at ``trail_after`` points of open profit and then follows the
+    # best price at ``trail_points`` (or ``trail_points_after`` once the wider
+    # band is reached). Zero disables the corresponding piece, so a book with
+    # ``stop_loss=0`` keeps the signal-only exit it had before.
+    stop_loss: float = 0.0
+    trail_points: float = 0.0
+    trail_after: float = 0.0
+    trail_points_after: float = 0.0
+
+    @property
+    def stop_rules(self) -> Any:
+        """This book's stop configuration, as the ``stops`` module reads it."""
+        import stops
+
+        return stops.StopRules(
+            initial_points=self.stop_loss,
+            trail_points=self.trail_points,
+            trail_after=self.trail_after,
+            trail_points_after=self.trail_points_after,
+        )
+
+    @property
+    def resolved_legs(self) -> tuple[str, ...]:
+        """The legs to trade, with the historical default applied.
+
+        Source-dependent, because the two sources did not behave alike: a
+        GIFT-sourced strategy has always settled the paper index book *and*
+        placed the futures order, while a NIFTY-sourced one never had an index
+        leg to settle. One shared default would silently switch off an existing
+        deployment's GIFT book on upgrade.
+        """
+        if self.legs:
+            return tuple(self.legs)
+        return ("gift", "futures") if self.source.strip().lower().startswith("gift") else ("futures",)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -365,6 +429,11 @@ class StrategyConfig:
             "filter_adx": self.filter_adx,
             "filter_ma": self.filter_ma,
             "live": self.live,
+            "legs": list(self.resolved_legs),
+            "stop_loss": self.stop_loss,
+            "trail_points": self.trail_points,
+            "trail_after": self.trail_after,
+            "trail_points_after": self.trail_points_after,
         }
 
     def strategy_params(self) -> dict[str, Any]:
@@ -405,8 +474,8 @@ def strategy_configs() -> list[StrategyConfig]:
             # first and trade the same book twice.
             continue
         if not explicit and index == 1:
-            source = "nifty"
-        resolved_source = (source or "nifty").strip().lower()
+            source = "gift"
+        resolved_source = (source or "gift").strip().lower()
         out.append(
             StrategyConfig(
                 index=index,
@@ -415,7 +484,7 @@ def strategy_configs() -> list[StrategyConfig]:
                 source=resolved_source,
                 interval=_env(
                     prefix + "INTERVAL",
-                    settings.candle_interval if index == 1 else "60minute",
+                    settings.gift_candle_interval if index == 1 else "60minute",
                 ),
                 exit=(
                     _env(prefix + "EXIT", settings.strategy_exit if index == 1 else "flip")
@@ -429,23 +498,70 @@ def strategy_configs() -> list[StrategyConfig]:
                 filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
                 filter_ma=_env_int(prefix + "FILTER_MA", 0),
                 live=_env_bool(prefix + "LIVE", False),
+                legs=_parse_legs(_env(prefix + "LEGS", "")),
+                stop_loss=_env_float(prefix + "STOP_LOSS", 0.0),
+                trail_points=_env_float(prefix + "TRAIL_POINTS", 0.0),
+                trail_after=_env_float(prefix + "TRAIL_AFTER", 0.0),
+                trail_points_after=_env_float(prefix + "TRAIL_POINTS_AFTER", 0.0),
             )
         )
     return out
+
+
+# The instruments a strategy may execute on. `futures` is the NFO Nifty future,
+# the only leg that can reach a broker for real money; `gift` is the paper index
+# book, which exists to compare the venue against the future.
+VALID_LEGS = ("futures", "gift")
+
+
+def _parse_legs(raw: str) -> tuple[str, ...]:
+    """Parse ``STRATEGY_<n>_LEGS`` into execution legs.
+
+    An unknown name raises rather than silently dropping the leg: a typo in the
+    leg list would otherwise trade one instrument fewer than the operator asked
+    for, which looks like a strategy that simply never fires.
+
+    Unset returns an empty tuple rather than a guess: the historical default
+    depends on the signal source, and ``StrategyConfig.resolved_legs`` is the one
+    place that knows it.
+    """
+    names = [part.strip().lower() for part in (raw or "").split(",") if part.strip()]
+    if not names:
+        # Unset, not "futures": StrategyConfig.resolved_legs owns the historical
+        # default, and it depends on the source.
+        return ()
+    unknown = [n for n in names if n not in VALID_LEGS]
+    if unknown:
+        raise ValueError(
+            f"Unknown execution leg(s) {unknown}; expected any of {list(VALID_LEGS)}"
+        )
+    # Deduplicated but ordered, so a repeated leg cannot double the size.
+    seen: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
 def enabled_strategies() -> list[StrategyConfig]:
     return [cfg for cfg in strategy_configs() if cfg.enabled]
 
 
-def build_bar_source_for(cfg: StrategyConfig) -> Any:
+def build_bar_source_for(cfg: StrategyConfig, *, gift_feed: Any = None) -> Any:
     """The bar source one strategy reads.
 
     Imported lazily so ``config`` stays free of a module-level dependency on
-    ``bar_source`` (which imports ``config`` in turn).
+    ``bar_source`` (which imports ``config`` in turn). The GIFT feed is passed in
+    rather than constructed here: it owns a process-global websocket, so every
+    GIFT strategy must share the one instance.
     """
-    from bar_source import NiftyBarSource
+    from bar_source import GiftBarSource, NiftyBarSource
 
+    if cfg.source in {"gift", "gift_nifty", "nseix:gift nifty"}:
+        # Pass the configured interval through: the feed builds it from the same
+        # ticks as its own series. Dropping it here is what made
+        # STRATEGY_<n>_INTERVAL silently do nothing for a GIFT book.
+        return GiftBarSource(gift_feed, interval=cfg.interval)
     if cfg.source in {"nifty", "nifty50", "nse:nifty 50"}:
         return NiftyBarSource(cfg.interval)
     raise ValueError(f"Unknown source {cfg.source!r} for strategy {cfg.id!r}")

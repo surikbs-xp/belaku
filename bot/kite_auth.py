@@ -167,10 +167,10 @@ def write_token(access_token: str) -> bool:
 
 
 def apply_token(access_token: str) -> None:
-    """Push a fresh token into the running client.
+    """Push a fresh token into the running client and reconnect the feed.
 
-    The Kite SDK is built from the token at construction time, so a new token
-    requires the client to be rebuilt, not just the attribute reassigned.
+    The GIFT Nifty websocket is built from the token at connect time, so a new
+    token requires the ticker to be rebuilt, not just the REST client.
     """
     import os
 
@@ -182,6 +182,15 @@ def apply_token(access_token: str) -> None:
     client.access_token = access_token
     client._init_sdk()  # rebuild KiteConnect with the new token
 
+    # The tick feed cannot be re-authenticated in place: tear it down and let
+    # the engine pick it up again.
+    try:
+        from gift_nifty import get_feed, reset_feed
+
+        reset_feed()
+        log.info("GIFT Nifty feed reset for the new token")
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Could not reset the GIFT feed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

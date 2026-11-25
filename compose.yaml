@@ -12,8 +12,10 @@ services:
       WEBHOOK_HOST: 0.0.0.0
       WEBHOOK_PORT: "9000"
       DB_PATH: /data/paper_trading.db
-      # The shadow book needs its own writable file. Without this it would
-      # default under /app/bot, which the read-only image cannot write.
+      # The GIFT index book and the shadow book each need their own writable
+      # file. Without these they would default under /app/bot, which the
+      # read-only image cannot write.
+      GIFT_BOOK_DB_PATH: /data/gift_book.db
       PAPER_MIRROR_DB_PATH: /data/paper_mirror.db
       LOG_FILE: /data/bot.log
       # Keep the NSE holiday cache on the writable volume: the image is

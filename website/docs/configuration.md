@@ -155,9 +155,9 @@ reintroduce the vote this strategy deliberately does not have.
 
 ## Strategies
 
-One strategy runs by default, built from the flat keys above. Additional ones are
-added with `STRATEGY_<n>_*` — see [Running multiple strategies](./multi-strategy.md),
-which also explains why two strategies in one contract can cancel each other.
+Two strategies run: **GIFT NIFTY 15m** and **NIFTY 60m**, each configured with
+`STRATEGY_<n>_*` — see [Running multiple strategies](./multi-strategy.md), which
+also explains why two strategies in one contract can cancel each other.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -168,8 +168,27 @@ which also explains why two strategies in one contract can cancel each other.
 | `STRATEGY_<n>_EXIT` | `flip` | `flip` or `flat`. |
 | `STRATEGY_<n>_LOTS` | `1` | Position size for that run. |
 | `STRATEGY_<n>_ENABLED` | `1` | `0` configures it without starting it. |
+| `STRATEGY_<n>_LIVE` | `0` | Initial LIVE/PAPER choice; the dashboard toggle persists it. |
+| `STRATEGY_<n>_STOP_LOSS` | `0` | Initial stop, in index points, from the futures fill. `0` disables stops. |
+| `STRATEGY_<n>_TRAIL_POINTS` | `0` | Trail distance before the wider band. |
+| `STRATEGY_<n>_TRAIL_AFTER` | `0` | Open profit (points) at which the wider trail takes over. |
+| `STRATEGY_<n>_TRAIL_POINTS_AFTER` | `0` | Trail distance once `TRAIL_AFTER` is reached. |
 | `STRATEGY_<n>_FILTER_ADX` | *(off)* | Only enter when ADX(14) exceeds this. |
 | `STRATEGY_<n>_FILTER_MA` | *(off)* | Only enter on the trend's side of this SMA. |
+
+The shipped configuration sets the stops the two strategies are specified with:
+
+| | GIFT 15m | NIFTY 60m |
+|---|---|---|
+| `STOP_LOSS` | 50 | 200 |
+| `TRAIL_POINTS` | 5 | 100 |
+| `TRAIL_AFTER` | 50 | 200 |
+| `TRAIL_POINTS_AFTER` | 30 | 100 |
+
+Every stop is measured on the **futures execution price**, never on the signal
+index, and it only ever moves in the profitable direction — it never widens. It
+is checked on the live futures price every mark cycle, not on a bar close, and it
+stays active while the book is paused.
 
 **Neither filter is recommended.** Measured on three years of NIFTY 60-minute
 bars, ADX makes the net monotonically worse — ADX>15 drops it from ₹160,318 to
@@ -258,20 +277,18 @@ when it falls back to this number. Set it conservatively.
 **There is no session loss cap.** It was removed: blocking new entries once the
 day's realised loss reached a limit sounds prudent, but it is a second, hidden
 strategy — it changes when the bot trades based on a number the strategy never
-looked at. The strategy's own signal is the only exit, and `MAX_OPEN_LOTS` is the
-only exposure limit.
+looked at. Each book's protective stop and `MAX_OPEN_LOTS` are the exposure
+limits.
 
-**`MAX_OPEN_LOTS` caps position size.** The strategy owns its own exit: a
-position is held while SuperTrend and PSAR agree and closed on the first bar they
-stop. There is no per-trade stop-loss, no trailing stop, and no profit target —
-see [Strategy](./strategy.md#what-the-strategy-does-not-have) for why, and for
-what the exit actually earns on real data.
+**`MAX_OPEN_LOTS` caps position size.** Each book also carries its own
+protective stop (`STRATEGY_<n>_STOP_LOSS` and the trail settings above), measured
+on the futures execution price. The signal is still the primary exit; the stop is
+the backstop that caps a single loss.
 
 `STOP_LOSS_POINTS`, `TRAILING_STOP_ENABLED`, `TRAILING_INITIAL_POINTS`,
 `TRAILING_STEP_POINTS`, `TRAILING_TIGHTEN_AT_POINTS`, `TRAILING_TIGHT_POINTS`,
 `LARGE_CANDLE_ATR_MULTIPLIER` and `LARGE_CANDLE_MAX_POINTS` are **no longer
-read**. Leaving them in an old `.env` is harmless: they cannot arm a stop or
-suppress a signal.
+read**. Stops are configured per strategy with the `STRATEGY_<n>_*` keys above.
 
 The signal exit is verified before it is reported: if the square-off did not
 fill, the position stays open and the exit is retried on the next bar rather than

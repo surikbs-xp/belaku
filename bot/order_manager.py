@@ -926,6 +926,26 @@ class OrderManager:
             # same (book-derived) instrument price.
             fill_price = simulated.price
         signed_quantity = filled_quantity if action == BUY else -filled_quantity
+        # The protective stop is placed at the fill, on the futures price. The
+        # engine sends the book's rules; the level is derived here so it is
+        # relative to the price the broker actually gave, not the signal close.
+        # A payload without rules (a webhook, a manual order) has no stop.
+        position_key = 1 if signed_quantity > 0 else -1
+        initial_stop = None
+        rules = payload.get("stop_rules")
+        if isinstance(rules, dict) and rules.get("enabled"):
+            import stops
+
+            initial_stop = stops.initial_stop(
+                fill_price,
+                position_key,
+                stops.StopRules(
+                    initial_points=float(rules.get("initial_points") or 0.0),
+                    trail_points=float(rules.get("trail_points") or 0.0),
+                    trail_after=float(rules.get("trail_after") or 0.0),
+                    trail_points_after=float(rules.get("trail_points_after") or 0.0),
+                ),
+            )
         position_id = db.open_position(
             symbol=symbol,
             quantity=signed_quantity,
@@ -934,6 +954,10 @@ class OrderManager:
             source=source,
             strategy=str(payload.get("strategy") or strategy_id),
             strategy_id=strategy_id,
+            sl_price=initial_stop,
+            initial_sl_price=initial_stop,
+            trailing_stop=initial_stop,
+            best_price=fill_price,
             notes=json.dumps({k: payload.get(k) for k in ("signal_id", "interval", "timestamp") if payload.get(k)}),
         )
         db.record_order(

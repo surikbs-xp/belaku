@@ -15,6 +15,7 @@ import bot as bot_app
 import database as db
 import engine
 import fill
+import gift_nifty
 import kite_auth
 import kite_client
 import order_manager
@@ -23,6 +24,7 @@ import risk
 import strategy
 from config import BASE_DIR
 from config import LIVE, PAPER, Settings
+from gift_nifty import GiftNiftyFeed
 from kite_client import IST, KiteClient, NetworkException
 from order_manager import OrderManager
 
@@ -34,6 +36,23 @@ def use_test_database(monkeypatch, tmp_path) -> None:
         SimpleNamespace(db_path=str(tmp_path / "test.db"), virtual_balance=1_000_000.0),
     )
     db.init_db()
+
+
+def _isolate_gift_book(monkeypatch, tmp_path) -> None:
+    """Point the GIFT index book at a throwaway file.
+
+    Its own module-level singleton defaults to ``GIFT_BOOK_DB_PATH``, which on a
+    developer machine is the *real* ledger. A test that lets the engine settle the
+    index book would then append to it - and because the rows record the test's
+    own name, the damage is invisible until someone reads the dashboard.
+    """
+    import gift_book
+
+    book = gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=True, units=65)
+    monkeypatch.setattr(gift_book, "_book", book, raising=False)
+    # Every strategy id resolves to this one throwaway book, so a test cannot
+    # reach the real ledger through a per-strategy lookup.
+    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
 
 
 def use_risk_limits(
@@ -689,14 +708,6 @@ def test_psar_matches_the_pine_reference_on_a_long_series() -> None:
     assert values == pytest.approx(expected, abs=1e-9)
 
 
-def _rising_candles(count: int = 40) -> list[dict[str, float]]:
-    """A clean uptrend, which an uptrend-following pair should both agree on."""
-    return [
-        {"high": 101.0 + i, "low": 99.0 + i, "close": 100.0 + i}
-        for i in range(count)
-    ]
-
-
 def test_supertrend_matches_the_pine_reference_on_a_long_series() -> None:
     highs, lows, closes = _reference_series()
 
@@ -714,18 +725,207 @@ def test_supertrend_matches_the_pine_reference_on_a_long_series() -> None:
     assert directions == [-value for value in expected_direction]
 
 
+def _gift_ticks(feed: GiftNiftyFeed, *ticks: tuple[float, datetime]) -> None:
+    feed._builder.on_close = feed._on_bar_close
+    for price, moment in ticks:
+        feed._builder.add_tick(price, moment)
+
+
 def _at(minute: int, second: int = 0) -> datetime:
     return datetime(2026, 11, 6, 10, minute, second, tzinfo=IST)
 
 
-def test_engine_status_evaluates_the_closed_bar_the_engine_actually_trades(monkeypatch) -> None:
-    """The dashboard must report the bars the engine actually trades.
+def test_bar_joined_late_is_excluded_from_indicator_history(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    feed = GiftNiftyFeed("5minute")
 
-    The NIFTY source is history-only - a bar appears when the exchange closes it
-    - so every bar it returns is closed and there is no forming bar to advertise.
-    The status payload must say so rather than inventing one.
+    _gift_ticks(
+        feed,
+        (100.0, _at(1, 30)),  # feed joined 90s into the 10:00 bar
+        (101.0, _at(5, 1)),
+        (102.0, _at(10, 1)),
+    )
+
+    assert [candle["time"] for candle in feed.candles()] == ["2026-11-06T10:05:00+05:30"]
+    stored = {row["start"][11:16]: row["partial"] for row in db.get_gift_candles()}
+    assert stored == {"10:00": gift_nifty.PARTIAL_GAP, "10:05": gift_nifty.PARTIAL_NONE}
+
+
+def test_feed_outage_inside_a_bar_excludes_that_bar_only(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    feed = GiftNiftyFeed("5minute")
+    feed._builder.on_close = feed._on_bar_close
+    feed._builder.add_tick(100.0, _at(0, 1))
+    feed._builder.add_tick(101.0, _at(5, 1))
+    feed._builder.mark_outage()
+    feed._builder.add_tick(102.0, _at(5, 2))  # reconnected, same bar
+    feed._builder.add_tick(103.0, _at(10, 1))
+    feed._builder.add_tick(104.0, _at(15, 1))
+
+    assert [candle["time"][11:16] for candle in feed.candles()] == ["10:00", "10:10"]
+
+
+def test_shutdown_cut_bar_is_dropped_unless_restarted_in_same_bucket(
+    monkeypatch, tmp_path
+) -> None:
+    use_test_database(monkeypatch, tmp_path)
+
+    class FixedDateTime(datetime):
+        current = datetime(2026, 11, 6, 10, 2, 0, tzinfo=IST)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    monkeypatch.setattr(gift_nifty, "datetime", FixedDateTime)
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 0, 3, tzinfo=IST)
+    first = GiftNiftyFeed("5minute")
+    first._handle_ticks(None, [{"last_price": 100.0}])
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 2, 0, tzinfo=IST)
+    first.stop()
+    assert [row["partial"] for row in db.get_gift_candles()] == [gift_nifty.PARTIAL_CUT]
+
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 20, 0, tzinfo=IST)
+    later = GiftNiftyFeed("5minute")
+    assert later.load_persisted() == 0
+    later._handle_ticks(None, [{"last_price": 101.0}])
+    assert later.candles() == []
+
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 2, 30, tzinfo=IST)
+    same_bucket = GiftNiftyFeed("5minute")
+    assert same_bucket.load_persisted() == 1
+    same_bucket._handle_ticks(None, [{"last_price": 102.0}])
+    FixedDateTime.current = datetime(2026, 11, 6, 10, 5, 1, tzinfo=IST)
+    same_bucket._handle_ticks(None, [{"last_price": 103.0}])
+    assert [candle["time"][11:16] for candle in same_bucket.candles()] == ["10:00"]
+
+
+def test_init_db_adds_partial_column_to_existing_candle_table(tmp_path) -> None:
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE gift_candles (start TEXT PRIMARY KEY, open REAL NOT NULL, "
+            "high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, "
+            "volume REAL NOT NULL DEFAULT 0, ticks INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO gift_candles VALUES ('2026-11-06T10:00:00+05:30', 1, 2, 0, 1, 0, 3, 'x')"
+        )
+
+    db.init_db(path)
+
+    assert db.get_gift_candles(path=path)[0]["partial"] == 0
+
+
+def test_ltp_ticks_contribute_to_explicit_volume_proxy() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed._handle_ticks(
+        None,
+        [
+            {"last_price": 100.0, "volume_traded": 10_000},
+            {"last_price": 101.0, "volume_traded": 10_001},
+        ],
+    )
+
+    assert feed.in_progress["volume"] == 2.0
+    assert feed.status()["volume_basis"] == "tick_count_proxy"
+
+
+def test_candle_snapshot_includes_forming_candle() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed._handle_ticks(None, [{"last_price": 100.0}])
+
+    candles, in_progress = feed.candle_snapshot()
+
+    assert in_progress
+    assert len(candles) == 1
+    assert candles[0]["close"] == 100.0
+    assert candles[0]["ticks"] == 1
+
+
+def test_feed_resumes_persisted_partial_candle_without_duplicate(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    class FixedDateTime(datetime):
+        current = datetime(2026, 11, 6, 6, 4, tzinfo=IST)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    start = gift_nifty.bucket_start(FixedDateTime.current, 300)
+    db.record_gift_candle(
+        start=start.isoformat(timespec="seconds"),
+        open_=100.0,
+        high=102.0,
+        low=99.0,
+        close=101.0,
+        volume=5.0,
+        ticks=5,
+    )
+    monkeypatch.setattr(gift_nifty, "datetime", FixedDateTime)
+
+    feed = GiftNiftyFeed("5minute")
+    assert feed.load_persisted() == 1
+    assert feed.candles() == []
+    assert feed.candle_snapshot() == ([], False)
+
+    feed._handle_ticks(None, [{"last_price": 103.0}])
+    snapshot, in_progress = feed.candle_snapshot()
+    assert in_progress
+    assert len(snapshot) == 1
+    assert snapshot[0] == {
+        "time": start.isoformat(timespec="seconds"),
+        "open": 100.0,
+        "high": 103.0,
+        "low": 99.0,
+        "close": 103.0,
+        "volume": 6.0,
+        "ticks": 6,
+    }
+
+    FixedDateTime.current = datetime(2026, 11, 6, 6, 5, tzinfo=IST)
+    feed._handle_ticks(None, [{"last_price": 104.0}])
+    closed = feed.candles()
+    snapshot, in_progress = feed.candle_snapshot()
+    assert len(closed) == 1
+    assert closed[0]["time"] == start.isoformat(timespec="seconds")
+    assert len(snapshot) == 2
+    assert snapshot[0]["time"] != snapshot[1]["time"]
+    assert in_progress
+
+
+def test_feed_status_exposes_last_candle_as_source_fallback() -> None:
+    feed = GiftNiftyFeed("5minute")
+    feed._history = [{
+        "time": "2026-11-05T21:40:00+05:30",
+        "open": 100.0,
+        "high": 105.0,
+        "low": 99.0,
+        "close": 104.0,
+        "volume": 5.0,
+    }]
+
+    status = feed.status()
+
+    assert status["last_price"] is None
+    assert status["last_candle_close"] == 104.0
+    assert status["last_candle_at"] == "2026-11-05T21:40:00+05:30"
+
+
+def test_engine_status_evaluates_the_closed_bar_the_engine_actually_trades(monkeypatch) -> None:
+    """The dashboard must not advertise a signal the engine will never act on.
+
+    The rule checks used to be computed from the *forming* bar while the engine
+    traded the last closed one. A wide forming candle therefore flipped the
+    dashboard to BULL while the engine still saw NO_SIGNAL on the bar it acts on
+    - the operator saw a signal that could not fire. Both verdicts now come from
+    closed bars; the forming bar is reported separately.
     """
-    rows = [
+    feed = GiftNiftyFeed("1minute")
+    feed._history = [
         {
             "time": f"2026-11-05T09:{index:02d}:00+05:30",
             "open": 100.0 + index,
@@ -738,21 +938,8 @@ def test_engine_status_evaluates_the_closed_bar_the_engine_actually_trades(monke
         # after the newest closed bar is dropped.
         for index in range(17)
     ]
-
-    class FakeSource:
-        seconds = 60
-        key = "NSE:NIFTY 50"
-
-        def refresh_history(self, force=False):
-            return len(rows)
-
-        def candles(self):
-            return list(rows)
-
-        def status(self):
-            return {"symbol": self.key, "bars": len(rows)}
-
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: FakeSource())
+    feed._handle_ticks(None, [{"last_price": 118.0}])
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "market_status", lambda: {"is_open": True})
     monkeypatch.setattr(
         engine,
@@ -764,23 +951,27 @@ def test_engine_status_evaluates_the_closed_bar_the_engine_actually_trades(monke
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
 
     status = engine.StrategyEngine().status()
+    snapshot, _ = feed.candle_snapshot()
 
-    # A history-only source has no forming bar, and the payload says so.
-    assert status["current_bar_in_progress"] is False
-    assert status["forming_bar_at"] is None
+    assert status["current_bar_in_progress"]
+    # The forming bar is still reported, but only as a timestamp - it never
+    # decides a signal.
+    assert status["forming_bar_at"] == snapshot[-1]["time"]
     # Both verdicts are computed from closed bars.
-    assert status["current_values"] == strategy.evaluate(rows).values
-    assert status["current_bar_at"] == rows[-1]["time"]
-    assert status["previous_values"] == strategy.evaluate(rows[:-1]).values
-    assert status["previous_bar_at"] == rows[-2]["time"]
+    assert status["current_values"] == strategy.evaluate(feed.candles()).values
+    assert status["current_bar_at"] == feed.candles()[-1]["time"]
+    assert status["previous_values"] == strategy.evaluate(feed.candles()[:-1]).values
+    assert status["previous_bar_at"] == feed.candles()[-2]["time"]
+    # `current_bar_at` is the bar the verdict came from, not the forming one.
+    assert status["current_bar_at"] != status["forming_bar_at"]
     assert status["previous_values"]["psar"] != status["current_values"]["psar"]
     assert status["last_signal"] == strategy.NO_SIGNAL
 
 
-def test_engine_after_hours_paper_order_does_not_price_from_the_index_close(
+def test_engine_after_hours_paper_order_does_not_price_from_the_gift_close(
     monkeypatch,
 ) -> None:
-    """The index close gates the fill but must never *price* it.
+    """The GIFT close gates the fill but must never *price* it.
 
     Booking an entry at the index level wrote the index/future basis into the
     position, so the row opened showing a P&L no trade had produced. The fill has
@@ -839,7 +1030,11 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
     until the first bar that closes in-session; without it the test would pass or
     fail depending on the wall clock when it ran.
     """
+    # Isolate the ledgers. Without this the engine's GIFT index book writes its
+    # signal trail into the developer's real gift_book.db, which is how that file
+    # came to hold hundreds of rows explaining that a test failed.
     use_test_database(monkeypatch, tmp_path)
+    _isolate_gift_book(monkeypatch, tmp_path)
 
     monkeypatch.setattr(
         engine, "market_status",
@@ -865,7 +1060,7 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
         strategy.StrategyVerdict(strategy.BEAR, 99.0, previous_signal=strategy.BULL),
     ])
     actions = []
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine.strategy, "evaluate", lambda *_args: next(verdicts))
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
@@ -880,7 +1075,7 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
     monkeypatch.setattr(
         engine, "strategy_configs",
         lambda: [config.StrategyConfig(
-            index=1, id="Surikbs", source="nifty", interval="60minute",
+            index=1, id="Surikbs", source="gift", interval="60minute",
             exit="flip", lots=1, enabled=True, name="",
         )],
     )
@@ -899,12 +1094,12 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
     assert actions == ["SELL"]
 
 
-def test_engine_logs_closed_candle_and_indicator_values(monkeypatch, caplog, tmp_path) -> None:
+def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog, tmp_path) -> None:
     use_test_database(monkeypatch, tmp_path)
+    _isolate_gift_book(monkeypatch, tmp_path)
 
     class FakeFeed:
         seconds = 300
-        key = "NSE:NIFTY 50"
 
         def candles(self):
             return [{
@@ -915,7 +1110,7 @@ def test_engine_logs_closed_candle_and_indicator_values(monkeypatch, caplog, tmp
                 "close": 100.5,
             }]
 
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: FakeFeed())
+    monkeypatch.setattr(engine, "get_feed", FakeFeed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(
         engine.strategy,
@@ -932,7 +1127,7 @@ def test_engine_logs_closed_candle_and_indicator_values(monkeypatch, caplog, tmp
     monkeypatch.setattr(
         engine, "strategy_configs",
         lambda: [config.StrategyConfig(
-            index=1, id="Surikbs", source="nifty", interval="60minute",
+            index=1, id="Surikbs", source="gift", interval="60minute",
             exit="flip", lots=1, enabled=True, name="",
         )],
     )
@@ -945,7 +1140,7 @@ def test_engine_logs_closed_candle_and_indicator_values(monkeypatch, caplog, tmp
         for record in caplog.records
         if record.name == "engine" and "Indicator values" in record.message
     )
-    assert "source=NSE:NIFTY 50" in message
+    assert "source=NSEIX:GIFT NIFTY" in message
     assert "interval_seconds=300" in message
     assert "candle_at=2026-11-05T22:10:00+05:30" in message
     assert '"close": 100.5' in message
@@ -961,6 +1156,7 @@ def test_engine_exits_an_opposing_paper_position_on_startup(monkeypatch, tmp_pat
     two never share a candle.
     """
     use_test_database(monkeypatch, tmp_path)
+    _isolate_gift_book(monkeypatch, tmp_path)
 
     # Pinned open: the decision is held until the first in-session bar, so an
     # unstubbed market_status makes the test depend on the wall clock.
@@ -982,7 +1178,7 @@ def test_engine_exits_an_opposing_paper_position_on_startup(monkeypatch, tmp_pat
         strategy.BEAR, 95.0, previous_signal=strategy.BULL
     )
     captured = []
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine.strategy, "evaluate", lambda *_args: verdict)
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
@@ -1020,12 +1216,12 @@ def test_engine_exits_an_opposing_paper_position_on_startup(monkeypatch, tmp_pat
     assert captured == [], "the opposite side must not open on the exit bar"
 
 
-def test_after_hours_paper_engine_pnl_marks_the_future_not_the_index(monkeypatch, tmp_path) -> None:
+def test_after_hours_paper_engine_pnl_marks_the_future_not_gift(monkeypatch, tmp_path) -> None:
     """The futures book must mark at the future's own price once NSE closes.
 
-    It used to substitute the index level after hours, which made a closed
+    It used to substitute the GIFT Nifty level after hours, which made a closed
     position keep moving on an index that still ticks - the mark disagreed with
-    the LTP the dashboard showed for the very same contract. The index at 95 is
+    the LTP the dashboard showed for the very same contract. GIFT at 95 is
     deliberately far from the future's 110 so the two rules cannot be confused.
     """
     use_test_database(monkeypatch, tmp_path)
@@ -1059,7 +1255,7 @@ def test_after_hours_paper_engine_pnl_marks_the_future_not_the_index(monkeypatch
     manager = OrderManager(client)
     monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: FakeFeed())
+    monkeypatch.setattr(gift_nifty, "get_feed", lambda: FakeFeed())
     monkeypatch.setattr(bot_app, "get_order_manager", lambda: manager)
     monkeypatch.setattr(bot_app, "get_client", lambda: client)
 
@@ -1068,7 +1264,7 @@ def test_after_hours_paper_engine_pnl_marks_the_future_not_the_index(monkeypatch
     position = bot_app._enrich_positions(db.get_open_positions())[0]
     active_positions = bot_app.api_positions(status="open")
 
-    # Marked at the future's 110, not the index's 95.
+    # Marked at the future's 110, not the GIFT index's 95.
     assert position["mark_price"] == 110.0
     assert metrics["prices"]["NIFTY26NOVFUT"] == 110.0
     assert position["unrealized_pnl"] == 650.0
@@ -1132,7 +1328,7 @@ def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_p
     assert result.ok
     assert result.quantity == 65
     # Filled at the *future's* quote (25,000), not the payload's 24,418.5. The
-    # payload price is an index level and booking it wrote the index/future
+    # payload price is a GIFT/index level and booking it wrote the index/future
     # basis into the row as P&L that no trade had produced.
     assert result.price == 25_000.05
     assert flipped.ok
@@ -1144,12 +1340,123 @@ def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_p
     assert "outside market hours" in rejected.reason.lower()
 
 
+def test_feed_connect_is_only_true_after_subscription_succeeds() -> None:
+    class FakeSocket:
+        MODE_LTP = "ltp"
+
+        def subscribe(self, tokens):
+            assert tokens == [123]
+
+        def set_mode(self, mode, tokens):
+            raise RuntimeError("subscription rejected")
+
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 123
+    feed.connected = True
+    feed._handle_connect(FakeSocket(), {})
+
+    status = feed.status()
+    assert not status["connected"]
+    assert "subscription rejected" in status["error"]
+
+
+def test_feed_uses_runtime_client_token(monkeypatch) -> None:
+    received: list[tuple[str, str]] = []
+
+    class FakeTicker:
+        def __init__(self, api_key, access_token, reconnect):
+            received.append((api_key, access_token))
+
+        def connect(self, threaded=False):
+            pass
+
+        def close(self):
+            pass
+
+    client = SimpleNamespace(sdk_ready=True, access_token="fresh-token", api_key="key")
+    monkeypatch.setattr(gift_nifty, "get_client", lambda: client)
+    monkeypatch.setitem(sys.modules, "kiteconnect", SimpleNamespace(KiteTicker=FakeTicker))
+
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 123
+    assert feed.start()
+    assert feed._thread is not None
+    feed._thread.join(timeout=1)
+    assert received == [("key", "fresh-token")]
+
+
+def test_feed_reports_running_when_reactor_is_reused(monkeypatch) -> None:
+    """A restart reuses the running reactor and creates no websocket_thread.
+
+    The SDK only starts its own thread when ``reactor.running`` is False, so on
+    the second connect() a fresh KiteTicker has no ``websocket_thread`` at all
+    and the wrapper thread has already exited. Liveness has to come from the
+    reactor, or the dashboard reports a healthy feed as stopped.
+    """
+    monkeypatch.setattr(gift_nifty, "_reactor_running", lambda: True)
+
+    feed = GiftNiftyFeed("1minute")
+    feed._ticker = SimpleNamespace()  # no websocket_thread, as after a restart
+    feed._thread = None
+    feed.connected = True
+
+    status = feed.status()
+    assert status["running"]
+    assert not status["starting"]
+
+
+def test_feed_reports_stopped_after_explicit_stop(monkeypatch) -> None:
+    """The reactor outlives stop(), so it alone must not imply a live feed."""
+    monkeypatch.setattr(gift_nifty, "_reactor_running", lambda: True)
+
+    feed = GiftNiftyFeed("1minute")
+    feed._ticker = SimpleNamespace()
+    feed.stop()
+
+    status = feed.status()
+    assert not status["running"]
+    assert not status["starting"]
+
+
+def test_feed_reports_stopped_when_reactor_is_down(monkeypatch) -> None:
+    monkeypatch.setattr(gift_nifty, "_reactor_running", lambda: False)
+
+    feed = GiftNiftyFeed("1minute")
+    feed._ticker = SimpleNamespace()
+    feed._thread = None
+
+    assert not feed.status()["running"]
+
+
+def test_reactor_running_is_false_without_twisted(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "twisted.internet", None)
+
+    assert gift_nifty._reactor_running() is False
+
+
 def test_runtime_token_arms_live_configuration(monkeypatch) -> None:
     settings = Settings(api_key="key", api_secret="secret", access_token="")
     monkeypatch.setenv("KITE_ACCESS_TOKEN", "fresh-token")
 
     assert settings.is_live_configured
     assert KiteClient(api_key="").access_token == "fresh-token"
+
+
+def test_startup_uses_valid_token_to_start_feed(monkeypatch) -> None:
+    called: list[str] = []
+    opened: list[str] = []
+    monkeypatch.setattr(bot_app.kite_auth, "token_status", lambda: {"state": "valid", "valid": True})
+    monkeypatch.setattr(
+        bot_app,
+        "_start_gift_feed",
+        lambda: called.append("start") or {"start_requested": True},
+    )
+    monkeypatch.setattr(bot_app.webbrowser, "open", lambda url, new=0: opened.append(url) or True)
+
+    bot_app._connect_kite_on_startup()
+
+    assert called == ["start"]
+    assert opened == []
 
 
 def test_startup_opens_zerodha_login_when_token_is_missing(monkeypatch) -> None:
@@ -1164,6 +1471,12 @@ def test_startup_opens_zerodha_login_when_token_is_missing(monkeypatch) -> None:
         "open",
         lambda url, new=0: opened.append((url, new)) or True,
     )
+    monkeypatch.setattr(
+        bot_app,
+        "_start_gift_feed",
+        lambda: (_ for _ in ()).throw(AssertionError("feed cannot start without a token")),
+    )
+
     bot_app._connect_kite_on_startup()
 
     assert opened == [("https://kite.example/login", 2)]
@@ -1569,17 +1882,19 @@ def test_engine_status_reuses_the_verdict_until_a_new_bar(monkeypatch) -> None:
 
     class FakeFeed:
         seconds = 300
-        key = "NSE:NIFTY 50"
 
         def refresh_history(self, force: bool = False):
             return 0
 
-        def candles(self):
-            return [
-                {"time": f"2026-11-06T22:{minute:02d}:00+05:30", "open": 100.0,
-                 "high": 101.0, "low": 99.0, "close": 100.5}
-                for minute in range(20)
-            ]
+        def candle_snapshot(self):
+            return (
+                [
+                    {"time": f"2026-11-06T22:{minute:02d}:00+05:30", "open": 100.0,
+                     "high": 101.0, "low": 99.0, "close": 100.5}
+                    for minute in range(20)
+                ],
+                False,
+            )
 
         def status(self):
             return {}
@@ -1588,7 +1903,7 @@ def test_engine_status_reuses_the_verdict_until_a_new_bar(monkeypatch) -> None:
         evaluations.append(len(candles))
         return strategy.StrategyVerdict(strategy.NO_SIGNAL, 100.5, values={"psar": 99.0})
 
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: FakeFeed())
+    monkeypatch.setattr(engine, "get_feed", FakeFeed)
     monkeypatch.setattr(engine.strategy, "evaluate", fake_evaluate)
     monkeypatch.setattr(engine, "required_bars", lambda: 2)
     monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False})
@@ -1600,6 +1915,32 @@ def test_engine_status_reuses_the_verdict_until_a_new_bar(monkeypatch) -> None:
 
     # Two slots (current + previous), each evaluated once for the same bar.
     assert len(evaluations) == 2
+
+
+def test_history_fetch_backs_off_after_a_failure(monkeypatch) -> None:
+    attempts: list[int] = []
+
+    class FakeClient:
+        def historical_data(self, **_kwargs):
+            attempts.append(1)
+            return []
+
+    monkeypatch.setattr(gift_nifty, "get_client", lambda: FakeClient())
+    feed = GiftNiftyFeed("5minute")
+    feed.token = 291849
+
+    feed.refresh_history(force=True)
+    assert len(attempts) == 1
+    assert feed._history_failures == 1
+
+    # A non-forced refresh inside the backoff window must not hit the API.
+    feed.refresh_history()
+    assert len(attempts) == 1
+
+    # force=True is an explicit operator action and always retries.
+    feed.refresh_history(force=True)
+    assert len(attempts) == 2
+    assert feed._history_failures == 2
 
 
 def test_failed_quote_is_cached_so_a_dead_token_is_not_retried() -> None:
@@ -1926,8 +2267,120 @@ def test_watchdog_survives_a_failing_webhook() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Execution future ticks (shown beside the signal series on the dashboard)
+# Execution future ticks (shown beside GIFT Nifty on the dashboard)
 # ---------------------------------------------------------------------------
+def test_execution_ticks_do_not_reach_the_gift_candle_builder() -> None:
+    """The two prices differ by the basis, so routing an execution tick into
+    the builder would corrupt the signal series rather than fail loudly."""
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+
+    feed._handle_ticks(None, [
+        {"instrument_token": 222, "last_price": 25060.0},
+    ])
+
+    assert feed.last_price is None
+    assert feed.tick_count == 0
+    assert feed._builder.current is None
+    assert feed.exec_last_price == 25060.0
+    assert feed.exec_ticks == 1
+
+
+def test_gift_and_execution_ticks_are_kept_apart() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+
+    feed._handle_ticks(None, [
+        {"instrument_token": 111, "last_price": 25000.0},
+        {"instrument_token": 222, "last_price": 25060.0},
+        {"instrument_token": 111, "last_price": 25001.0},
+    ])
+
+    assert feed.last_price == 25001.0
+    assert feed.tick_count == 2
+    assert feed.exec_last_price == 25060.0
+    assert feed.exec_ticks == 1
+
+
+def test_a_tick_without_a_token_counts_as_gift() -> None:
+    """Every existing caller and test sends a bare tick, so the default must
+    stay GIFT - the series that must never be disturbed."""
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+
+    feed._handle_ticks(None, [{"last_price": 25000.0}])
+
+    assert feed.last_price == 25000.0
+    assert feed.exec_last_price is None
+
+
+def test_exec_quote_reports_provenance_and_the_basis_inputs() -> None:
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+    feed._handle_ticks(None, [
+        {"instrument_token": 111, "last_price": 25000.0},
+        {"instrument_token": 222, "last_price": 25060.0},
+    ])
+
+    exec_quote = feed.status()["exec"]
+
+    assert exec_quote["symbol"] == "NIFTY26KFUT"
+    assert exec_quote["price"] == 25060.0
+    assert exec_quote["source"] == "tick"
+    assert exec_quote["subscribed"] is True
+    assert exec_quote["ticks"] == 1
+    assert exec_quote["age_seconds"] is not None
+
+
+def test_exec_quote_is_safe_before_any_tick() -> None:
+    feed = GiftNiftyFeed("1minute")
+
+    exec_quote = feed.status()["exec"]
+
+    assert exec_quote["price"] is None
+    assert exec_quote["age_seconds"] is None
+    assert exec_quote["source"] == "none"
+    assert exec_quote["subscribed"] is False
+
+
+def test_unresolved_execution_token_falls_back_to_polling(monkeypatch) -> None:
+    """A future that cannot be resolved must not leave the card blank: the
+    mark loop polls a quote instead of relying on a subscription."""
+    feed = GiftNiftyFeed("1minute")
+    monkeypatch.setattr(feed, "current_exec_symbol", lambda: "NIFTY26KFUT")
+
+    feed.set_exec_token("NIFTY26KFUT", None)
+    assert feed.exec_source == "poll"
+
+    monkeypatch.setattr(
+        gift_nifty, "get_client", lambda: SimpleNamespace(get_ltp=lambda s: 25060.0)
+    )
+    feed.refresh_exec_quote()
+
+    assert feed.exec_last_price == 25060.0
+    assert feed.status()["exec"]["source"] == "poll"
+
+
+def test_tick_source_wins_over_a_later_poll(monkeypatch) -> None:
+    """Once real ticks arrive, a polled quote should not relabel the source."""
+    feed = GiftNiftyFeed("1minute")
+    feed.token = 111
+    feed.set_exec_token("NIFTY26KFUT", 222)
+    feed._handle_ticks(None, [{"instrument_token": 222, "last_price": 25060.0}])
+
+    monkeypatch.setattr(
+        gift_nifty, "get_client", lambda: SimpleNamespace(get_ltp=lambda s: 25061.0)
+    )
+    feed.refresh_exec_quote()
+
+    assert feed.exec_last_price == 25061.0
+    assert feed.status()["exec"]["source"] == "tick"
+
+
 def test_future_symbol_matches_kites_instrument_dump() -> None:
     """Kite's NFO dump uses three-letter months (NIFTY26NOVFUT). The older
     single-letter form (NIFTY26KFUT) matched nothing, so the token could not be
@@ -1956,6 +2409,45 @@ def test_future_symbol_rolls_to_the_next_contract(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # Candle interval isolation
 # ---------------------------------------------------------------------------
+def test_candles_of_different_intervals_do_not_mix(monkeypatch, tmp_path) -> None:
+    """A 5-minute and a 15-minute bucket can both start at 10:00 but cover
+    different windows, so `start` alone cannot separate them. Without the
+    interval column a timeframe change would splice two series together and the
+    indicators would run on garbage."""
+    use_test_database(monkeypatch, tmp_path)
+    start = "2026-11-06T10:00:00+05:30"
+
+    db.record_gift_candle(
+        start=start, open_=100.0, high=102.0, low=99.0, close=101.0, interval="5minute"
+    )
+    db.record_gift_candle(
+        start=start, open_=200.0, high=205.0, low=198.0, close=204.0, interval="15minute"
+    )
+
+    assert [r["close"] for r in db.get_gift_candles(interval="5minute")] == [101.0]
+    assert [r["close"] for r in db.get_gift_candles(interval="15minute")] == [204.0]
+    # Unfiltered still returns everything, which is what the count uses.
+    assert len(db.get_gift_candles()) == 2
+
+
+def test_feed_only_loads_its_own_interval(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    db.record_gift_candle(
+        start="2026-11-06T09:00:00+05:30",
+        open_=100.0, high=101.0, low=99.0, close=100.5, interval="5minute",
+    )
+    db.record_gift_candle(
+        start="2026-11-06T10:00:00+05:30",
+        open_=200.0, high=201.0, low=199.0, close=200.5, interval="15minute",
+    )
+
+    feed = GiftNiftyFeed("15minute")
+    feed.load_persisted()
+
+    times = [c["time"] for c in feed.candles()]
+    assert times == ["2026-11-06T10:00:00+05:30"]
+
+
 def test_default_candle_interval_is_sixty_minutes() -> None:
     """The strategy timeframe is configuration, but the shipped default must
     match the .env.example value so a fresh install is self-consistent.
@@ -1966,11 +2458,11 @@ def test_default_candle_interval_is_sixty_minutes() -> None:
     """
     from config import Settings
 
-    assert Settings().candle_interval == "60minute"
+    assert Settings().gift_candle_interval == "60minute"
 
 
 def test_interval_to_seconds_maps_fifteen_minutes() -> None:
-    from bar_source import interval_to_seconds
+    from gift_nifty import interval_to_seconds
 
     assert interval_to_seconds("15minute") == 900
     assert interval_to_seconds("5minute") == 300
@@ -1981,9 +2473,9 @@ def test_interval_to_seconds_maps_fifteen_minutes() -> None:
 def test_settings_exposes_bar_length_in_seconds() -> None:
     """The staleness limit is derived from the bar length, so the length has to
     be reachable as a number without repeating the interval table."""
-    assert Settings(candle_interval="15minute").candle_interval_seconds == 900
-    assert Settings(candle_interval="5minute").candle_interval_seconds == 300
-    assert Settings(candle_interval="1hour").candle_interval_seconds == 3600
+    assert Settings(gift_candle_interval="15minute").gift_candle_interval_seconds == 900
+    assert Settings(gift_candle_interval="5minute").gift_candle_interval_seconds == 300
+    assert Settings(gift_candle_interval="1hour").gift_candle_interval_seconds == 3600
 
 
 def test_signal_max_age_outlives_the_bar(monkeypatch) -> None:
@@ -1994,7 +2486,7 @@ def test_signal_max_age_outlives_the_bar(monkeypatch) -> None:
 
     def with_bar(seconds: int) -> int:
         monkeypatch.setattr(
-            engine, "settings", SimpleNamespace(candle_interval_seconds=seconds)
+            engine, "settings", SimpleNamespace(gift_candle_interval_seconds=seconds)
         )
         return eng._signal_max_age()
 
@@ -2027,7 +2519,7 @@ def test_engine_payload_carries_the_bar_scaled_max_age(monkeypatch) -> None:
 
     monkeypatch.setattr(
         engine, "settings",
-        SimpleNamespace(candle_interval_seconds=900, default_lots=1),
+        SimpleNamespace(gift_candle_interval_seconds=900, default_lots=1),
     )
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
     monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False, "reason": "Post-market"})
@@ -2427,6 +2919,316 @@ def test_latency_keeps_a_bounded_sample_window(monkeypatch) -> None:
     assert len(kite._latency_samples) == kite_client.LATENCY_SAMPLE_COUNT
 
 
+# ---------------------------------------------------------------------------
+# GIFT Nifty index book
+#
+# The index book exists to answer one question - would trading the signal source
+# have beaten trading the future? - so these tests pin the properties that make
+# the comparison valid: both books act on the same bar, the index is paper-only
+# because it cannot be traded, and the two ledgers stay in separate files.
+# ---------------------------------------------------------------------------
+def _gift_book(monkeypatch, tmp_path, *, enabled=True, units=65):
+    import gift_book
+    import order_manager
+
+    use_test_database(monkeypatch, tmp_path)
+    stub = SimpleNamespace(
+        tick_size=0.05,
+        slippage_ticks=1.0,
+        lot_size=65,
+        gift_book_balance=200_000.0,
+        virtual_balance=1_000_000.0,
+        gift_book_units=units,
+    )
+    monkeypatch.setattr(gift_book, "settings", stub)
+    monkeypatch.setattr(order_manager, "settings", stub)
+    return gift_book.GiftBook(
+        path=str(tmp_path / "gift_book.db"),
+        enabled=enabled,
+        units=units,
+    )
+
+
+def test_gift_book_is_off_by_default(monkeypatch, tmp_path) -> None:
+    """It changes what the UI shows, so it must never switch itself on."""
+    book = _gift_book(monkeypatch, tmp_path, enabled=False)
+
+    assert book.execute("BUY", 25_000.0) is None
+    assert book.positions() == []
+    assert not (tmp_path / "gift_book.db").exists()
+    assert book.status() == {"enabled": False, "configured": False, "symbol": "NSEIX:GIFT NIFTY"}
+
+
+def test_gift_book_trades_the_index_level_not_a_contract(monkeypatch, tmp_path) -> None:
+    book = _gift_book(monkeypatch, tmp_path)
+
+    book.execute("BUY", 25_000.0, detail="2 of 3 ST agreed")
+
+    positions = book.positions()
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "NSEIX:GIFT NIFTY"
+    assert positions[0]["source"] == "GIFT_BOOK"
+    # One tick of slippage on the signal's close, in the adverse direction.
+    assert positions[0]["entry_price"] == 25_000.05
+    assert positions[0]["quantity"] == 65
+
+
+def test_gift_book_flips_like_the_pine_entries(monkeypatch, tmp_path) -> None:
+    """BUY/SELL are target positions, so an opposite signal flips in one step."""
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+
+    book.execute("SELL", 25_100.0)
+
+    assert book.net_units() == -65
+    trades = book.trades()
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "FLIP"
+    assert trades[0]["direction"] == "LONG"
+
+
+def test_gift_book_settles_at_the_signal_close_with_no_quote(monkeypatch, tmp_path) -> None:
+    """The bar's own close prices the fill, so the index book cannot be blocked.
+
+    This is the mechanism that lets it act at 02:00, when the futures book has to
+    defer - the single most important difference between the two books.
+    """
+    book = _gift_book(monkeypatch, tmp_path)
+
+    book.execute("SELL", 24_950.0, bar_at="2026-11-11T02:00:00+05:30")
+
+    assert book.net_units() == -65
+    assert book.trades() == []  # still open
+
+
+def test_gift_book_skips_a_bar_with_no_price(monkeypatch, tmp_path) -> None:
+    """An unpriced signal is recorded, never filled at a guess."""
+    book = _gift_book(monkeypatch, tmp_path)
+
+    assert book.execute("BUY", None) is None
+    assert book.execute("BUY", 0.0) is None
+    assert book.positions() == []
+    status = book.status()
+    assert status["skipped"] == 2
+    assert "no GIFT Nifty price" in status["last_error"]
+
+
+def test_gift_book_repeats_nothing_when_already_positioned(monkeypatch, tmp_path) -> None:
+    """A repeat of the same signal must not stack a second position."""
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+
+    assert book.execute("BUY", 25_050.0) is None
+    assert book.net_units() == 65
+    assert book.status()["fills"] == 1
+
+
+def test_gift_book_flattens_on_a_flat_signal(monkeypatch, tmp_path) -> None:
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+
+    book.execute("FLAT", 25_120.0)
+
+    assert book.net_units() == 0
+    assert book.trades()[0]["exit_reason"] == "FLAT"
+    # 65 units x ~119 points net of two ticks of slippage, less the round-trip
+    # cost stack. At 0.05% sell-side STT the stack is ~970 on this turnover, so
+    # the net lands near 6,823 - below 7,000, which is the statutory cost biting.
+    assert 6_700 < book.trades()[0]["net_pnl"] < 7_000
+
+
+def test_gift_book_keeps_its_own_ledger(monkeypatch, tmp_path) -> None:
+    """The two books must not be able to see or corrupt each other."""
+    book = _gift_book(monkeypatch, tmp_path)
+    db.open_position("NIFTY26NOVFUT", 65, 25_400.0, mode=PAPER, source="ENGINE")
+
+    book.execute("BUY", 25_000.0)
+
+    futures = db.get_open_positions(mode=PAPER)
+    assert [p["symbol"] for p in futures] == ["NIFTY26NOVFUT"]
+    assert [p["symbol"] for p in book.positions()] == ["NSEIX:GIFT NIFTY"]
+    assert db.get_trades() == []
+
+
+def test_gift_book_marks_to_the_index_level(monkeypatch, tmp_path) -> None:
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+
+    book.mark(25_100.0)
+
+    position = book.positions()[0]
+    assert position["last_price"] == 25_100.0
+    assert book.summary()["metrics"]["unrealized_pnl"] > 6_000
+
+
+def test_gift_book_records_a_failure_instead_of_raising(monkeypatch, tmp_path) -> None:
+    """It runs ahead of the futures order, so it can never be allowed to throw."""
+    book = _gift_book(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        db, "open_position", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full"))
+    )
+
+    result = book.execute("BUY", 25_000.0)
+
+    assert result is None
+    assert "disk full" in book.status()["last_error"]
+
+
+def test_gift_book_honours_the_pause_switch(monkeypatch, tmp_path) -> None:
+    """A paused bot must not open index trades either.
+
+    The index book is a separate ledger, so it does not go through the order
+    manager's entry guard. Without its own check, pausing the bot still opened
+    index positions - which is what made a "clean" reset re-enter within seconds.
+    """
+    import order_manager
+
+    book = _gift_book(monkeypatch, tmp_path)
+    manager = order_manager.get_order_manager()
+    manager.pause("RESET: books wiped")
+
+    try:
+        assert book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:30:00+05:30") is None
+        assert book.open_positions() == []
+        # The refusal is recorded, so the trail explains why nothing happened.
+        rows = book.signals()
+        assert rows and rows[0]["accepted"] == 0
+        assert "paused" in rows[0]["reason"]
+    finally:
+        manager.resume()
+
+    # Unpaused, the same call opens the position.
+    assert book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:35:00+05:30") is not None
+    assert len(book.open_positions()) == 1
+
+
+def test_gift_book_still_exits_while_paused(monkeypatch, tmp_path) -> None:
+    """A pause blocks entries, not exits - an open leg must still be closable."""
+    import order_manager
+
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:30:00+05:30")
+
+    manager = order_manager.get_order_manager()
+    manager.pause("RESET: books wiped")
+    try:
+        assert book.execute("FLAT", 25_100.0, bar_at="2026-11-12T21:35:00+05:30") is not None
+        assert book.open_positions() == []
+    finally:
+        manager.resume()
+
+
+def test_gift_book_records_its_own_signal_trail(monkeypatch, tmp_path) -> None:
+    """The index book's decisions must be readable from its own ledger.
+
+    The Orders tab scopes its signal trail to the selected venue, so an index
+    book that traded without recording a signal would render as "no signals"
+    while its order book showed fills - the exact mismatch this fixes.
+    """
+    book = _gift_book(monkeypatch, tmp_path)
+
+    book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:30:00+05:30", detail="test")
+    book.execute("FLAT", 25_100.0, bar_at="2026-11-12T21:35:00+05:30", detail="test")
+
+    rows = book.signals()
+    assert [row["action"] for row in rows] == ["FLAT", "BUY"]
+    assert all(row["accepted"] == 1 for row in rows)
+    # The futures ledger is a different database and must stay untouched.
+    assert db.get_signals() == []
+
+
+def test_gift_book_records_a_refused_signal(monkeypatch, tmp_path) -> None:
+    """A skipped bar is a decision the trail has to explain, not silence."""
+    book = _gift_book(monkeypatch, tmp_path)
+
+    book.execute("BUY", None)
+
+    rows = book.signals()
+    assert len(rows) == 1
+    assert rows[0]["accepted"] == 0
+    assert "no GIFT Nifty price" in rows[0]["reason"]
+
+
+def test_gift_book_does_not_record_a_repeat_as_a_signal(monkeypatch, tmp_path) -> None:
+    """Holding the same position is a no-op, not a new decision."""
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+
+    book.execute("BUY", 25_050.0)
+
+    assert len(book.signals()) == 1
+
+
+def test_gift_signals_endpoint_reads_the_index_ledger(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("SELL", 25_000.0)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+    monkeypatch.setattr(bot_app, "gift_books", lambda: [book])
+
+    payload = TestClient(bot_app.app).get("/api/gift/signals").json()
+
+    assert payload["enabled"] is True
+    assert payload["tradeable"] is False
+    assert payload["count"] == 1
+    assert payload["signals"][0]["action"] == "SELL"
+
+
+def test_gift_signals_endpoint_reports_a_disabled_book(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    import gift_book
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+    monkeypatch.setattr(
+        bot_app,
+        "gift_books",
+        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
+    )
+
+    payload = TestClient(bot_app.app).get("/api/gift/signals").json()
+
+    assert payload["enabled"] is False
+    assert payload["signals"] == []
+
+
+def test_gift_book_endpoints_report_a_disabled_book(monkeypatch, tmp_path) -> None:
+    """Off is a normal state for the UI to render, not a 500."""
+    from fastapi.testclient import TestClient
+
+    import bot as bot_app
+    import gift_book
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+    monkeypatch.setattr(
+        bot_app,
+        "gift_books",
+        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
+    )
+
+    client = TestClient(bot_app.app)
+    for path in ("/api/gift/positions", "/api/gift/trades", "/api/gift/orders"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.json()["tradeable"] is False
+    summary = client.get("/api/gift/summary").json()
+    assert summary["enabled"] is False
+    assert summary["reason"] == "GIFT_BOOK is off"
+
+
+# ---------------------------------------------------------------------------
+# St strategy: one SuperTrend (14x3) AND PSAR, both required
+# ---------------------------------------------------------------------------
+def _rising_candles(count: int = 40) -> list[dict[str, float]]:
+    """A clean uptrend, which an uptrend-following pair should both agree on."""
+    return [
+        {"high": 101.0 + i, "low": 99.0 + i, "close": 100.0 + i}
+        for i in range(count)
+    ]
+
 
 def test_single_supertrend_is_14x3_by_default() -> None:
     """The strategy is one SuperTrend instance, not a 2-of-3 vote."""
@@ -2751,7 +3553,8 @@ def test_engine_status_reports_rollover_before_the_first_loop_tick(monkeypatch, 
     """
     use_test_database(monkeypatch, tmp_path)
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
-    rows = [
+    feed = GiftNiftyFeed("1minute")
+    feed._history = [
         {
             "time": f"2026-11-05T09:{index:02d}:00+05:30",
             "open": 100.0 + index,
@@ -2762,21 +3565,7 @@ def test_engine_status_reports_rollover_before_the_first_loop_tick(monkeypatch, 
         }
         for index in range(15)
     ]
-
-    class FakeSource:
-        seconds = 60
-        key = "NSE:NIFTY 50"
-
-        def refresh_history(self, force=False):
-            return len(rows)
-
-        def candles(self):
-            return list(rows)
-
-        def status(self):
-            return {"symbol": self.key, "bars": len(rows)}
-
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: FakeSource())
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False, "reason": "closed"})
     monkeypatch.setattr(
         engine,
@@ -2868,6 +3657,181 @@ def test_status_exposes_the_contract_expiry_for_the_exec_panel(monkeypatch, tmp_
 # ---------------------------------------------------------------------------
 # Venue-scoped ledger: the Orders and Performance tabs read one book at a time
 # ---------------------------------------------------------------------------
+def test_gift_analytics_reads_its_own_ledger(monkeypatch, tmp_path) -> None:
+    """The index book's statistics must come from its own database. A shared
+    query would silently report futures trades under the index heading."""
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+    book.execute("SELL", 25_100.0)
+
+    analytics = book.analytics()
+
+    assert analytics["summary"]["trades"] == 1
+    assert analytics["summary"]["net_pnl"] > 0
+    # The futures ledger is untouched, so its own analytics stay empty.
+    assert db.get_trade_analytics(mode=PAPER)["summary"]["trades"] == 0
+
+
+def test_gift_analytics_is_empty_when_the_book_is_off(monkeypatch, tmp_path) -> None:
+    book = _gift_book(monkeypatch, tmp_path, enabled=False)
+
+    assert book.analytics() == {}
+
+
+def test_gift_analytics_endpoint_reports_a_disabled_book(monkeypatch, tmp_path) -> None:
+    """Off is a normal state for the UI to render, not a 500."""
+    from fastapi.testclient import TestClient
+
+    import gift_book
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+    monkeypatch.setattr(
+        bot_app,
+        "gift_books",
+        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
+    )
+
+    response = TestClient(bot_app.app).get("/api/gift/analytics")
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    assert response.json()["tradeable"] is False
+
+
+def test_gift_portfolio_matches_the_futures_payload_shape(monkeypatch, tmp_path) -> None:
+    """The Performance tab's tiles are fed from either endpoint, so the two must
+    expose the same keys or the index venue would render em dashes."""
+    from fastapi.testclient import TestClient
+
+    book = _gift_book(monkeypatch, tmp_path)
+    book.execute("BUY", 25_000.0)
+    book.execute("SELL", 25_100.0)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+    monkeypatch.setattr(bot_app, "gift_books", lambda: [book])
+
+    payload = TestClient(bot_app.app).get("/api/gift/portfolio").json()
+
+    for key in ("total_pnl", "total_return_pct", "max_drawdown_pct", "total_trades",
+                "win_rate", "realized_total", "unrealized_pnl", "equity",
+                "initial_balance", "open_position_count"):
+        assert key in payload, key
+    assert payload["total_trades"] == 1
+    assert payload["tradeable"] is False
+    assert payload["mode"] == PAPER
+
+
+def test_gift_portfolio_is_empty_when_the_book_is_off(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    import gift_book
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+    monkeypatch.setattr(
+        bot_app,
+        "gift_books",
+        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
+    )
+
+    payload = TestClient(bot_app.app).get("/api/gift/portfolio").json()
+
+    assert payload["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Rollover execution: a signal inside the window closes the old leg and opens
+# the new contract in one action
+# ---------------------------------------------------------------------------
+class _FrozenDatetime(datetime):
+    """A ``datetime`` whose ``now()`` is pinned, for expiry-boundary tests.
+
+    Only ``now()`` is overridden; construction and arithmetic behave normally, so
+    the module under test can still build and compare real timestamps.
+    """
+
+    _now: Optional[datetime] = None
+
+    @classmethod
+    def now(cls, tz=None):
+        moment = cls._now
+        return moment if tz is None else moment.astimezone(tz)
+
+
+def _pin_clock(monkeypatch, moment: datetime) -> None:
+    """Freeze ``kite_client``'s clock, which is where expiry is decided."""
+    _FrozenDatetime._now = moment
+    monkeypatch.setattr(kite_client, "datetime", _FrozenDatetime)
+
+
+def _pin_signal_clock(monkeypatch, moment: datetime) -> None:
+    """Freeze the clock the *staleness* check reads.
+
+    ``order_manager`` measures a signal's age against ``datetime.now`` in its own
+    module, so pinning ``kite_client`` alone leaves the age computed from the real
+    wall clock. A test that builds bars at a fixed timestamp then drifts into
+    "Stale signal" as the calendar moves away from it.
+    """
+    _FrozenDatetime._now = moment
+    monkeypatch.setattr(order_manager, "datetime", _FrozenDatetime)
+
+
+def _rollover_manager(monkeypatch, tmp_path, *, lot_size=65, now=None):
+    """A manager whose fills always succeed, with no broker access.
+
+    The clock is pinned to ``now`` (default: a quiet day well before the November
+    2026 expiry). The rollover decision itself depends only on which contract is
+    held relative to the front month, but the *entry block* asks whether that
+    contract has stopped trading - which is a question about the current time, so
+    an unpinned clock would make these tests pass or fail by calendar date.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    _pin_clock(monkeypatch, now or datetime(2026, 11, 19, 10, 0, tzinfo=IST))
+    stub = SimpleNamespace(
+        product="NRML",
+        order_type="MARKET",
+        tick_size=0.05,
+        slippage_ticks=1.0,
+        lot_size=lot_size,
+        default_lots=1,
+        max_open_lots=4,
+        lot_margin=150_000.0,
+        virtual_balance=1_000_000.0,
+    )
+    monkeypatch.setattr(order_manager, "settings", stub)
+
+    class FakeClient:
+        mode = PAPER
+
+        def __init__(self):
+            self.orders = []
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_000.0
+
+        def place_order(self, **kwargs):
+            self.orders.append(kwargs)
+            return {
+                "order_id": f"o{len(self.orders)}",
+                "status": "COMPLETE",
+                "filled_quantity": kwargs["quantity"],
+                "average_price": kwargs["price"],
+            }
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "test"
+
+        def auth_status(self):
+            return {"authenticated": True}
+
+    client = FakeClient()
+    return OrderManager(client), client
+
+
 def test_a_flip_inside_the_window_rolls_the_position_to_the_new_contract(
     monkeypatch, tmp_path
 ) -> None:
@@ -2945,6 +3909,34 @@ def test_a_position_in_a_later_month_is_refused_as_double_exposure(
     assert client.orders == []
     # Nothing was closed: the refusal happens before any order is placed.
     assert [p["symbol"] for p in db.get_open_positions(mode=PAPER)] == ["NIFTY27JANFUT"]
+
+
+def test_rollover_does_not_touch_the_gift_index_book(monkeypatch, tmp_path) -> None:
+    """The index book shares the position table's shape but is a different
+    instrument in a different database. A rollover must never close it."""
+    import gift_book
+
+    manager, client = _rollover_manager(monkeypatch, tmp_path)
+    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
+    monkeypatch.setattr(
+        gift_book,
+        "settings",
+        SimpleNamespace(
+            tick_size=0.05, slippage_ticks=1.0, lot_size=65,
+            gift_book_balance=200_000.0, virtual_balance=1_000_000.0, gift_book_units=65,
+        ),
+    )
+    book.execute("BUY", 25_000.0)
+    db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
+
+    # A SELL against a long November position is a flip, so the rollover path
+    # runs - which is the case where the index book could be wrongly swept up.
+    result = manager._execute_directional({}, "SELL", "NIFTY26DECFUT", PAPER, "test", strategy_id=db.DEFAULT_STRATEGY_ID)
+
+    assert result.ok, result.reason
+    # The index book is untouched: still long, still open.
+    assert [p["symbol"] for p in book.positions()] == ["NSEIX:GIFT NIFTY"]
+    assert book.net_units() == 65
 
 
 def test_rollover_is_refused_when_the_old_leg_cannot_be_closed(monkeypatch, tmp_path) -> None:
@@ -3369,110 +4361,16 @@ def test_live_flip_inside_the_window_rolls_the_position(monkeypatch, tmp_path) -
 # risk is set, so that is the worst signal to lose.
 #
 # The rule is decided on the first bar that closes in-session. With 15-minute
-# bars that is the 09:00 candle, which closes at exactly 09:15 (the NSE
+# GIFT bars that is the 09:00 candle, which closes at exactly 09:15 (the NSE
 # open), so the decision is the morning's own state rather than the overnight one.
 # ---------------------------------------------------------------------------
 
 
-class _FrozenDatetime(datetime):
-    """A ``datetime`` whose ``now()`` is pinned, for expiry-boundary tests.
-
-    Only ``now()`` is overridden; construction and arithmetic behave normally, so
-    the module under test can still build and compare real timestamps.
-    """
-
-    _now: Optional[datetime] = None
-
-    @classmethod
-    def now(cls, tz=None):
-        moment = cls._now
-        return moment if tz is None else moment.astimezone(tz)
-
-
-def _pin_clock(monkeypatch, moment: datetime) -> None:
-    """Freeze ``kite_client``'s clock, which is where expiry is decided."""
-    _FrozenDatetime._now = moment
-    monkeypatch.setattr(kite_client, "datetime", _FrozenDatetime)
-
-
-def _pin_signal_clock(monkeypatch, moment: datetime) -> None:
-    """Freeze the clock the *staleness* check reads.
-
-    ``order_manager`` measures a signal's age against ``datetime.now`` in its own
-    module, so pinning ``kite_client`` alone leaves the age computed from the real
-    wall clock. A test that builds bars at a fixed timestamp then drifts into
-    "Stale signal" as the calendar moves away from it.
-    """
-    _FrozenDatetime._now = moment
-    monkeypatch.setattr(order_manager, "datetime", _FrozenDatetime)
-
-
-def _rollover_manager(monkeypatch, tmp_path, *, lot_size=65, now=None):
-    """A manager whose fills always succeed, with no broker access.
-
-    The clock is pinned to ``now`` (default: a quiet day well before the November
-    2026 expiry). The rollover decision itself depends only on which contract is
-    held relative to the front month, but the *entry block* asks whether that
-    contract has stopped trading - which is a question about the current time, so
-    an unpinned clock would make these tests pass or fail by calendar date.
-    """
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    _pin_clock(monkeypatch, now or datetime(2026, 11, 19, 10, 0, tzinfo=IST))
-    stub = SimpleNamespace(
-        product="NRML",
-        order_type="MARKET",
-        tick_size=0.05,
-        slippage_ticks=1.0,
-        lot_size=lot_size,
-        default_lots=1,
-        max_open_lots=4,
-        lot_margin=150_000.0,
-        virtual_balance=1_000_000.0,
-    )
-    monkeypatch.setattr(order_manager, "settings", stub)
-
-    class FakeClient:
-        mode = PAPER
-
-        def __init__(self):
-            self.orders = []
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_000.0
-
-        def place_order(self, **kwargs):
-            self.orders.append(kwargs)
-            return {
-                "order_id": f"o{len(self.orders)}",
-                "status": "COMPLETE",
-                "filled_quantity": kwargs["quantity"],
-                "average_price": kwargs["price"],
-            }
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "test"
-
-        def auth_status(self):
-            return {"authenticated": True}
-
-    client = FakeClient()
-    return OrderManager(client), client
-
-
-
-def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER, source=None):
+def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER):
     """An engine whose session, broker and executor are all stubbed.
 
     The fake broker tracks its own net quantity so the LIVE reconciliation guard
     sees a coherent book rather than a static one that disagrees after each fill.
-
-    ``source`` is the bar source the engine should build. It has to be supplied
-    here rather than patched afterwards: the engine resolves its source when it
-    is constructed, so a later patch would arrive too late.
     """
     use_test_database(monkeypatch, tmp_path)
     _client_mode = mode
@@ -3489,7 +4387,7 @@ def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER, source=None):
     monkeypatch.setattr(
         engine, "strategy_configs",
         lambda: [config.StrategyConfig(
-            index=1, id="Surikbs", source="nifty", interval="60minute",
+            index=1, id="Surikbs", source="gift", interval="60minute",
             exit="flip", lots=1, enabled=True, name="",
         )],
     )
@@ -3560,15 +4458,13 @@ def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER, source=None):
     client._load_instruments = lambda: raw_instruments
     monkeypatch.setattr(engine, "get_order_manager", lambda: manager)
     monkeypatch.setattr(order_manager, "get_order_manager", lambda: manager)
-    if source is not None:
-        monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: source)
     return engine.StrategyEngine(), manager, client
 
 
 def test_the_0900_candle_is_the_one_that_closes_in_session() -> None:
     """Pin the bar boundary the whole feature is specified against.
 
-    15-minute bars bucket on :00/:15/:30/:45, and the NSE opens at 09:15, so
+    15-minute GIFT bars bucket on :00/:15/:30/:45, and the NSE opens at 09:15, so
     the 09:00 candle closes exactly at the open. The 08:45 candle closes at 09:00
     and is still pre-open - using it would decide on the overnight state.
     """
@@ -3777,10 +4673,11 @@ def test_evaluate_now_closes_an_opposing_overnight_leg_without_reversing(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BEAR
 
@@ -3837,10 +4734,11 @@ def test_evaluate_now_holds_the_position_when_the_morning_bar_agrees(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.NO_SIGNAL
 
@@ -3861,7 +4759,7 @@ def test_evaluate_now_enters_when_the_signal_arrived_while_the_market_was_shut(
 ) -> None:
     """A signal that closed out of session must still enter on the next open.
 
-    This is the case the state-based entry exists for. The index trades ~6
+    This is the case the state-based entry exists for. GIFT Nifty trades ~20
     hours, so a BULL that turns up after the NSE close is deferred - no order is
     placed - while the bar still advances the previous verdict. Under a
     transition-gated entry every later BULL bar looked like "no signal change",
@@ -3922,10 +4820,11 @@ def test_evaluate_now_enters_when_the_signal_arrived_while_the_market_was_shut(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4009,10 +4908,11 @@ def test_evaluate_now_does_not_re_enter_while_already_positioned(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4035,6 +4935,12 @@ def _fresh_signal_env(monkeypatch, tmp_path, verdicts, bars=None):
     executor's staleness check measures a one-bar-old signal rather than a
     calendar-old one.
     """
+    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
+    _pin_signal_clock(monkeypatch, datetime(2026, 11, 16, 9, 15, tzinfo=IST))
+    monkeypatch.setattr(
+        engine, "market_status",
+        lambda: {"is_open": True, "reason": "Market open"},
+    )
     rows = bars or [
         {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-16T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
@@ -4056,15 +4962,11 @@ def _fresh_signal_env(monkeypatch, tmp_path, verdicts, bars=None):
             return rows[: self.n]
 
     feed = FakeFeed()
-    eng, manager, client = _overnight_env(monkeypatch, tmp_path, source=feed)
-    _pin_signal_clock(monkeypatch, datetime(2026, 11, 16, 9, 15, tzinfo=IST))
-    monkeypatch.setattr(
-        engine, "market_status",
-        lambda: {"is_open": True, "reason": "Market open"},
-    )
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(script))
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     return eng, feed, client
 
@@ -4095,6 +4997,7 @@ def test_each_run_reports_the_close_its_own_verdict_used(monkeypatch, tmp_path) 
     """
     import bar_source
 
+    _isolate_gift_book(monkeypatch, tmp_path)
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
         _verdict(strategy.BEAR, strategy.BULL, close=25_000.0),
         _verdict(strategy.BEAR, strategy.BULL, close=25_500.0),
@@ -4113,7 +5016,7 @@ def test_each_run_reports_the_close_its_own_verdict_used(monkeypatch, tmp_path) 
         def status(self):
             return {"bars": 1}
 
-    # The source's status() delegates to its client, so the stub needs one.
+    # GiftBarSource.status() delegates to the feed, so the stub needs one.
     monkeypatch.setattr(feed, "status", lambda: {"bars": feed.n}, raising=False)
 
     other = engine.StrategyRun("other-book", OtherSource(), params={}, lots=1)
@@ -4136,6 +5039,7 @@ def test_status_reports_the_close_the_verdict_was_computed_on(monkeypatch, tmp_p
     operator cannot tell whether the next bar is likely to keep the verdict. The
     close is the third number that makes the other two mean something.
     """
+    _isolate_gift_book(monkeypatch, tmp_path)
     # status() recomputes the verdict for the dashboard, so the script needs an
     # entry for that pass as well as for the evaluation.
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
@@ -4162,12 +5066,13 @@ def test_the_hero_warmup_counters_belong_to_the_active_run(monkeypatch, tmp_path
     """A second strategy must not overwrite the hero panel's bar count.
 
     ``self.state.warmup_have`` was written by every run, so the last strategy to
-    evaluate won. With one book on 63 bars and another on 310, the hero
-    showed "310 closed" beside the other book's signal - a bar count from a different book
+    evaluate won. With a GIFT book on 63 bars and a NIFTY book on 310, the hero
+    showed "310 closed" beside a GIFT signal - a bar count from a different book
     than the signal it sat next to.
     """
     import bar_source
 
+    _isolate_gift_book(monkeypatch, tmp_path)
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
         _verdict(strategy.BULL, strategy.NO_SIGNAL),
         _verdict(strategy.BULL, strategy.BULL),
@@ -4202,6 +5107,50 @@ def test_the_hero_warmup_counters_belong_to_the_active_run(monkeypatch, tmp_path
     assert eng.state.warmup_have == active_bars, (
         "a non-active run overwrote the hero panel's bar count"
     )
+
+
+def test_only_a_gift_signalled_run_settles_the_gift_index_book(
+    monkeypatch, tmp_path
+) -> None:
+    """The GIFT index book is priced on GIFT Nifty, so only GIFT may settle it.
+
+    ``_settle_gift_book`` used to be called from ``evaluate_run`` with no check on
+    which strategy was running. Once a second strategy existed, every run settled
+    the same book: a NIFTY-signalled strategy would drive a GIFT-priced ledger,
+    and two runs would each read the other's position as their own.
+    """
+    import bar_source
+    import gift_book
+
+    _isolate_gift_book(monkeypatch, tmp_path)
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
+        _verdict(strategy.BULL, strategy.NO_SIGNAL),
+    ])
+    # _fresh_signal_env stubs settlement out so the order tests stay focused.
+    # Put the real method back: the guard is what is under test here.
+    monkeypatch.setattr(
+        eng, "_settle_gift_book",
+        engine.StrategyEngine._settle_gift_book.__get__(eng),
+    )
+
+    book = gift_book.get_gift_book()
+    before = len(book.positions())
+
+    # A NIFTY-signalled run must not touch the GIFT-priced book.
+    nifty_run = engine.StrategyRun(
+        "nifty-book", bar_source.NiftyBarSource(), params={}, lots=1
+    )
+    eng._settle_gift_book("BUY", _verdict(strategy.BULL, strategy.NO_SIGNAL),
+                          "2026-11-16T09:30:00+05:30", nifty_run)
+    assert len(book.positions()) == before, "a NIFTY run settled the GIFT book"
+
+    # The GIFT-signalled run still does.
+    gift_run = engine.StrategyRun(
+        "gift-book", bar_source.GiftBarSource(feed), params={}, lots=1
+    )
+    eng._settle_gift_book("BUY", _verdict(strategy.BULL, strategy.NO_SIGNAL),
+                          "2026-11-16T09:30:00+05:30", gift_run)
+    assert len(book.positions()) == before + 1, "the GIFT run did not settle its book"
 
 
 def test_a_flip_exit_reverses_on_the_same_bar(monkeypatch, tmp_path) -> None:
@@ -4299,6 +5248,7 @@ def test_the_owed_entry_survives_a_restart(monkeypatch, tmp_path) -> None:
     db.close_position(db.get_open_positions(mode=PAPER)[0]["id"], 25_000.0)
 
     restarted = engine.StrategyEngine()
+    monkeypatch.setattr(restarted, "_settle_gift_book", lambda *a, **k: None)
     restarted._last_bar_at = "seed"
 
     feed.n = 2
@@ -4613,10 +5563,11 @@ def test_evaluate_now_holds_through_a_disagreeing_bar(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4670,10 +5621,11 @@ def test_strategy_exit_flat_restores_the_disagreeing_bar_exit(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {"exit": "flat"})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4734,10 +5686,11 @@ def test_a_run_of_opposite_bars_exits_only_once(monkeypatch, tmp_path) -> None:
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4796,10 +5749,11 @@ def test_evaluate_now_flips_a_paper_position_on_the_opposite_verdict(
             return bars[: self.n]
 
     feed = FakeFeed()
-    monkeypatch.setattr(engine, "NiftyBarSource", lambda *a, **k: feed)
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BEAR
 
@@ -4812,6 +5766,162 @@ def test_evaluate_now_flips_a_paper_position_on_the_opposite_verdict(
 
     assert result["action"] == "SELL"
     assert db.get_open_positions(mode=PAPER)[0]["position_key"] == -1
+
+
+def test_evaluate_now_drives_the_gift_index_book_after_hours(
+    monkeypatch, tmp_path
+) -> None:
+    """The index book must act on the same bars whatever the NSE session is.
+
+    GIFT Nifty trades ~20 hours while NSE F&O trades 6 h 15 m, so gating the index
+    book on the 09:15 open would make it react to the *overnight* verdict while
+    the futures book waited for the morning's - the two venues would disagree on
+    when they acted, which is the one thing that comparison exists not to do. A
+    bar with no signal must leave the index book alone: there is no neutral exit,
+    so its position is carried until the opposite pair confirms or its stop trips.
+    """
+    import gift_book
+
+    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
+    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
+    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
+
+    # After hours: the futures decision is held, the index book is not.
+    monkeypatch.setattr(
+        engine, "market_status",
+        lambda: {"is_open": False, "reason": "Post-market - closed at 15:30 IST"},
+    )
+    bars = [
+        {"time": "2026-11-16T15:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T16:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T16:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+    ]
+    # BULL is a transition on the first bar, then the state persists; the third
+    # bar flips the pair into BEAR, which is the exit - a disagreeing bar before
+    # it is carried, because NO_SIGNAL is not an exit.
+    verdicts = iter([
+        SimpleNamespace(signal=strategy.BULL, previous_signal=strategy.NO_SIGNAL,
+                        opposite=False, flat=False,
+                        fresh=True, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+        SimpleNamespace(signal=strategy.NO_SIGNAL, previous_signal=strategy.BULL,
+                        opposite=False, flat=True,
+                        fresh=False, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.NO_SIGNAL,
+                        opposite=False, flat=False,
+                        fresh=True, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+    ])
+
+    class FakeFeed:
+        seconds = 900
+
+        def __init__(self):
+            self.n = 0
+
+        def refresh_history(self):
+            return None
+
+        def candles(self):
+            return bars[: self.n]
+
+    feed = FakeFeed()
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(engine, "strategy_params", lambda: {})
+    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    eng._last_bar_at = "seed"
+    eng._last_signal = strategy.NO_SIGNAL
+
+    feed.n = 1
+    opened = eng.evaluate_now()
+    assert opened["action"] is None
+    assert opened["gift_book"]["action"] == "BUY"
+    assert book.net_units() == 65
+    # The futures book did nothing: it is out of session.
+    assert client.orders == []
+
+    # The pair merely disagrees: the book keeps its long. There is no neutral
+    # exit, so a NO_SIGNAL bar is carried exactly as the futures leg carries it.
+    feed.n = 2
+    held = eng.evaluate_now()
+    assert held["gift_book"] is None
+    assert book.net_units() == 65
+
+    # The pair confirms the other way: the book flips, still without the futures
+    # book, which is out of session.
+    feed.n = 3
+    flipped = eng.evaluate_now()
+    assert flipped["gift_book"]["action"] == "SELL"
+    assert book.net_units() == -65
+    assert client.orders == []
+
+
+def test_evaluate_now_drives_the_gift_index_book_in_live(monkeypatch, tmp_path) -> None:
+    """LIVE must not change the index book's behavior - it is paper in every mode.
+
+    GIFT Nifty has no tradeable contract, so the mode the futures book is in has
+    no bearing on the index book: it follows the same verdict either way.
+    """
+    import gift_book
+
+    eng, manager, client = _overnight_env(monkeypatch, tmp_path, mode=LIVE)
+    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
+    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
+
+    monkeypatch.setattr(
+        engine, "market_status",
+        lambda: {"is_open": True, "reason": "Market open"},
+    )
+    bars = [
+        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+    ]
+    verdicts = iter([
+        SimpleNamespace(signal=strategy.BULL, previous_signal=strategy.NO_SIGNAL,
+                        opposite=False,
+                        flat=False,
+                        fresh=True, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.BULL,
+                        opposite=True,
+                        flat=False,
+                        fresh=True, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+    ])
+
+    class FakeFeed:
+        seconds = 900
+
+        def __init__(self):
+            self.n = 0
+
+        def refresh_history(self):
+            return None
+
+        def candles(self):
+            return bars[: self.n]
+
+    feed = FakeFeed()
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(engine, "strategy_params", lambda: {})
+    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    eng._last_bar_at = "seed"
+    eng._last_signal = strategy.NO_SIGNAL
+
+    feed.n = 1
+    entered = eng.evaluate_now()
+    assert entered["gift_book"]["action"] == "BUY"
+    assert book.net_units() == 65
+
+    # The pair flips, so the book flattens - the exit rule is the same in LIVE as
+    # in PAPER, because the index book is paper in every mode.
+    feed.n = 2
+    exited = eng.evaluate_now()
+    assert exited["gift_book"]["action"] == "SELL"
+    assert book.net_units() == -65
 
 
 def test_a_book_may_not_open_against_another_books_position(monkeypatch, tmp_path) -> None:
@@ -4828,7 +5938,7 @@ def test_a_book_may_not_open_against_another_books_position(monkeypatch, tmp_pat
     portfolio.reset_aggregator()
 
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
 
     aggregator = portfolio.PortfolioAggregator(max_lots=4)
     verdict = aggregator.authorise(
@@ -4837,7 +5947,7 @@ def test_a_book_may_not_open_against_another_books_position(monkeypatch, tmp_pat
 
     assert verdict.allowed is False
     assert "opposing" in verdict.reason
-    assert "nifty-flip long" in verdict.reason
+    assert "gift-flip long" in verdict.reason
     # The same side is fine: adding to a direction is netting, not cancelling.
     assert aggregator.authorise(
         "nifty-adx", "BUY", "NIFTY26NOVFUT", 1, lot_size=65, mode=PAPER,
@@ -4854,14 +5964,14 @@ def test_exits_are_never_blocked_by_the_portfolio(monkeypatch, tmp_path) -> None
 
     use_test_database(monkeypatch, tmp_path)
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
     db.open_position("NIFTY26NOVFUT", -65, 25_000.0, mode=PAPER,
                      source="ENGINE", strategy_id="nifty-adx")
 
     aggregator = portfolio.PortfolioAggregator(max_lots=4)
     for action in ("FLAT", "PANIC"):
         assert aggregator.authorise(
-            "nifty-flip", action, "NIFTY26NOVFUT", 1, lot_size=65, mode=PAPER,
+            "gift-flip", action, "NIFTY26NOVFUT", 1, lot_size=65, mode=PAPER,
         ).allowed is True
 
 
@@ -4875,7 +5985,7 @@ def test_combined_lots_stay_inside_the_portfolio_budget(monkeypatch, tmp_path) -
 
     use_test_database(monkeypatch, tmp_path)
     db.open_position("NIFTY26NOVFUT", 65 * 3, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
 
     aggregator = portfolio.PortfolioAggregator(max_lots=4)
     # 3 lots held + 2 more would be 5, over the budget of 4.
@@ -4903,13 +6013,13 @@ def test_exposure_reports_each_book_and_the_netted_reality(monkeypatch, tmp_path
 
     use_test_database(monkeypatch, tmp_path)
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
                      source="ENGINE", strategy_id="nifty-adx")
 
     view = portfolio.PortfolioAggregator(max_lots=4).exposure(PAPER)
 
-    assert {r["strategy_id"] for r in view["strategies"]} == {"nifty-flip", "nifty-adx"}
+    assert {r["strategy_id"] for r in view["strategies"]} == {"gift-flip", "nifty-adx"}
     assert view["netted"]["NIFTY26NOVFUT"] == 130
     assert view["gross_units"] == 130
     # Both books hold the same contract, which the dashboard must be able to flag.
@@ -4925,6 +6035,7 @@ def test_every_run_reports_its_own_state(monkeypatch, tmp_path) -> None:
     broken.
     """
     use_test_database(monkeypatch, tmp_path)
+    _isolate_gift_book(monkeypatch, tmp_path)
 
     import bar_source
     import strategy_run
@@ -5166,9 +6277,9 @@ def test_one_configured_strategy_is_the_default(monkeypatch) -> None:
 
     assert len(configs) == 1
     first = configs[0]
-    assert first.source == "nifty"
+    assert first.source == "gift"
     assert first.exit == "flip"
-    assert first.interval == config.Settings().candle_interval
+    assert first.interval == config.Settings().gift_candle_interval
     assert first.enabled is True
     # Filters are off unless asked for.
     assert first.filter_adx == 0.0
@@ -5250,30 +6361,30 @@ def test_two_runs_do_not_share_an_owed_entry(monkeypatch, tmp_path) -> None:
 
     use_test_database(monkeypatch, tmp_path)
 
-    first = strategy_run.StrategyRun("nifty-flip", bar_source.NiftyBarSource())
+    gift = strategy_run.StrategyRun("gift-flip", bar_source.GiftBarSource())
     nifty = strategy_run.StrategyRun("nifty-adx", bar_source.NiftyBarSource())
 
-    assert first.pending_key != nifty.pending_key
+    assert gift.pending_key != nifty.pending_key
 
-    first.set_pending_signal(strategy.BULL, "2026-11-16T09:15:00")
+    gift.set_pending_signal(strategy.BULL, "2026-11-16T09:15:00")
     nifty.set_pending_signal(strategy.BEAR, "2026-11-16T10:15:00")
 
     stored = db.get_settings()
-    assert stored[first.pending_key] == strategy.BULL
+    assert stored[gift.pending_key] == strategy.BULL
     assert stored[nifty.pending_key] == strategy.BEAR
 
     # A fresh process resumes each book's own intent, not the other's.
-    fresh = strategy_run.StrategyRun("nifty-flip", bar_source.NiftyBarSource())
+    fresh_gift = strategy_run.StrategyRun("gift-flip", bar_source.GiftBarSource())
     fresh_nifty = strategy_run.StrategyRun("nifty-adx", bar_source.NiftyBarSource())
-    fresh.load_pending_signal()
+    fresh_gift.load_pending_signal()
     fresh_nifty.load_pending_signal()
 
-    assert fresh.pending_signal == strategy.BULL
+    assert fresh_gift.pending_signal == strategy.BULL
     assert fresh_nifty.pending_signal == strategy.BEAR
 
     # Clearing one leaves the other's debt intact.
-    first.set_pending_signal(None)
-    assert db.get_settings().get(first.pending_key) is None
+    gift.set_pending_signal(None)
+    assert db.get_settings().get(gift.pending_key) is None
     assert db.get_settings()[nifty.pending_key] == strategy.BEAR
 
 
@@ -5294,7 +6405,7 @@ def test_a_second_strategy_does_not_inherit_a_legacy_latch(monkeypatch, tmp_path
         }
     )
 
-    legacy = strategy_run.StrategyRun(db.DEFAULT_STRATEGY_ID, bar_source.NiftyBarSource())
+    legacy = strategy_run.StrategyRun(db.DEFAULT_STRATEGY_ID, bar_source.GiftBarSource())
     legacy.load_pending_signal()
     assert legacy.pending_signal == strategy.BULL, "the original book keeps its debt"
 
@@ -5415,9 +6526,10 @@ def test_a_failed_nifty_refresh_keeps_the_previous_series(monkeypatch) -> None:
     assert src.status()["error"]
 
 
-def test_the_source_satisfies_the_protocol() -> None:
+def test_both_sources_satisfy_the_protocol() -> None:
     import bar_source
 
+    assert isinstance(bar_source.GiftBarSource(), bar_source.BarSource)
     assert isinstance(bar_source.NiftyBarSource(), bar_source.BarSource)
 
 
@@ -5432,7 +6544,7 @@ def test_one_strategy_exit_cannot_close_anothers_position(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
 
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
     db.open_position("NIFTY26NOVFUT", -65, 25_000.0, mode=PAPER,
                      source="ENGINE", strategy_id="nifty-adx")
 
@@ -5443,10 +6555,10 @@ def test_one_strategy_exit_cannot_close_anothers_position(monkeypatch, tmp_path)
     ))
 
     # A scoped square-off closes only that book's row.
-    result = manager.square_off("SIGNAL_FLIP", mode=PAPER, strategy_id="nifty-flip")
+    result = manager.square_off("SIGNAL_FLIP", mode=PAPER, strategy_id="gift-flip")
 
     assert result.ok
-    assert db.get_open_positions(mode=PAPER, strategy_id="nifty-flip") == []
+    assert db.get_open_positions(mode=PAPER, strategy_id="gift-flip") == []
     remaining = db.get_open_positions(mode=PAPER, strategy_id="nifty-adx")
     assert [p["position_key"] for p in remaining] == [-1], (
         "the other strategy's short must survive this book's exit"
@@ -5464,13 +6576,13 @@ def test_netting_does_not_read_the_other_strategys_leg(monkeypatch, tmp_path) ->
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
 
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
     db.open_position("NIFTY26NOVFUT", -65, 25_000.0, mode=PAPER,
                      source="ENGINE", strategy_id="nifty-adx")
 
     manager = order_manager.OrderManager(client=SimpleNamespace())
 
-    assert manager._current_net_lots("NIFTY26NOVFUT", PAPER, 65, "nifty-flip") == 1
+    assert manager._current_net_lots("NIFTY26NOVFUT", PAPER, 65, "gift-flip") == 1
     assert manager._current_net_lots("NIFTY26NOVFUT", PAPER, 65, "nifty-adx") == -1
     # Unscoped is the portfolio net, which is genuinely flat here - and is only
     # ever the right answer for a portfolio-wide view, never for an entry.
@@ -5487,7 +6599,7 @@ def test_panic_closes_every_strategy(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
 
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
     db.open_position("NIFTY26NOVFUT", -65, 25_000.0, mode=PAPER,
                      source="ENGINE", strategy_id="nifty-adx")
 
@@ -5621,24 +6733,174 @@ def test_two_strategies_positions_are_isolated(monkeypatch, tmp_path) -> None:
     use_test_database(monkeypatch, tmp_path)
 
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER,
-                     source="ENGINE", strategy_id="nifty-flip")
+                     source="ENGINE", strategy_id="gift-flip")
     db.open_position("NIFTY26NOVFUT", -65, 25_000.0, mode=PAPER,
                      source="ENGINE", strategy_id="nifty-adx")
 
     assert [p["position_key"] for p in
-            db.get_open_positions(mode=PAPER, strategy_id="nifty-flip")] == [1]
+            db.get_open_positions(mode=PAPER, strategy_id="gift-flip")] == [1]
     assert [p["position_key"] for p in
             db.get_open_positions(mode=PAPER, strategy_id="nifty-adx")] == [-1]
     # Unscoped is the whole portfolio, and must still see both.
     assert len(db.get_open_positions(mode=PAPER)) == 2
 
 
-def test_after_hours_paper_entry_books_the_future_price_not_the_index_close(
+def test_both_books_reverse_on_the_same_flip(monkeypatch, tmp_path) -> None:
+    """PAPER must trade both venues, and both must reverse on the flip.
+
+    The two books are the whole point of PAPER mode: GIFT Nifty signals, GIFT
+    Nifty fills in the index book *and* futures fills in the paper futures book,
+    settled on the same bar. A reversal that happened in only one of them would
+    make the comparison meaningless from the first flip onwards.
+    """
+    import gift_book
+
+    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
+    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
+    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
+    _pin_signal_clock(monkeypatch, datetime(2026, 11, 16, 9, 15, tzinfo=IST))
+    monkeypatch.setattr(
+        engine, "market_status", lambda: {"is_open": True, "reason": "Market open"}
+    )
+    bars = [
+        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+    ]
+    verdicts = iter([
+        SimpleNamespace(signal=strategy.BULL, previous_signal=strategy.NO_SIGNAL,
+                        opposite=False, flat=False, fresh=True, detail="test",
+                        bars=100, conditions={}, values={}, close=25_000.0),
+        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.BULL,
+                        opposite=True, flat=False, fresh=True, detail="test",
+                        bars=100, conditions={}, values={}, close=25_100.0),
+    ])
+
+    class FakeFeed:
+        seconds = 3600
+
+        def __init__(self):
+            self.n = 0
+
+        def refresh_history(self):
+            return None
+
+        def candles(self):
+            return bars[: self.n]
+
+    feed = FakeFeed()
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(engine, "strategy_params", lambda: {"exit": "flip"})
+    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    eng._last_bar_at = "seed"
+    eng._last_signal = strategy.NO_SIGNAL
+
+    feed.n = 1
+    opened = eng.evaluate_now()
+    assert opened["gift_book"]["action"] == "BUY"
+    assert book.net_units() == 65
+
+    feed.n = 2
+    flipped = eng.evaluate_now()
+
+    # Both venues took the flip on the same bar, in opposite directions.
+    assert flipped["action"] == "SELL"
+    assert flipped["gift_book"]["action"] == "SELL"
+    assert book.net_units() == -65
+    assert [p["position_key"] for p in db.get_open_positions(mode=PAPER)] == [-1]
+
+
+def test_overnight_reconcile_also_settles_the_gift_index_book(
+    monkeypatch, tmp_path
+) -> None:
+    """The overnight path must settle the index book too, not only the futures.
+
+    The two venues keep their own hours, so on the pre-open bar the index book
+    takes the flip immediately while the futures leg waits for the morning's
+    in-session bar. The point of the test is that the *futures* reconcile does not
+    swallow the index book's settle: both ledgers end the morning on the verdict,
+    and neither is left a bar behind.
+    """
+    import gift_book
+
+    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
+    db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
+    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
+    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
+    book.execute("BUY", 25_000.0)
+
+    state = {"open": False}
+    monkeypatch.setattr(
+        engine, "market_status",
+        lambda: {"is_open": state["open"], "reason": "Pre-market"},
+    )
+    bars = [
+        {"time": "2026-11-16T08:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+    ]
+    # The pre-open bar merely disagrees, which is not an exit and not an entry:
+    # both books hold and the futures leg is deferred to the morning's own bar.
+    # That bar then opens the short, which closes the long overnight leg.
+    verdicts = iter([
+        SimpleNamespace(signal=strategy.NO_SIGNAL, previous_signal=strategy.BULL,
+                        opposite=False,
+                        flat=True,
+                        fresh=False, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.NO_SIGNAL,
+                        opposite=False,
+                        flat=False,
+                        fresh=True, detail="test", bars=100, conditions={},
+                        values={}, close=25_000.0),
+    ])
+
+    class FakeFeed:
+        seconds = 900
+
+        def __init__(self):
+            self.n = 0
+
+        def refresh_history(self):
+            return None
+
+        def candles(self):
+            return bars[: self.n]
+
+    feed = FakeFeed()
+    monkeypatch.setattr(engine, "get_feed", lambda: feed)
+    monkeypatch.setattr(engine, "required_bars", lambda: 1)
+    monkeypatch.setattr(engine, "strategy_params", lambda: {})
+    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
+    eng._last_bar_at = "seed"
+    eng._last_signal = strategy.BEAR
+
+    # Pre-open: nothing moves. The index book has no exit to take, and the
+    # futures leg is deferred to the first in-session close.
+    feed.n = 1
+    pre_open = eng.evaluate_now()
+    assert eng._overnight_pending is True
+    assert pre_open["gift_book"] is None
+    assert book.net_units() == 65
+    assert db.get_open_positions(mode=PAPER)[0]["position_key"] == 1
+
+    # The 09:00 bar closes in-session and confirms BEAR. The reconcile flips the
+    # wrong long to the short; the index book opens the same side on the same bar,
+    # on its own hours. Neither ledger is left a bar behind.
+    state["open"] = True
+    feed.n = 2
+    result = eng.evaluate_now()
+
+    assert result["action"] == "SELL"
+    assert book.net_units() == -65
+    assert db.get_open_positions(mode=PAPER)[0]["position_key"] == -1
+
+
+def test_after_hours_paper_entry_books_the_future_price_not_the_gift_close(
     monkeypatch, tmp_path
 ) -> None:
     """The row must not open holding the index/future basis.
 
-    Reproduces the reported symptom: a long opened from an index close and marked
+    Reproduces the reported symptom: a long opened from a GIFT close and marked
     at the future's LTP showed a loss equal to the basis, with no trade behind it.
     Filling and marking from one instrument is what removes it.
     """
@@ -5657,7 +6919,7 @@ def test_after_hours_paper_entry_books_the_future_price_not_the_index_close(
         ),
     )
 
-    # The index close (25,293) and the future's LTP (25,235) differ by the basis.
+    # The GIFT close (25,293) and the future's LTP (25,235) differ by the basis.
     class FakeClient:
         mode = PAPER
 
@@ -5691,7 +6953,7 @@ def test_after_hours_paper_entry_books_the_future_price_not_the_index_close(
         "symbol": "NIFTY26NOVFUT",
         "qty_lots": 1,
         "paper_after_hours": True,
-        "price": 25_293.0,   # an index close supplied by a caller
+        "price": 25_293.0,   # a GIFT close supplied by a caller
     }
     result = manager.process_signal(payload, source="ENGINE")
 
@@ -5709,7 +6971,7 @@ def test_after_hours_paper_entry_books_the_future_price_not_the_index_close(
 
 
 def test_after_hours_fill_is_impossible_without_a_future_quote(monkeypatch, tmp_path) -> None:
-    """Fail closed: no future price means no fill, not an index fill.
+    """Fail closed: no future price means no fill, not a GIFT-index fill.
 
     Booking at the index was the old fallback, and it is what put basis into the
     position. Refusing is the honest outcome - a paper entry at a price the
@@ -5749,7 +7011,7 @@ def test_after_hours_fill_is_impossible_without_a_future_quote(monkeypatch, tmp_
             "action": "BUY",
             "symbol": "NIFTY26NOVFUT",
             "qty_lots": 1,
-            "price": 25_293.0,          # an index close must not rescue this
+            "price": 25_293.0,          # a GIFT close must not rescue this
             "paper_after_hours": True,
             "signal_id": "no-quote-after-hours",
         },
@@ -5767,7 +7029,7 @@ def test_after_hours_fill_is_impossible_without_a_future_quote(monkeypatch, tmp_
 # PAPER mocks orders but not market data. A real market order walks the book, so
 # the paper futures leg fills at the bid/ask touch (volume-weighted across
 # levels) and falls back to the old adverse-tick approximation only when the
-# quote has no depth.
+# quote has no depth. The GIFT index book is unaffected: an index has no order
 # book and fills at the completed bar's close.
 # ---------------------------------------------------------------------------
 def test_fill_walks_the_book_from_the_touch(monkeypatch) -> None:
@@ -5937,7 +7199,7 @@ def test_paper_entry_keeps_old_behaviour_without_depth(monkeypatch, tmp_path) ->
 # Degenerate-bar guards
 #
 # A bar seeded from Kite's still-forming row carries only the OHLC of its first
-# tick. Closed as-is it prices as a flat line, and the book filled an entry
+# tick. Closed as-is it prices as a flat line, and the GIFT book filled an entry
 # 84 points above the market off exactly that (LONG @ 25399.05 against a true
 # close of 25315.5). These pin every layer that must refuse such a bar.
 # ---------------------------------------------------------------------------
@@ -5951,13 +7213,83 @@ def test_is_degenerate_rejects_a_flat_bar() -> None:
     assert fill.is_degenerate(None, 1.0, 2.0, 3.0) is True
 
 
+def test_a_still_forming_kite_row_is_not_treated_as_closed() -> None:
+    """Kite stamps bars at an offset, so a floored start can still be forming.
+
+    The 16:01->16:06 bucket is stamped 16:01 and floors to 16:00, which matches
+    ``bucket_start(now)`` at 16:05 and used to be emitted as a closed bar holding
+    only its first tick's OHLC.
+    """
+    import gift_nifty
+
+    stamp = datetime(2026, 11, 12, 16, 1, tzinfo=gift_nifty.IST)
+    now = datetime(2026, 11, 12, 16, 5, tzinfo=gift_nifty.IST)
+    assert stamp + timedelta(seconds=300) > now
+
+    closed_now = now + timedelta(minutes=2)
+    assert stamp + timedelta(seconds=300) <= closed_now
+
+
+def test_merge_forming_keeps_the_true_range_and_tick_count() -> None:
+    """Merging must not throw away the high/low the tick feed already saw."""
+    import gift_nifty
+
+    start = datetime(2026, 11, 12, 16, 0, tzinfo=gift_nifty.IST)
+    live = gift_nifty.Candle(
+        start=start, open=25_310.0, high=25_320.0, low=25_300.0, close=25_315.0, ticks=140
+    )
+    snapshot = gift_nifty.Candle(
+        start=start, open=25_310.0, high=25_399.0, low=25_296.0, close=25_315.5
+    )
+
+    merged = gift_nifty._merge_forming(live, snapshot)
+
+    assert merged.high == 25_399.0
+    assert merged.low == 25_296.0
+    assert merged.close == 25_315.5
+    assert merged.ticks == 140, "the tick count must survive so the bar still counts"
+
+
+def test_merge_forming_prefers_the_snapshot_for_a_bucket_it_never_saw() -> None:
+    """A bucket the feed joined mid-way is replaced, not merged across starts."""
+    import gift_nifty
+
+    start = datetime(2026, 11, 12, 16, 0, tzinfo=gift_nifty.IST)
+    other = datetime(2026, 11, 12, 15, 55, tzinfo=gift_nifty.IST)
+    live = gift_nifty.Candle(
+        start=other, open=1.0, high=2.0, low=0.5, close=1.5, ticks=9
+    )
+    snapshot = gift_nifty.Candle(
+        start=start, open=25_310.0, high=25_320.0, low=25_300.0, close=25_315.0
+    )
+
+    merged = gift_nifty._merge_forming(live, snapshot)
+
+    assert merged is snapshot
+
+
+def test_a_tick_starved_bar_is_marked_partial_when_stored() -> None:
+    """A bar that closed with no tick of its own must not enter the series."""
+    import gift_nifty
+
+    builder = gift_nifty.CandleBuilder(seconds=300)
+    flat = gift_nifty.Candle(
+        start=datetime(2026, 11, 12, 16, 0, tzinfo=gift_nifty.IST),
+        open=25_399.0, high=25_399.0, low=25_399.0, close=25_399.0, ticks=0,
+    )
+
+    builder._store(flat)
+
+    assert builder.closed[-1].partial == gift_nifty.PARTIAL_GAP
+
+
 def test_a_close_exactly_on_the_psar_votes_sell_rather_than_abstaining() -> None:
     """A tie on the SAR must not silently abstain from the vote.
 
     ``buy_psar`` was ``close > psar`` and ``sell_psar`` was ``close < psar``, so a
     bar closing exactly *on* the SAR satisfied neither and the PSAR rule abstained
     while SuperTrend was confirming - 1 of 2 -> NEUTRAL. PSAR's two-bar clamp can
-    pin the SAR precisely to the close, so this is reachable on real data: a
+    pin the SAR precisely to the close, so this is reachable on real data: a GIFT
     bar closed at 25279.00 with the SAR at 25279.00 and the bot stood aside on an
     otherwise confirmed short.
     """
@@ -6086,20 +7418,17 @@ def test_status_does_not_fetch_history_on_the_poll_path(monkeypatch) -> None:
     calls = []
 
     class FakeFeed:
-        seconds = 3600
-        key = "NSE:NIFTY 50"
-
         def refresh_history(self, force: bool = False):
             calls.append(force)
             return 0
 
-        def candles(self):
-            return []
+        def candle_snapshot(self):
+            return [], False
 
         def status(self):
             return {}
 
-    monkeypatch.setattr(engine_mod, "NiftyBarSource", lambda *a, **k: FakeFeed())
+    monkeypatch.setattr(engine_mod, "get_feed", lambda: FakeFeed())
     monkeypatch.setattr(engine_mod, "market_status", lambda: {"is_open": False})
     monkeypatch.setattr(engine_mod, "get_execution_mode", lambda: "PAPER")
 
@@ -6126,11 +7455,19 @@ def test_mark_loop_marks_without_placing_orders(monkeypatch) -> None:
             order.append("risk")
             return None
 
+    class FakeFeed:
+        def refresh_exec_quote(self):
+            order.append("quote")
+
+        def status(self):
+            return {"price": 25_000.0}
+
     class FakeManager:
         def price_map(self):
             order.append("mark")
             return {"NIFTY26NOVFUT": 25_000.0}
 
+    monkeypatch.setattr(bot_mod, "get_feed", lambda: FakeFeed())
     monkeypatch.setattr(bot_mod, "get_order_manager", lambda: FakeManager())
     monkeypatch.setattr(bot_mod, "get_engine", lambda: FakeEngine())
     monkeypatch.setattr(bot_mod, "get_execution_mode", lambda: "PAPER")
@@ -6503,6 +7840,41 @@ def test_a_position_closed_by_another_check_is_not_reported_as_a_failure(monkeyp
         raise AssertionError("expected the second close to report already-closed")
 
 
+def test_the_gift_index_book_alerts_on_its_own_open_and_close(monkeypatch) -> None:
+    """The index book is a separate ledger, so its fills are their own events.
+
+    Without this the only notifications were for the futures book, and an index
+    exit went unseen - which is exactly what happened when the GIFT book stopped
+    out at 10:03 and no alert arrived.
+    """
+    import gift_book
+    import notifier
+
+    sent: list[dict] = []
+    monkeypatch.setattr(notifier, "configured", lambda: True)
+    monkeypatch.setattr(notifier, "send", lambda payload, timeout=8.0: sent.append(payload) or True)
+
+    gift_book._book_alert("GIFT_TRADE_OPENED", "BUY 65 units @ 25374.55", severity="info")
+    gift_book._book_alert("GIFT_TRADE_CLOSED", "closed 1 position at 25403.45", severity="warning")
+
+    assert [p["kind"] for p in sent] == ["GIFT_TRADE_OPENED", "GIFT_TRADE_CLOSED"]
+    assert all(p["symbol"] == "NSEIX:GIFT NIFTY" for p in sent)
+
+
+def test_a_gift_book_alert_never_raises_when_the_channel_is_broken(monkeypatch) -> None:
+    """A notification must never be able to break the index book."""
+    import gift_book
+    import notifier
+
+    monkeypatch.setattr(notifier, "configured", lambda: True)
+
+    def boom(payload, timeout=8.0):
+        raise RuntimeError("telegram is down")
+
+    monkeypatch.setattr(notifier, "send", boom)
+    gift_book._book_alert("GIFT_TRADE_CLOSED", "closed 1 position")
+
+
 def test_a_token_written_by_the_login_flow_beats_the_deployment_spec(monkeypatch, tmp_path) -> None:
     """A browser login must survive a restart, not revert to the spec value.
 
@@ -6850,7 +8222,7 @@ def test_live_readiness_checks_the_strategy_not_just_the_process(monkeypatch) ->
     monkeypatch.setattr(
         bot_app, "get_engine",
         lambda: SimpleNamespace(status=lambda: {"strategies": [
-            {"id": "nifty-flip", "state": {"ready": False, "last_error": None}},
+            {"id": "gift-flip", "state": {"ready": False, "last_error": None}},
         ]}),
     )
 
@@ -6869,7 +8241,7 @@ def test_live_readiness_passes_when_a_book_is_evaluating(monkeypatch) -> None:
     monkeypatch.setattr(
         bot_app, "get_engine",
         lambda: SimpleNamespace(status=lambda: {"strategies": [
-            {"id": "nifty-flip", "state": {"ready": True, "last_error": None}},
+            {"id": "gift-flip", "state": {"ready": True, "last_error": None}},
         ]}),
     )
 
@@ -6892,7 +8264,7 @@ def test_live_readiness_blocks_on_a_strategy_error(monkeypatch) -> None:
     monkeypatch.setattr(
         bot_app, "get_engine",
         lambda: SimpleNamespace(status=lambda: {"strategies": [
-            {"id": "nifty-flip", "state": {"ready": True, "last_error": "boom"}},
+            {"id": "gift-flip", "state": {"ready": True, "last_error": "boom"}},
         ]}),
     )
 
@@ -7088,28 +8460,29 @@ def test_the_alert_toggle_is_reachable_and_persists(monkeypatch, tmp_path) -> No
 
 
 def _book(live: bool, strategy_id: str = "book"):
-    from bar_source import NiftyBarSource
+    from bar_source import GiftBarSource
     from strategy_run import StrategyRun
 
-    return StrategyRun(strategy_id, NiftyBarSource(), live=live)
+    return StrategyRun(strategy_id, GiftBarSource(None), live=live)
 
 
-def test_a_book_that_did_not_opt_in_stays_paper_when_the_bot_goes_live() -> None:
-    """The bot's switch is the master control; the book's flag is its consent.
+def test_each_book_has_its_own_mode_independent_of_the_other() -> None:
+    """Each strategy's LIVE/PAPER switch is its own.
 
-    Both directions matter. A book flagged live must still simulate while the bot
-    is in PAPER - the flag is not a bypass. And a book that did not opt in must
-    keep its paper ledger when the bot is armed, which is what lets one book
-    book keep running unchanged beside a live NIFTY book.
+    The two books are independent: one can be live while the other stays paper,
+    and neither switch moves the other. A book that has not opted in stays paper,
+    which is the safe default - an unset flag must never be what puts real money
+    on a signal.
     """
     from config import LIVE, PAPER
 
     paper_book = _book(live=False)
     live_book = _book(live=True)
 
+    assert paper_book.mode() == PAPER
+    assert live_book.mode() == LIVE
+    # The global mode no longer overrides a book's own choice.
     assert paper_book.mode(PAPER) == PAPER
-    assert live_book.mode(PAPER) == PAPER, "a per-book flag must not bypass PAPER"
-    assert paper_book.mode(LIVE) == PAPER, "no consent, no real orders"
     assert live_book.mode(LIVE) == LIVE
 
 
@@ -7120,10 +8493,10 @@ def test_the_default_for_a_book_is_paper() -> None:
     without thinking about the flag would otherwise trade live the moment the bot
     was armed, on a rule nobody had considered funding.
     """
-    from bar_source import NiftyBarSource
+    from bar_source import GiftBarSource
     from strategy_run import StrategyRun
 
-    run = StrategyRun("new-book", NiftyBarSource())
+    run = StrategyRun("new-book", GiftBarSource(None))
 
     assert run.live is False
     assert run.status()["live"] is False
@@ -7139,7 +8512,7 @@ def test_each_book_reports_its_own_mode(monkeypatch) -> None:
     # mode through config, so that is the module to patch.
     monkeypatch.setattr(config, "get_execution_mode", lambda: LIVE)
 
-    paper_book = _book(live=False, strategy_id="nifty-flip")
+    paper_book = _book(live=False, strategy_id="gift-flip")
     live_book = _book(live=True, strategy_id="nifty-flip")
 
     assert paper_book.status()["mode"] == "PAPER"
@@ -7337,7 +8710,7 @@ def test_a_mode_switch_resets_every_book_not_just_the_first(monkeypatch, tmp_pat
 def test_the_pre_open_reconcile_flag_is_per_book(monkeypatch, tmp_path) -> None:
     """One book's pre-open bar must not arm the other book's reconcile.
 
-    The flag was a single engine field, so a pre-open bar in one series
+    The flag was a single engine field, so a pre-open bar in the GIFT series
     armed a reconcile for the NIFTY book as well - which would then decide the
     morning on a leg it does not hold.
     """
@@ -7448,7 +8821,7 @@ def test_a_configured_book_with_no_account_row_still_shows_an_equity(
     """Every configured book must appear in `accounts`, not just the ones with rows.
 
     A fresh database holds one legacy row keyed by the old default id ("Surikbs").
-    With two books configured, neither id had a row, so both bands
+    With gift-flip / nifty-flip configured, neither id had a row, so both bands
     rendered a blank equity - which reads as a broken book rather than one that
     has simply not traded yet. Reading the account seeds it.
     """
@@ -7458,18 +8831,18 @@ def test_a_configured_book_with_no_account_row_still_shows_an_equity(
     monkeypatch.setattr(
         config, "strategy_configs",
         lambda: [
-            SimpleNamespace(id="nifty-flip"),
+            SimpleNamespace(id="gift-flip"),
             SimpleNamespace(id="nifty-flip"),
         ],
     )
     # Only the legacy row exists, exactly as in a freshly migrated database.
-    assert "nifty-flip" not in db.get_accounts()
+    assert "gift-flip" not in db.get_accounts()
 
-    accounts = bot_app._strategy_accounts({"nifty-flip": PAPER, "nifty-flip": PAPER})
+    accounts = bot_app._strategy_accounts({"gift-flip": PAPER, "nifty-flip": PAPER})
 
-    assert "nifty-flip" in accounts, "the band has no account to render"
+    assert "gift-flip" in accounts, "the band has no account to render"
     assert "nifty-flip" in accounts
-    assert accounts["nifty-flip"]["equity"] is not None
+    assert accounts["gift-flip"]["equity"] is not None
 
 
 def test_a_switched_off_channel_is_not_reported_as_unconfigured(
@@ -7512,12 +8885,99 @@ def test_a_switched_off_channel_is_not_reported_as_unconfigured(
     assert state["channel_ready"] is False
 
 
+def test_a_gift_books_configured_interval_is_honoured() -> None:
+    """A GIFT book must read the timeframe it was configured for.
+
+    `build_bar_source_for` dropped `cfg.interval` for GIFT sources, so
+    STRATEGY_<n>_INTERVAL silently did nothing: every GIFT book read the one
+    global feed's bars whatever it asked for. A 15-minute GIFT twin would have
+    reported 60-minute on the dashboard and evaluated a series it was not
+    configured to read.
+    """
+    from config import StrategyConfig, build_bar_source_for
+    from bar_source import GiftBarSource
+
+    class FakeFeed:
+        interval = "60minute"
+        seconds = 3600
+
+        def __init__(self):
+            self.asked = []
+
+        def candles(self):
+            return [{"time": "primary"}]
+
+        def ensure_interval(self, interval):
+            self.asked.append(interval)
+
+        def interval_candles(self, interval=None):
+            if interval in (None, "60minute"):
+                return [{"time": "primary"}]
+            return [{"time": "15m", "interval": interval}]
+
+    feed = FakeFeed()
+    cfg = StrategyConfig(
+        index=3, id="gift-15m", source="gift", interval="15minute",
+    )
+
+    src = build_bar_source_for(cfg, gift_feed=feed)
+
+    assert isinstance(src, GiftBarSource)
+    assert src.seconds == 900, "the configured interval must set the bar length"
+    # The feed is asked to build it, and the book reads that series.
+    assert feed.asked == ["15minute"]
+    assert src.candles() == [{"time": "15m", "interval": "15minute"}]
+
+
+def test_one_feed_builds_two_timeframes_from_the_same_ticks() -> None:
+    """The websocket cannot be opened twice, so the feed aggregates both.
+
+    Twisted's reactor is process-global and one-shot: a second GIFT book cannot
+    create its own ticker. Building the extra timeframe in the same feed is what
+    makes two GIFT intervals possible at all.
+    """
+    from datetime import datetime, timedelta
+    from gift_nifty import GiftNiftyFeed, interval_to_seconds
+    from database import IST
+
+    feed = GiftNiftyFeed("60minute")
+    feed.ensure_interval("15minute")
+    feed.ensure_interval("15minute")  # idempotent - polled every evaluation
+
+    assert set(feed._extra_builders) == {"15minute"}
+
+    # Four ticks inside one 15-minute bucket but spread across it.
+    base = datetime(2026, 11, 19, 10, 0, tzinfo=IST)
+    for minute, price in ((0, 100.0), (4, 104.0), (9, 98.0), (14, 101.0)):
+        moment = base + timedelta(minutes=minute)
+        feed._builder.add_tick(price, moment, volume=1.0)
+        for builder in feed._extra_builders.values():
+            builder.on_close = lambda bar, _i="15minute": feed._on_extra_close(_i, bar)
+            builder.add_tick(price, moment, volume=1.0)
+
+    # A tick in the next bucket closes both timeframes' current bar.
+    later = base + timedelta(minutes=15)
+    feed._builder.add_tick(105.0, later, volume=1.0)
+    for builder in feed._extra_builders.values():
+        builder.add_tick(105.0, later, volume=1.0)
+
+    fifteen = feed.interval_candles("15minute")
+    assert len(fifteen) == 1, "one 15-minute bar should have closed"
+    bar = fifteen[0]
+    assert bar["open"] == 100.0
+    assert bar["high"] == 104.0
+    assert bar["low"] == 98.0
+    assert bar["close"] == 101.0
+    # The 60-minute series is still inside its first bar, so nothing closed there.
+    assert feed.candles() == []
+
+
 def test_the_tiles_are_grouped_by_instrument() -> None:
     """One column, ordered by timeframe inside it.
 
-    Every book now reads NIFTY 50 and trades the Nifty future, so there is one
-    instrument column and the row order inside it carries the like-for-like
-    comparison between timeframes.
+    Both strategies execute on the NIFTY future, so there is one instrument
+    column; the row order inside it carries the like-for-like comparison between
+    the 15m and 60m books.
     """
     from pathlib import Path
 
@@ -7525,7 +8985,7 @@ def test_the_tiles_are_grouped_by_instrument() -> None:
     js = (root / "app.js").read_text(encoding="utf-8")
 
     assert "key: 'nifty', title: 'NIFTY 50'" in js
-    assert "key: 'gift'" not in js
+    assert "key: 'gift', title: 'GIFT Nifty'" not in js
     assert ".sort((a, b) => (a.seconds || 0) - (b.seconds || 0))" in js
 
     # A tile must not still be built from the old boxed sections.
@@ -7556,6 +9016,83 @@ def test_a_tile_shows_its_numbers_without_a_labels_column() -> None:
     # The mode that the money figure came from stays on the tile: it is the one
     # label that changes what the number means.
     assert "book-band-mode" in js
+
+
+def test_a_reconnect_keeps_the_books_configured_interval(monkeypatch) -> None:
+    """Replacing the feed must not reset the book to the feed's own timeframe.
+
+    `evaluate_run` rebuilds the source when the process feed has been replaced -
+    a reconnect does exactly that - and rebuilt it without the interval. A
+    15-minute GIFT book silently became 60-minute on the first reconnect: its
+    `seconds` went back to the feed's, so it evaluated and reported the wrong
+    series for the rest of the process's life. The dashboard showed it as a 60m
+    book because it had become one.
+    """
+    import gift_nifty
+    import engine as engine_module
+
+    # The book's interval is configuration, so the test has to state it. It used
+    # to rely on the developer's own bot/.env setting STRATEGY_1_INTERVAL=15minute,
+    # which passed locally and failed in CI (where .env is not committed) with
+    # "60minute != 15minute" - reporting a reconnect bug that was not there.
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_INTERVAL", "15minute")
+
+    first = gift_nifty.GiftNiftyFeed("60minute")
+    monkeypatch.setattr(engine_module, "get_feed", lambda: first)
+    eng = engine_module.StrategyEngine()
+    run = eng.runs[0]
+
+    # The book is configured for 15 minutes on a 60-minute feed.
+    assert run.source.interval == "15minute"
+    assert run.source.seconds == 900
+
+    # A reconnect swaps the process feed.
+    second = gift_nifty.GiftNiftyFeed("60minute")
+    monkeypatch.setattr(engine_module, "get_feed", lambda: second)
+    monkeypatch.setattr(run.source, "refresh_history", lambda force=False: 0)
+    monkeypatch.setattr(run.source, "candles", lambda: [])
+    eng.evaluate_run(run)
+
+    assert run.source.feed is second, "the run must follow the new feed"
+    assert run.source.interval == "15minute", (
+        "the rebuild dropped the configured interval, so the book silently "
+        "reverted to the feed's own timeframe"
+    )
+    assert run.source.seconds == 900
+
+
+def test_a_second_timeframe_is_seeded_when_it_is_registered(monkeypatch) -> None:
+    """A timeframe registered after a refresh must not wait for the next one.
+
+    The primary history refresh is throttled to HISTORY_REFRESH_SECONDS and
+    returns early inside the throttle, so a book whose timeframe was registered
+    just after one had already run got no history at all: its series stayed empty
+    and the dashboard reported "warming up" while the ticks were being aggregated
+    correctly. Reproduced against a live feed - a 15-minute GIFT book read 0 bars
+    where its 60-minute twin read 64.
+    """
+    import gift_nifty
+    from datetime import datetime, timedelta
+    from database import IST
+
+    feed = gift_nifty.GiftNiftyFeed("60minute")
+    now = datetime.now(IST)
+    rows = [
+        {"date": now - timedelta(minutes=15 * n),
+         "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5}
+        for n in range(40, 0, -1)
+    ]
+    monkeypatch.setattr(feed, "token", 12345)
+    monkeypatch.setattr(gift_nifty, "get_client", lambda: SimpleNamespace(
+        historical_data=lambda **kw: rows,
+    ))
+
+    feed.ensure_interval("15minute")
+
+    seeded = feed.interval_candles("15minute")
+    assert seeded, "registering a timeframe must seed it, not leave it empty"
+    assert len(seeded) > 1
 
 
 def test_pausing_one_book_leaves_the_others_trading(monkeypatch, tmp_path) -> None:
@@ -7612,7 +9149,7 @@ def test_an_entry_is_scoped_to_the_book_that_sent_it(monkeypatch, tmp_path) -> N
     nobody had configured: the configured book looked flat while that default id
     accumulated its legs, and the second entry was then rejected as "already
     positioned at -1 lots" against the first book's fill. On the live bot this
-    read as "why was the trade rejected" - nothing was wrong with the signal.
+    read as "why was the GIFT trade rejected" - nothing was wrong with the signal.
     """
     import inspect
 
@@ -7674,7 +9211,7 @@ def test_a_portfolio_refusal_does_not_raise_on_an_undefined_name() -> None:
         "`detail` is not defined in evaluate_run; the record_signal call will "
         "raise NameError the first time it runs"
     )
-    assert "db.record_signal(" in source
+    assert 'f"GIFT {verdict.detail}"' in source
 
 
 # ---------------------------------------------------------------------------
@@ -7686,6 +9223,378 @@ def test_a_portfolio_refusal_does_not_raise_on_an_undefined_name() -> None:
 # silent: a strategy configured for the index alone still traded the future,
 # which looks like a working bot trading an instrument nobody asked for.
 # ---------------------------------------------------------------------------
+def test_legs_are_parsed_and_deduplicated(monkeypatch) -> None:
+    """A repeated leg must not double the position size."""
+    import config
+
+    assert config._parse_legs("") == ()
+    assert config._parse_legs("gift") == ("gift",)
+    assert config._parse_legs("GIFT, futures") == ("gift", "futures")
+    assert config._parse_legs("futures,futures") == ("futures",)
+    # An unknown leg is a startup error, not a silently dropped order.
+    try:
+        config._parse_legs("gift,options")
+    except ValueError as exc:
+        assert "options" in str(exc)
+    else:  # pragma: no cover - the assertion above is the test
+        raise AssertionError("an unknown leg was accepted")
+
+
+def test_unset_legs_default_to_what_that_source_used_to_do(monkeypatch) -> None:
+    """The historical default differs by source, so one shared default is wrong.
+
+    A GIFT-sourced book has always settled the paper index book *and* placed the
+    futures order. A NIFTY-sourced one never had an index leg. Defaulting both to
+    futures alone would silently switch off an existing deployment's GIFT book on
+    upgrade - a change nobody asked for and nothing would report.
+    """
+    import config
+
+    gift = config.StrategyConfig(index=1, id="a", source="gift", interval="15minute")
+    nifty = config.StrategyConfig(index=2, id="b", source="nifty", interval="60minute")
+    explicit = config.StrategyConfig(
+        index=3, id="c", source="gift", interval="60minute", legs=("gift",)
+    )
+
+    assert gift.resolved_legs == ("gift", "futures")
+    assert nifty.resolved_legs == ("futures",)
+    assert explicit.resolved_legs == ("gift",)
+    # Reported to the dashboard, so the tile can draw a row per leg.
+    assert gift.to_dict()["legs"] == ["gift", "futures"]
+    assert nifty.to_dict()["legs"] == ["futures"]
+
+
+def test_a_gift_only_book_places_no_futures_order(monkeypatch, tmp_path) -> None:
+    """``LEGS=gift`` means the index leg and nothing else.
+
+    Without the guard the leg list was parsed, reported, and then ignored: the
+    book settled its index ledger *and* placed a futures order, so a strategy the
+    operator had confined to a paper index was trading a real contract.
+    """
+    import bar_source
+
+    _isolate_gift_book(monkeypatch, tmp_path)
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
+        _verdict(strategy.BULL, strategy.NO_SIGNAL),
+    ])
+    gift_only = engine.StrategyRun(
+        "gift-only", bar_source.GiftBarSource(feed), params={"exit": "flip"}, lots=1,
+        legs=("gift",),
+    )
+    eng.runs = [gift_only]
+
+    before = len(db.get_open_positions(mode=PAPER, strategy_id="gift-only"))
+    feed.n = 1
+    result = eng.evaluate_run(gift_only)
+
+    assert result["action"] == "BUY"
+    assert len(db.get_open_positions(mode=PAPER, strategy_id="gift-only")) == before, (
+        "a gift-only book placed a futures order"
+    )
+
+
+def test_a_two_leg_book_places_the_futures_order_and_settles_the_index(monkeypatch, tmp_path) -> None:
+    """The two legs are independent: one filling does not stand in for the other."""
+    import bar_source
+    import gift_book
+
+    _isolate_gift_book(monkeypatch, tmp_path)
+    book = gift_book.get_gift_book()
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
+        _verdict(strategy.BULL, strategy.NO_SIGNAL),
+    ])
+    monkeypatch.setattr(
+        eng, "_settle_gift_book",
+        engine.StrategyEngine._settle_gift_book.__get__(eng),
+    )
+    both = engine.StrategyRun(
+        "both-legs", bar_source.GiftBarSource(feed), params={"exit": "flip"}, lots=1,
+        legs=("gift", "futures"),
+    )
+    eng.runs = [both]
+
+    feed.n = 1
+    result = eng.evaluate_run(both)
+
+    assert result["action"] == "BUY"
+    # The futures leg is on the ledger...
+    assert len(db.get_open_positions(mode=PAPER, strategy_id="both-legs")) == 1
+    # ...and the index leg is on its own, priced on the index.
+    assert book.net_units() == 65
+
+
+def test_the_index_ledger_is_scoped_to_the_strategy_that_owns_it(monkeypatch, tmp_path) -> None:
+    """Two GIFT-sourced strategies are two books, not two views of one.
+
+    A single process-wide book let the 15-minute strategy read the 60-minute
+    strategy's position as its own, close it, and report P&L that belonged to
+    neither - which looks like a strategy closing trades it never opened.
+    """
+    import gift_book
+
+    monkeypatch.setattr(
+        gift_book, "settings",
+        SimpleNamespace(
+            gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
+            gift_book_units=65, gift_book_balance=200_000.0,
+            tick_size=0.05, slippage_ticks=1.0, lot_size=65,
+        ),
+    )
+    gift_book.reset_gift_books()
+    try:
+        fast = gift_book.get_gift_book("gift-15m")
+        slow = gift_book.get_gift_book("gift-60m")
+
+        assert fast is not slow
+        assert fast.strategy_id == "gift-15m"
+        # Separate files, so one cannot even read the other's rows.
+        assert fast.path != slow.path
+
+        fast.execute("BUY", 25_000.0)
+        assert fast.net_units() == 65
+        assert slow.net_units() == 0, "one strategy's book read another's position"
+    finally:
+        gift_book.reset_gift_books()
+
+
+def test_a_paused_book_also_holds_its_index_leg(monkeypatch, tmp_path) -> None:
+    """The pause is one operator decision, not one per venue.
+
+    The index book read the global switch only, so a book paused from its own
+    tile kept opening index trades - the pause looked applied on the futures leg
+    and ignored on the other.
+    """
+    import order_manager
+
+    book = _gift_book(monkeypatch, tmp_path)
+    book.strategy_id = "gift-15m"
+    monkeypatch.setattr(
+        order_manager, "get_order_manager",
+        lambda: SimpleNamespace(book_paused=lambda sid: sid == "gift-15m"),
+    )
+
+    assert book.execute("BUY", 25_000.0) is None
+    assert book.net_units() == 0
+
+
+def test_the_dashboard_draws_one_card_per_execution_leg() -> None:
+    """A two-leg strategy is two positions, and each must get its own card.
+
+    The tile had one Position cell, so a strategy carrying its signal on two
+    venues showed one of them and hid the other - the half that was working and
+    the half that was not were indistinguishable. A table row was the first fix;
+    it still put both legs under one shared P&L and one shared mode, so the split
+    is now a card per leg with its own levels and score.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "bot" / "web"
+    js = (root / "app.js").read_text(encoding="utf-8")
+    css = (root / "styles.css").read_text(encoding="utf-8")
+
+    assert "function renderLegCards(run, legPerf, columnKey)" in js
+    assert "book-leg-cards" in js and ".book-leg-cards" in css
+    assert "leg-card-venue" in js and ".leg-card-venue" in css
+    assert "leg-card-levels" in js and ".leg-card-levels" in css
+    # Both legs' scores come from the server, per venue.
+    assert "payload.leg_performance" in js
+    assert '"leg_performance": legs' in (Path(__file__).resolve().parent.parent
+                                         / "bot" / "bot.py").read_text(encoding="utf-8")
+    # A single-leg book keeps its one footer row: a card would repeat the same
+    # numbers in twice the height.
+    assert "if (legs.length < 2) return '';" in js
+    assert "Array.isArray(run.legs)" in js
+    # The GIFT leg is paper by construction and must never inherit a LIVE chip.
+    assert "isGift ? 'PAPER'" in js
+    # The split tile must not restyle itself from its own container query.
+    assert ".book-band-split { container-type: inline-size; }" in css
+
+
+def test_a_half_filled_two_leg_strategy_is_reported_as_partial(monkeypatch, tmp_path) -> None:
+    """Two legs, two fills, and either can fail on its own.
+
+    Treating "the strategy acted" as one outcome is what made a half-filled
+    strategy invisible: the tile showed a position and nothing said the other leg
+    had been rejected. The report is what turns a partial fill into a recorded
+    fact rather than something to infer from two unrelated logs.
+    """
+    import bar_source
+
+    _isolate_gift_book(monkeypatch, tmp_path)
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
+        _verdict(strategy.BULL, strategy.NO_SIGNAL),
+    ])
+    run = engine.StrategyRun(
+        "both-legs", bar_source.GiftBarSource(feed), params={"exit": "flip"}, lots=1,
+        legs=("gift", "futures"),
+    )
+
+    # The futures order was rejected; the index leg settled.
+    report = eng._report_partial_legs(
+        "BUY", {"ok": False, "reason": "rejected"}, {"action": "BUY"}, run,
+        "2026-11-16T09:30:00+05:30",
+    )
+
+    assert report is not None
+    assert report["filled"] == ["gift"]
+    assert report["failed"] == ["futures"]
+    assert "Partial execution" in run.state.last_error
+
+
+def test_both_legs_filling_is_not_reported_as_partial(monkeypatch, tmp_path) -> None:
+    """A clean two-leg fill must not be flagged; a warning on every bar is noise."""
+    import bar_source
+
+    _isolate_gift_book(monkeypatch, tmp_path)
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [])
+    run = engine.StrategyRun(
+        "both-legs", bar_source.GiftBarSource(feed), params={}, lots=1,
+        legs=("gift", "futures"),
+    )
+
+    assert eng._report_partial_legs(
+        "BUY", {"ok": True}, {"action": "BUY"}, run, "2026-11-16T09:30:00+05:30"
+    ) is None
+    # A single-leg book has nothing to be partial about.
+    single = engine.StrategyRun(
+        "one-leg", bar_source.GiftBarSource(feed), params={}, lots=1, legs=("futures",),
+    )
+    assert eng._report_partial_legs(
+        "BUY", {"ok": False}, None, single, "2026-11-16T09:30:00+05:30"
+    ) is None
+
+
+def test_merged_gift_analytics_keeps_the_single_book_shape() -> None:
+    """A consolidated report must not blank the page it consolidates for.
+
+    The Performance tab reads ``days`` and ``summary`` off the top level. With one
+    book per strategy, returning only a per-book map left both undefined and the
+    calendar rendered empty - a consolidation that silently removed the page.
+    """
+    import bot as bot_app
+
+    merged = bot_app._merge_analytics([
+        {
+            "summary": {"trades": 2, "wins": 1, "losses": 1, "net_pnl": 100.0,
+                        "gross_pnl": 300.0, "fees": 200.0, "points": 10.0,
+                        "gross_win": 300.0, "gross_loss": -200.0,
+                        "largest_win": 300.0, "largest_loss": -200.0,
+                        "avg_hold_minutes": 30.0},
+            "streaks": {"max_win": 1, "max_loss": 1},
+            "days": [{"date": "2026-11-19", "trades": 2, "wins": 1, "losses": 1,
+                      "net_pnl": 100.0, "gross_pnl": 300.0, "fees": 200.0, "points": 10.0}],
+            "by_hour": [{"hour": 10, "trades": 2, "wins": 1, "losses": 1,
+                         "net_pnl": 100.0, "gross_pnl": 300.0, "fees": 200.0, "points": 10.0}],
+            "by_direction": {"LONG": {"trades": 2, "wins": 1, "losses": 1, "net_pnl": 100.0}},
+        },
+        {
+            "summary": {"trades": 3, "wins": 3, "losses": 0, "net_pnl": 50.0,
+                        "gross_pnl": 100.0, "fees": 50.0, "points": 5.0,
+                        "gross_win": 100.0, "gross_loss": 0.0,
+                        "largest_win": 60.0, "largest_loss": 0.0,
+                        "avg_hold_minutes": 90.0},
+            "streaks": {"max_win": 3, "max_loss": 0},
+            # The same date, from the other book: one day carrying both.
+            "days": [{"date": "2026-11-19", "trades": 3, "wins": 3, "losses": 0,
+                      "net_pnl": 50.0, "gross_pnl": 100.0, "fees": 50.0, "points": 5.0}],
+            "by_hour": [{"hour": 10, "trades": 3, "wins": 3, "losses": 0,
+                         "net_pnl": 50.0, "gross_pnl": 100.0, "fees": 50.0, "points": 5.0}],
+            "by_direction": {"LONG": {"trades": 3, "wins": 3, "losses": 0, "net_pnl": 50.0}},
+        },
+    ])
+
+    # Additive figures are summed...
+    assert merged["summary"]["trades"] == 5
+    assert merged["summary"]["net_pnl"] == 150.0
+    # ...and the ratios are recomputed, not averaged: 4 wins of 5 trades.
+    assert merged["summary"]["win_rate"] == 80.0
+    assert merged["summary"]["profit_factor"] == pytest.approx(400.0 / 200.0)
+    assert merged["summary"]["avg_win"] == pytest.approx(400.0 / 4)
+    # The same date must be one bucket carrying both books.
+    assert len(merged["days"]) == 1
+    assert merged["days"][0]["trades"] == 5
+    assert merged["days"][0]["net_pnl"] == 150.0
+    assert merged["by_hour"][0]["trades"] == 5
+    assert merged["by_direction"]["LONG"]["trades"] == 5
+    # The maxima survive, so a long streak in one book is not lost.
+    assert merged["streaks"]["max_win"] == 3
+    # Nothing may be a non-finite float that JSON cannot represent.
+    import json
+
+    json.dumps(merged, allow_nan=False)
+
+
+def test_the_default_gift_book_keeps_the_unsuffixed_ledger(monkeypatch, tmp_path) -> None:
+    """Pointing the default book at a new file would erase the operator's history.
+
+    Every row written before books were per-strategy lives in ``gift_book.db``.
+    A per-strategy file for the default id would open an empty ledger beside it,
+    so the dashboard would show a GIFT book that had never traded while the real
+    history sat unread on disk - a silent data loss on upgrade.
+    """
+    import gift_book
+
+    monkeypatch.setattr(
+        gift_book, "settings",
+        SimpleNamespace(
+            gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
+            gift_book_units=65, gift_book_balance=200_000.0,
+        ),
+    )
+    gift_book.reset_gift_books()
+    try:
+        default = gift_book.get_gift_book()
+        explicit = gift_book.get_gift_book("gift-15m")
+
+        assert default.strategy_id == gift_book.DEFAULT_STRATEGY
+        # The legacy path, not a suffixed one.
+        assert default.path == str(tmp_path / "gift.db")
+        # A named strategy still gets its own file.
+        assert explicit.path == str(tmp_path / "gift.db.gift-15m")
+    finally:
+        gift_book.reset_gift_books()
+
+
+def test_a_legacy_index_ledger_is_listed_rather_than_hidden(monkeypatch, tmp_path) -> None:
+    """Rows from before per-strategy books must not vanish from the dashboard.
+
+    A book nobody configured still holds the operator's GIFT history. Omitting it
+    from the list does not delete the rows - it hides them, so the venue reports
+    a book that has never traded while the real history sits unread on disk.
+    """
+    import gift_book
+    import order_manager
+
+    stub = SimpleNamespace(
+        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
+        gift_book_units=65, gift_book_balance=200_000.0,
+        tick_size=0.05, slippage_ticks=1.0, lot_size=65,
+        default_lots=1,
+    )
+    monkeypatch.setattr(gift_book, "settings", stub)
+    monkeypatch.setattr(order_manager, "settings", stub)
+    # One configured strategy that trades the index leg.
+    monkeypatch.setattr(
+        "config.strategy_configs",
+        lambda: [SimpleNamespace(
+            id="gift-15m", enabled=True, resolved_legs=("gift", "futures"),
+        )],
+    )
+    gift_book.reset_gift_books()
+    try:
+        # The legacy book trades; the configured one has not.
+        gift_book.get_gift_book().execute("BUY", 25_000.0)
+
+        listed = {book.strategy_id for book in gift_book.gift_books()}
+
+        assert "gift-15m" in listed
+        assert gift_book.DEFAULT_STRATEGY in listed, (
+            "the legacy ledger holds real rows and must be listed"
+        )
+    finally:
+        gift_book.reset_gift_books()
+
+
 def test_live_readiness_refuses_an_account_that_cannot_fund_one_lot(
     monkeypatch, tmp_path
 ) -> None:
@@ -7755,6 +9664,52 @@ def test_an_unreadable_margin_is_reported_but_does_not_block(
     assert margin["ok"] is False
     assert margin["blocking"] is False
     assert "margin" not in report["blocking"]
+
+
+def test_the_board_files_a_book_under_the_venue_it_is_exposed_to() -> None:
+    """Both books execute on the NIFTY future, so both sit in the NIFTY column.
+
+    The signal series differs (GIFT 15m vs NIFTY 60m) and each tile names its own,
+    but the venue the operator is exposed to is the same for both - so there is
+    one column and no book is filed under a venue it does not trade.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "bot" / "web"
+    js = (root / "app.js").read_text(encoding="utf-8")
+
+    # One column, and every run is filed into it.
+    assert "key: 'nifty', title: 'NIFTY 50'" in js
+    assert "key: 'gift', title: 'GIFT Nifty'" not in js
+    assert "buckets.get('nifty').push(run);" in js
+    # The tile names its signal series when that differs from the column, and
+    # the comparison is case-insensitive - the column key is lowercase and the
+    # label is not, so a strict compare printed "signal NIFTY" on the NIFTY tile.
+    assert "signal ${signalVenue}" in js
+    assert "signalVenue.toLowerCase() !== String(columnKey || '').toLowerCase()" in js
+
+
+def test_a_gift_signalled_book_can_trade_the_future_live(monkeypatch) -> None:
+    """The signal series and the traded instrument are separate decisions.
+
+    GIFT Nifty is quote-only, so the *index* can never be filled - but a book
+    that reads GIFT and executes on the Nifty future is trading a real
+    instrument on a real venue. Refusing it live would be refusing the future
+    because of the index, which is not the thing being bought.
+    """
+    import config
+
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_ID", "gift-15m")
+    monkeypatch.setenv("STRATEGY_1_INTERVAL", "15minute")
+    monkeypatch.setenv("STRATEGY_1_LEGS", "gift,futures")
+    monkeypatch.setenv("STRATEGY_1_LIVE", "1")
+
+    cfg = next(c for c in config.strategy_configs() if c.id == "gift-15m")
+
+    assert cfg.source == "gift"
+    assert cfg.resolved_legs == ("gift", "futures")
+    assert cfg.live is True
 
 
 def test_an_armed_book_says_so_before_the_switch_is_thrown() -> None:
@@ -7855,11 +9810,83 @@ def test_arming_live_is_allowed_when_every_check_passes(monkeypatch, tmp_path) -
     assert response.json()["mode"] == "LIVE"
 
 
-def test_a_flat_book_does_not_render_as_a_wall_of_dashes() -> None:
-    """A flat book is the common case and it was the least readable.
+def test_leg_performance_scores_each_venue_separately(monkeypatch, tmp_path) -> None:
+    """A two-leg strategy is two positions, so its score is two scores.
 
-    Four columns of em-dashes under a big "Flat" said nothing about why the book
-    was not holding, or where it would act. A flat book now says so in words -
+    Reporting one P&L for the pair hides the half that is working and the half
+    that is not - which is the whole reason the legs are tracked separately. The
+    index legs live in their own databases, so they have to be read from there;
+    the futures ledger cannot see them.
+    """
+    import gift_book
+    import order_manager
+
+    use_test_database(monkeypatch, tmp_path)
+    stub = SimpleNamespace(
+        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
+        gift_book_units=65, gift_book_balance=200_000.0,
+        tick_size=0.05, slippage_ticks=1.0, lot_size=65, default_lots=1,
+    )
+    monkeypatch.setattr(gift_book, "settings", stub)
+    monkeypatch.setattr(order_manager, "settings", stub)
+    monkeypatch.setattr(
+        "config.strategy_configs",
+        lambda: [SimpleNamespace(
+            id="gift-15m", enabled=True, resolved_legs=("gift", "futures"),
+        )],
+    )
+    gift_book.reset_gift_books()
+    try:
+        # One index leg round trip, in profit.
+        book = gift_book.get_gift_book("gift-15m")
+        book.execute("BUY", 25_000.0)
+        book.execute("SELL", 25_100.0)
+
+        # One futures round trip, in loss.
+        db.open_position("NIFTY26NOVFUT", 65, 25_400.0, mode=PAPER,
+                         source="ENGINE", strategy_id="gift-15m")
+        position_id = db.get_open_positions(mode=PAPER, strategy_id="gift-15m")[0]["id"]
+        db.close_position(position_id, 25_300.0, fees=0.0, exit_reason="FLIP",
+                          quantity=65)
+
+        legs = bot_app._leg_performance(PAPER)
+
+        assert set(legs["gift-15m"]) == {"gift", "futures"}
+        assert legs["gift-15m"]["gift"]["trades"] == 1
+        assert legs["gift-15m"]["gift"]["net_pnl"] > 0
+        assert legs["gift-15m"]["futures"]["trades"] == 1
+        assert legs["gift-15m"]["futures"]["net_pnl"] < 0
+        # Each venue's own win rate, not the pair's.
+        assert legs["gift-15m"]["gift"]["win_rate"] == 100.0
+        assert legs["gift-15m"]["futures"]["win_rate"] == 0.0
+    finally:
+        gift_book.reset_gift_books()
+
+
+def test_leg_performance_omits_a_leg_that_never_traded(monkeypatch, tmp_path) -> None:
+    """An absent key means "no closed trades", not a fabricated zero row.
+
+    Inventing a 0.00 result for a leg that never filled would claim a
+    performance it never had; the UI draws the configured legs and fills them
+    from here, so absence is the honest answer.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position("NIFTY26NOVFUT", 65, 25_400.0, mode=PAPER,
+                     source="ENGINE", strategy_id="gift-15m")
+    position_id = db.get_open_positions(mode=PAPER, strategy_id="gift-15m")[0]["id"]
+    db.close_position(position_id, 25_300.0, fees=0.0, exit_reason="FLIP", quantity=65)
+
+    legs = bot_app._leg_performance(PAPER)
+
+    assert set(legs["gift-15m"]) == {"futures"}
+    assert "gift" not in legs["gift-15m"]
+
+
+def test_a_flat_leg_does_not_render_as_a_wall_of_dashes() -> None:
+    """A flat leg is the common case and it was the least readable.
+
+    Four columns of em-dashes under a big "Flat" said nothing about why the leg
+    was not holding, or where it would act. A flat leg now says so in words -
     and it says the *right* words: this strategy enters on a transition, so "the
     rules agree" is not a reason it would enter, and printing that would leave
     the reader expecting an entry that cannot come.
@@ -7868,35 +9895,45 @@ def test_a_flat_book_does_not_render_as_a_wall_of_dashes() -> None:
 
     root = Path(__file__).resolve().parent.parent / "bot" / "web"
     js = (root / "app.js").read_text(encoding="utf-8")
+    css = (root / "styles.css").read_text(encoding="utf-8")
 
+    assert "leg-card-flat-state" in js and ".leg-card-flat-state" in css
+    assert "leg-card-flat-note" in js and ".leg-card-flat-note" in css
     # The reason names the transition rule, not just "the rules agree".
-    assert "enters on the next flip, at" in js
+    assert "enters on the next flip, not on the state" in js
     # And the disagreement case is distinguished from it.
-    assert "Waiting for SuperTrend and PSAR to agree." in js
+    assert "disagree, so there is no signal to act on" in js
+    # The flat card must not carry the four-column level grid at all.
+    flat_block = js.split("if (!row) {", 1)[1].split("return `", 2)[1]
+    assert "leg-card-levels" not in flat_block
 
 
-def test_the_exit_level_is_derived_once_per_book() -> None:
-    """The exit level belongs to the signal, so it is derived once.
+def test_the_exit_level_is_stated_once_per_book() -> None:
+    """It belongs to the signal, so both legs share it.
 
-    Two copies of one rule is how the two drift apart, so the tile computes the
-    flip level in one place and reuses it for the footer.
+    Printing it inside each leg card showed the same number twice and implied
+    each leg had its own. It is hoisted to the verdict it came from, and derived
+    once - two copies of one rule is how the two drift apart.
     """
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent / "bot" / "web"
     js = (root / "app.js").read_text(encoding="utf-8")
 
+    # One derivation, used by both the split tile and the single-leg tile.
     assert js.count("Math.max(...singleLevels)") == 1
     assert "const flipLevels" not in js
     assert "singleFlip" in js
+    assert "Both legs would act at" in js
 
 
 def test_the_tile_footer_is_words_not_the_raw_verdict_string() -> None:
     """The last line of a tile is read by a person.
 
     The verdict ships "close=… psar=… ST bullish confirm BUY 2/2 SELL 0/2",
-    which is fine in a tooltip and unreadable as the visible summary. The tile
-    shows a sentence and keeps the raw string in the title attribute.
+    which is fine in a tooltip and unreadable as the visible summary. Both the
+    split and single-leg tiles show a sentence and keep the raw string in the
+    title attribute.
     """
     from pathlib import Path
 
@@ -7904,9 +9941,11 @@ def test_the_tile_footer_is_words_not_the_raw_verdict_string() -> None:
     js = (root / "app.js").read_text(encoding="utf-8")
 
     assert "singleFooter" in js
+    assert "legFooter" in js
     # The raw detail still has to be reachable for diagnosis.
     assert 'class="strategy-detail${err ? \' is-bad\' : \'\'}" title="${escapeHtml(detail)}"' in js
     # An error is never replaced by the friendly sentence - it is the thing to fix.
+    assert "${escapeHtml(err ? detail : legFooter)}" in js
     assert "${escapeHtml(err ? detail : singleFooter)}" in js
 
 
@@ -8021,6 +10060,37 @@ def test_a_fresh_database_file_still_gets_its_schema(monkeypatch, tmp_path) -> N
     db.close_connections()
 
 
+def test_refresh_history_does_not_copy_the_series() -> None:
+    """The 5 s tick must not duplicate every bar to return a number.
+
+    ``refresh_history`` ends by reporting a count, and it did that through
+    ``bar_count()`` -> ``candles()``, which builds a fresh list of the whole
+    series. The engine calls it once per book per tick whether or not a bar
+    closed, and then throws the count away - so it was paying a full copy every
+    5 seconds for nothing. The feed now answers with a length.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "bot").joinpath("bar_source.py")
+    text = src.read_text(encoding="utf-8")
+
+    assert "interval_count" in text
+    # The cheaper counter is what the refresh path asks for.
+    assert 'getattr(self.feed, "interval_count", None)' in text
+    # And refresh_history itself must not fall back to the copying count.
+    refresh = text.split("def refresh_history", 1)[1].split("def candles", 1)[0]
+    assert "bar_count()" not in refresh, (
+        "refresh_history copies the whole series just to return a count"
+    )
+
+    feed = (Path(__file__).resolve().parent.parent / "bot").joinpath("gift_nifty.py")
+    feed_text = feed.read_text(encoding="utf-8")
+    assert "def interval_count(" in feed_text
+
+
+# ---------------------------------------------------------------------------
+# Image and import footprint
+# ---------------------------------------------------------------------------
 def test_pandas_is_not_imported_for_the_constants() -> None:
     """Importing the strategy module must not pull in the numeric stack.
 
@@ -8255,6 +10325,114 @@ def test_a_flat_exit_does_not_reverse_on_the_exiting_bar(monkeypatch, tmp_path) 
     )
 
 
+def test_a_flat_exit_closes_the_index_leg_when_the_futures_leg_is_empty(
+    monkeypatch, tmp_path
+) -> None:
+    """A two-leg book must not be left holding one leg after an exit.
+
+    ``exit_on_signal`` returns early when the *futures* book holds nothing, and
+    the caller only settles the index leg inside the ``exit_report is not None``
+    branch. So a book whose futures leg never filled - an out-of-session entry, a
+    rejected order, a restart between the two legs - kept its index position
+    forever: the exit rule fired, the futures book had nothing to close, and the
+    index book was never told.
+
+    Observed live: gift-15m held LONG 65 on the index with no futures leg, and
+    the flat exit did nothing.
+    """
+    import gift_book
+
+    _isolate_gift_book(monkeypatch, tmp_path)
+    book = gift_book.get_gift_book()
+    # The index leg is open; the futures leg is not.
+    book.execute("BUY", 25_000.0)
+    assert book.net_units() == 65
+
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
+        _verdict(strategy.NO_SIGNAL, strategy.BULL),
+    ])
+    monkeypatch.setattr(engine, "strategy_params", lambda: {"exit": "flat"})
+    eng.run.params = {"exit": "flat"}
+    # Put the real settlement back: _fresh_signal_env stubs it out.
+    monkeypatch.setattr(
+        eng, "_settle_gift_book",
+        engine.StrategyEngine._settle_gift_book.__get__(eng),
+    )
+
+    feed.n = 1
+    result = eng.evaluate_now()
+
+    assert result["action"] == "FLAT", result
+    assert book.net_units() == 0, (
+        "the index leg was left open after a flat exit with no futures position"
+    )
+
+
+def test_a_lagging_history_refresh_does_not_discard_a_tick_closed_bar() -> None:
+    """Kite's history lags the tick feed, and replacing the series lost the bar.
+
+    ``interval_history`` assigned the fetched rows over the whole secondary
+    series. Kite's 15-minute history trails the ticks by seconds to minutes, so a
+    bar the ticks had already closed was thrown away and an older series put in
+    its place. The engine keys off the newest bar's timestamp, so it then saw the
+    bar it had already evaluated and skipped - the signal sat unacted-on until
+    Kite caught up.
+
+    Observed live: a 15-minute bar closed at 21:00 and the order was placed at
+    21:04. Four minutes, on a strategy whose whole point is acting on the close.
+    """
+    import gift_nifty
+
+    feed = gift_nifty.GiftNiftyFeed.__new__(gift_nifty.GiftNiftyFeed)
+    feed._lock = __import__("threading").RLock()
+    feed._extra_builders = {"15minute": SimpleNamespace(max_history=2000)}
+    feed._extra_history = {"15minute": [
+        {"time": "2026-11-19 20:30:00", "open": 1, "high": 2, "low": 1, "close": 2},
+        # Closed by the ticks at 21:00. Kite has not published it yet.
+        {"time": "2026-11-19 20:45:00", "open": 2, "high": 3, "low": 2, "close": 3},
+    ]}
+
+    # Kite's history stops one bar earlier.
+    feed.interval_history("15minute", [
+        {"time": "2026-11-19 20:30:00", "open": 1, "high": 9, "low": 1, "close": 9},
+    ])
+
+    series = feed._extra_history["15minute"]
+    times = [row["time"] for row in series]
+    assert "2026-11-19 20:45:00" in times, (
+        "the tick-closed bar was discarded by a lagging history refresh"
+    )
+    # Kite still wins where it has a row: its OHLC replaces the tick-built one.
+    assert series[0]["close"] == 9
+    # And the series stays ordered, because the engine reads the last element.
+    assert times == sorted(times)
+
+
+def test_a_history_refresh_does_not_duplicate_a_bar() -> None:
+    """Merging must not append a bar Kite and the ticks both produced."""
+    import gift_nifty
+
+    feed = gift_nifty.GiftNiftyFeed.__new__(gift_nifty.GiftNiftyFeed)
+    feed._lock = __import__("threading").RLock()
+    feed._extra_builders = {"15minute": SimpleNamespace(max_history=2000)}
+    feed._extra_history = {"15minute": [
+        {"time": "2026-11-19 20:30:00", "open": 1, "high": 2, "low": 1, "close": 2},
+    ]}
+
+    feed.interval_history("15minute", [
+        {"time": "2026-11-19 20:30:00", "open": 1, "high": 2, "low": 1, "close": 2},
+    ])
+
+    assert len(feed._extra_history["15minute"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-book signal identity
+#
+# Three books write one ledger. A signal id is only unique within the book that
+# generated it, and both halves of that were wrong: the id was built from the
+# engine's active-run bar, and the duplicate guard scanned every book's rows.
+# ---------------------------------------------------------------------------
 def test_the_duplicate_guard_is_scoped_to_the_book(monkeypatch, tmp_path) -> None:
     """One book's signal must not suppress another book's order.
 
@@ -8268,17 +10446,17 @@ def test_the_duplicate_guard_is_scoped_to_the_book(monkeypatch, tmp_path) -> Non
 
     use_test_database(monkeypatch, tmp_path)
     db.record_signal(
-        "BUY", '{"signal_id": "NIFTY-BUY-2026-11-19 20:45:00"}', True,
-        "opened", strategy_id="nifty-15m",
+        "BUY", '{"signal_id": "GIFT-BUY-2026-11-19 20:45:00"}', True,
+        "opened", strategy_id="gift-15m",
     )
 
     manager = order_manager.OrderManager.__new__(order_manager.OrderManager)
-    shared = "NIFTY-BUY-2026-11-19 20:45:00"
+    shared = "GIFT-BUY-2026-11-19 20:45:00"
 
     # The book that produced it has processed it.
-    assert manager._already_processed(shared, PAPER, "nifty-15m") is True
+    assert manager._already_processed(shared, PAPER, "gift-15m") is True
     # A different book has not, and must be allowed to trade.
-    assert manager._already_processed(shared, PAPER, "nifty-60m") is False
+    assert manager._already_processed(shared, PAPER, "gift-60m") is False
     # Unscoped still means "any book", which is what a caller with no book wants.
     assert manager._already_processed(shared, PAPER) is True
 
@@ -8296,16 +10474,99 @@ def test_the_signal_id_names_the_book_and_its_own_bar() -> None:
     import engine
 
     source = inspect.getsource(engine.StrategyEngine.execute)
-    assert 'f"NIFTY-{action}-{book}-' in source, (
+    assert 'f"GIFT-{action}-{book}-' in source, (
         "the signal id does not name the book"
     )
     assert "run.state.last_bar_at" in source, (
         "the signal id is not built from the book's own bar"
     )
     # The engine-level field must not be the primary source any more.
-    assert 'f"NIFTY-{action}-{self._last_bar_at}"' not in source
+    assert 'f"GIFT-{action}-{self._last_bar_at}"' not in source
 
 
+def test_panic_flattens_the_index_books_too(monkeypatch, tmp_path) -> None:
+    """An emergency stop must not leave an index position open.
+
+    ``/api/panic`` squares off through the order manager, which owns the
+    *futures* ledger. The index book is a separate database, so the operator's
+    square-off could not reach it - and an emergency stop that leaves a position
+    open is the one state it must never leave behind.
+    """
+    from fastapi.testclient import TestClient
+
+    import bot as bot_app
+    import gift_book
+    import order_manager
+
+    use_test_database(monkeypatch, tmp_path)
+    stub = SimpleNamespace(
+        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
+        gift_book_units=65, gift_book_balance=200_000.0,
+        tick_size=0.05, slippage_ticks=1.0, lot_size=65, default_lots=1,
+    )
+    monkeypatch.setattr(gift_book, "settings", stub)
+    monkeypatch.setattr(order_manager, "settings", stub)
+    gift_book.reset_gift_books()
+    try:
+        book = gift_book.get_gift_book("gift-15m")
+        book.execute("BUY", 25_000.0)
+        book.mark(25_050.0)
+        assert book.net_units() == 65
+
+        monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
+        monkeypatch.setattr(
+            bot_app, "get_order_manager",
+            lambda: SimpleNamespace(
+                square_off=lambda *a, **k: SimpleNamespace(
+                    ok=True, reason="squared off", to_dict=lambda: {"ok": True},
+                ),
+                pause=lambda reason: None,
+                paused=True,
+            ),
+        )
+        # Patched on `gift_book`, not on `bot`: `api_panic` imports `gift_books`
+        # inside the function, so a `bot_app.gift_books` attribute is never read.
+        # The old patch therefore did nothing at all, and the test only passed
+        # where `.env` configured a strategy whose id happened to match the book.
+        monkeypatch.setattr(gift_book, "gift_books", lambda: [book])
+
+        payload = TestClient(bot_app.app, base_url="http://localhost").post(
+            "/api/panic", json={"confirm": True, "reason": "PANIC"}
+        ).json()
+
+        assert book.net_units() == 0, (
+            "PANIC left the index leg open - the emergency stop did not reach it"
+        )
+        assert "gift-15m" in payload["index_books"]
+    finally:
+        gift_book.reset_gift_books()
+
+
+def test_flatten_is_a_no_op_when_the_index_book_is_flat(monkeypatch, tmp_path) -> None:
+    """Flattening an empty book must not invent a trade."""
+    import gift_book
+    import order_manager
+
+    use_test_database(monkeypatch, tmp_path)
+    stub = SimpleNamespace(
+        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
+        gift_book_units=65, gift_book_balance=200_000.0,
+        tick_size=0.05, slippage_ticks=1.0, lot_size=65, default_lots=1,
+    )
+    monkeypatch.setattr(gift_book, "settings", stub)
+    monkeypatch.setattr(order_manager, "settings", stub)
+    gift_book.reset_gift_books()
+    try:
+        book = gift_book.get_gift_book("gift-15m")
+        assert book.flatten("PANIC") is None
+        assert book.net_units() == 0
+    finally:
+        gift_book.reset_gift_books()
+
+
+# ---------------------------------------------------------------------------
+# Alert delivery and message shape
+# ---------------------------------------------------------------------------
 def test_watchdog_delivers_on_a_channel_that_has_no_webhook_url(monkeypatch) -> None:
     """Telegram is addressed by token and chat id, so ALERT_WEBHOOK_URL is empty.
 
@@ -8391,7 +10652,7 @@ def test_watchdog_does_not_claim_delivery_when_alerting_is_off(monkeypatch) -> N
 def test_an_alert_message_carries_its_structured_context() -> None:
     """A message must say which book, which instrument, and what to do.
 
-    "Feed connected but no tick for 240s" does not say which strategy is
+    "GIFT feed connected but no tick for 240s" does not say which strategy is
     affected or whether it is real money, so the operator had to open the
     dashboard to find out whether it mattered.
     """
@@ -8400,9 +10661,9 @@ def test_an_alert_message_carries_its_structured_context() -> None:
     text = notifier.describe({
         "kind": "STALE_FEED",
         "severity": "critical",
-        "detail": "The signal series has not refreshed for 240s.",
+        "detail": "The GIFT Nifty feed is connected but has delivered no tick for 240s.",
         "fields": {
-            "strategy": "nifty-15m",
+            "strategy": "gift-15m",
             "venue": "LIVE",
             "symbol": "NIFTY26NOVFUT",
             "interval": "15minute",
@@ -8413,7 +10674,7 @@ def test_an_alert_message_carries_its_structured_context() -> None:
     })
 
     assert text.startswith("\U0001F6A8 STALE_FEED")
-    for expected in ("nifty-15m", "LIVE", "NIFTY26NOVFUT", "15minute",
+    for expected in ("gift-15m", "LIVE", "NIFTY26NOVFUT", "15minute",
                      "Check the Kite websocket."):
         assert expected in text, f"{expected!r} missing from the alert:\n{text}"
     # Timestamps are rendered for a human, not as raw ISO with an offset.
@@ -8468,7 +10729,7 @@ def test_a_trade_alert_names_the_book_and_the_order(monkeypatch, tmp_path) -> No
         severity="info",
         symbol="NIFTY26NOVFUT",
         fields={
-            "strategy": "nifty-15m",
+            "strategy": "gift-15m",
             "venue": "LIVE",
             "action": "BUY",
             "quantity": 65,
@@ -8479,14 +10740,14 @@ def test_a_trade_alert_names_the_book_and_the_order(monkeypatch, tmp_path) -> No
 
     assert len(sent) == 1
     text = sent[0]["text"]
-    for expected in ("nifty-15m", "LIVE", "251120000012345", "24180.50"):
+    for expected in ("gift-15m", "LIVE", "251120000012345", "24180.50"):
         assert expected in text, f"{expected!r} missing from the trade alert:\n{text}"
 
 
 def test_a_second_book_enters_on_its_own_fresh_signal(monkeypatch, tmp_path) -> None:
     """A non-active book must read its own owed-entry latch, not the engine's.
 
-    Observed live: nifty-60m logged "Fresh BULL signal on bar 11:30; entry owed"
+    Observed live: gift-60m logged "Fresh BULL signal on bar 11:30; entry owed"
     and then never entered. The latch was written to the run (correctly), but the
     entry gate read ``self._pending_signal`` - the engine-level mirror, which is
     only kept in step for ``self.run`` (``runs[0]``). For every other book it
@@ -8499,6 +10760,7 @@ def test_a_second_book_enters_on_its_own_fresh_signal(monkeypatch, tmp_path) -> 
     """
     import bar_source
 
+    _isolate_gift_book(monkeypatch, tmp_path)
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
         _verdict(strategy.BULL, strategy.NO_SIGNAL, close=25_000.0),
         _verdict(strategy.BULL, strategy.NO_SIGNAL, close=25_000.0),
@@ -8642,3 +10904,433 @@ def test_the_newest_closed_bar_survives_a_refresh(monkeypatch) -> None:
         f"the bar that closed at 16:15 was dropped from the series: {times}"
     )
     assert "2026-11-20 16:15:00" not in times, "the forming bar must not be kept"
+
+
+# ---------------------------------------------------------------------------
+# Protective stops: initial stop, trailing activation, never-widen
+#
+# Two strategies trade the same future with different stops. The rules are the
+# same shape and differ only in numbers, so they are pinned here once against
+# both configurations. Every level is measured on the futures price, and the two
+# invariants - only move in the profitable direction, never widen - are what make
+# a trailing stop a stop rather than a suggestion.
+# ---------------------------------------------------------------------------
+def _gift_rules():
+    import stops
+
+    return stops.StopRules(
+        initial_points=50, trail_points=5, trail_after=50, trail_points_after=30
+    )
+
+
+def _nifty_rules():
+    import stops
+
+    return stops.StopRules(
+        initial_points=200, trail_points=100, trail_after=200, trail_points_after=100
+    )
+
+
+def test_initial_stop_sits_the_configured_distance_from_the_fill() -> None:
+    import stops
+
+    assert stops.initial_stop(25_000.0, stops.LONG, _gift_rules()) == 24_950.0
+    assert stops.initial_stop(25_000.0, stops.SHORT, _gift_rules()) == 25_050.0
+    assert stops.initial_stop(25_000.0, stops.LONG, _nifty_rules()) == 24_800.0
+    assert stops.initial_stop(25_000.0, stops.SHORT, _nifty_rules()) == 25_200.0
+
+
+def test_a_disabled_stop_places_nothing() -> None:
+    import stops
+
+    assert stops.initial_stop(25_000.0, stops.LONG, stops.StopRules(0)) is None
+
+
+def test_gift_trail_uses_five_points_until_fifty_then_thirty() -> None:
+    import stops
+
+    rules = _gift_rules()
+    # 40 points of profit: still the 5-point trail.
+    assert rules.trail_for(40) == 5
+    # 50 points: the wider 30-point trail takes over.
+    assert rules.trail_for(50) == 30
+    assert rules.trail_for(120) == 30
+
+
+def test_nifty_trail_is_one_hundred_points_once_two_hundred_in_profit() -> None:
+    import stops
+
+    rules = _nifty_rules()
+    assert rules.trail_for(150) == 100
+    assert rules.trail_for(200) == 100
+
+
+def test_a_long_stop_only_rises_and_never_widens() -> None:
+    import stops
+
+    rules = _gift_rules()
+    # Entry 25,000, stop 24,950. Price runs to 25,060: 60 points of profit, so
+    # the 30-point trail puts the stop at 25,030 - above the initial 24,950.
+    state, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=25_060.0, rules=rules,
+    )
+    assert not breached
+    assert state.current == 25_030.0
+
+    # Price falls back to 25,040. The trail would imply 25,010, which is *lower*
+    # than the 25,030 already in force - the never-widen rule keeps 25,030.
+    state2, breached2 = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=25_040.0, rules=rules,
+        current_stop=state.current, best_price=state.best_price,
+    )
+    assert not breached2
+    assert state2.current == 25_030.0, "the stop must not widen"
+
+
+def test_a_short_stop_only_falls_and_never_widens() -> None:
+    import stops
+
+    rules = _gift_rules()
+    # Short at 25,000, stop 25,050. Price falls to 24,940: 60 points of profit,
+    # so the 30-point trail puts the stop at 24,970 - below the initial 25,050.
+    state, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.SHORT, mark=24_940.0, rules=rules,
+    )
+    assert not breached
+    assert state.current == 24_970.0
+
+    # Price rises back to 24,960. The trail would imply 24,990, which is *higher*
+    # than 24,970 - the never-widen rule keeps 24,970.
+    state2, _ = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.SHORT, mark=24_960.0, rules=rules,
+        current_stop=state.current, best_price=state.best_price,
+    )
+    assert state2.current == 24_970.0, "the stop must not widen"
+
+
+def test_a_long_breaches_when_the_mark_reaches_the_stop() -> None:
+    import stops
+
+    rules = _gift_rules()
+    # Initial stop 24,950; a mark at or below it is a breach.
+    _, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=24_950.0, rules=rules,
+    )
+    assert breached
+    _, breached_below = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=24_900.0, rules=rules,
+    )
+    assert breached_below
+
+
+def test_a_short_breaches_when_the_mark_reaches_the_stop() -> None:
+    import stops
+
+    rules = _gift_rules()
+    _, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.SHORT, mark=25_050.0, rules=rules,
+    )
+    assert breached
+
+
+def test_a_mark_inside_the_stop_does_not_breach() -> None:
+    import stops
+
+    rules = _gift_rules()
+    _, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=24_960.0, rules=rules,
+    )
+    assert not breached
+
+
+def test_the_breach_is_judged_against_the_stop_in_force_before_the_update() -> None:
+    """A mark that both advances the trail and sits beyond it is a breach.
+
+    The stop the position was actually protected by is the one that decides, not
+    the tightened level this same tick would produce.
+    """
+    import stops
+
+    rules = _gift_rules()
+    # Long at 25,000 with the stop already trailed to 25,030. A mark at 25,020 is
+    # below that stop, so it breaches even though the trail would recompute.
+    _, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=25_020.0, rules=rules,
+        current_stop=25_030.0, best_price=25_060.0,
+    )
+    assert breached
+
+
+def test_the_two_strategies_keep_independent_stops_on_one_contract(monkeypatch, tmp_path) -> None:
+    """Both books hold the same future; each is stopped by its own rules.
+
+    A single shared stop would let the tighter book's level close the looser
+    book's position - the exact cross-strategy interference the per-book stop
+    exists to prevent.
+    """
+    import stops
+
+    use_test_database(monkeypatch, tmp_path)
+    # Two longs in the same contract, one per book, at the same fill.
+    gift_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
+    )
+    nifty_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="nifty-60m", trailing_stop=24_800.0, best_price=25_000.0,
+    )
+
+    # A mark of 24,940 breaches the GIFT book's 50-point stop but not the NIFTY
+    # book's 200-point stop.
+    gift_state, gift_breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=24_940.0,
+        rules=_gift_rules(), current_stop=24_950.0, best_price=25_000.0,
+    )
+    nifty_state, nifty_breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=24_940.0,
+        rules=_nifty_rules(), current_stop=24_800.0, best_price=25_000.0,
+    )
+    assert gift_breached is True
+    assert nifty_breached is False
+
+    # And the ledger rows are independent.
+    rows = {r["id"]: r for r in db.get_open_positions(mode=PAPER)}
+    assert rows[gift_id]["strategy_id"] == "gift-15m"
+    assert rows[nifty_id]["strategy_id"] == "nifty-60m"
+
+
+def test_the_engine_closes_only_the_breaching_books_position(monkeypatch, tmp_path) -> None:
+    """A stop-out is scoped to the position that breached, not the contract.
+
+    Both books hold a long in the same future. The GIFT book's stop is hit; the
+    NIFTY book's position must survive untouched.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    gift_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
+    )
+    nifty_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="nifty-60m", trailing_stop=24_800.0, best_price=25_000.0,
+    )
+
+    eng = engine.StrategyEngine()
+    # Give each run its own rules without rebuilding the engine's sources.
+    for run in eng.runs:
+        if run.id == "gift-15m":
+            run.stop_rules = _gift_rules()
+        elif run.id == "nifty-60m":
+            run.stop_rules = _nifty_rules()
+
+    reports = eng.check_stops({"NIFTY26NOVFUT": 24_940.0})
+
+    assert [r["strategy_id"] for r in reports] == ["gift-15m"]
+    assert reports[0]["confirmed"] is True
+    open_ids = {r["id"] for r in db.get_open_positions(mode=PAPER)}
+    assert gift_id not in open_ids, "the breaching book's position must be closed"
+    assert nifty_id in open_ids, "the other book's position must be untouched"
+
+
+def test_a_stop_out_does_not_need_the_pause_switch(monkeypatch, tmp_path) -> None:
+    """Pausing blocks entries; it must never disarm a protective stop."""
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
+    )
+    from order_manager import get_order_manager
+
+    eng = engine.StrategyEngine()
+    for run in eng.runs:
+        if run.id == "gift-15m":
+            run.stop_rules = _gift_rules()
+    get_order_manager().pause_book("gift-15m", "PAUSED")
+
+    reports = eng.check_stops({"NIFTY26NOVFUT": 24_940.0})
+
+    assert [r["strategy_id"] for r in reports] == ["gift-15m"]
+    assert db.get_open_positions(mode=PAPER, strategy_id="gift-15m") == []
+
+
+def test_a_book_without_stop_rules_is_left_alone(monkeypatch, tmp_path) -> None:
+    """An unconfigured book keeps the signal-only exit it had before."""
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="gift-15m", trailing_stop=None, best_price=25_000.0,
+    )
+    eng = engine.StrategyEngine()
+    for run in eng.runs:
+        run.stop_rules = None
+
+    reports = eng.check_stops({"NIFTY26NOVFUT": 20_000.0})
+
+    assert reports == []
+    assert len(db.get_open_positions(mode=PAPER, strategy_id="gift-15m")) == 1
+
+
+def test_the_stop_advances_on_every_mark_and_persists(monkeypatch, tmp_path) -> None:
+    """The trail is written to the ledger, so a restart resumes it."""
+    use_test_database(monkeypatch, tmp_path)
+    position_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
+    )
+    eng = engine.StrategyEngine()
+    for run in eng.runs:
+        if run.id == "gift-15m":
+            run.stop_rules = _gift_rules()
+
+    eng.check_stops({"NIFTY26NOVFUT": 25_060.0})
+
+    row = [p for p in db.get_open_positions(mode=PAPER) if p["id"] == position_id][0]
+    assert row["trailing_stop"] == 25_030.0
+    assert row["best_price"] == 25_060.0
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy LIVE/PAPER, pause and square-off
+# ---------------------------------------------------------------------------
+def test_a_books_mode_is_persisted_across_a_restart(monkeypatch, tmp_path) -> None:
+    """The operator's per-book choice survives a restart."""
+    from config import LIVE, PAPER
+    from strategy_run import StrategyRun
+
+    from bar_source import GiftBarSource
+
+    use_test_database(monkeypatch, tmp_path)
+    run = StrategyRun("gift-15m", GiftBarSource(None), live=False)
+    assert run.mode() == PAPER
+
+    run.set_mode(LIVE)
+    assert run.mode() == LIVE
+
+    # A fresh object reads the stored choice, not the config default.
+    restarted = StrategyRun("gift-15m", GiftBarSource(None), live=False)
+    assert restarted.mode() == LIVE
+
+
+def test_switching_one_books_mode_leaves_the_other_alone(monkeypatch, tmp_path) -> None:
+    from config import LIVE, PAPER
+    from strategy_run import StrategyRun
+
+    from bar_source import GiftBarSource
+
+    use_test_database(monkeypatch, tmp_path)
+    gift = StrategyRun("gift-15m", GiftBarSource(None), live=False)
+    nifty = StrategyRun("nifty-60m", GiftBarSource(None), live=False)
+
+    gift.set_mode(LIVE)
+
+    assert gift.mode() == LIVE
+    assert nifty.mode() == PAPER, "the other book must not move"
+
+
+def test_switching_a_book_to_paper_is_refused_while_it_holds_a_live_position(
+    monkeypatch, tmp_path
+) -> None:
+    """LIVE -> PAPER needs the live position squared off or reconciled first."""
+    from config import LIVE
+    from fastapi.testclient import TestClient
+
+    from engine import get_engine
+
+    use_test_database(monkeypatch, tmp_path)
+    eng = get_engine()
+    run = next(r for r in eng.runs if r.id == "gift-15m")
+    run.set_mode(LIVE)
+    db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=LIVE, source="ENGINE",
+        strategy_id="gift-15m",
+    )
+
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/mode",
+        json={"strategy_id": "gift-15m", "mode": "PAPER"},
+    )
+
+    assert response.status_code == 409
+    assert "square it off" in response.json()["detail"]
+    assert run.mode() == LIVE
+
+
+def test_arming_a_book_live_requires_confirmation(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/mode",
+        json={"strategy_id": "gift-15m", "mode": "LIVE"},
+    )
+    assert response.status_code == 400
+    assert "confirm" in response.json()["detail"]
+
+
+def test_square_off_closes_only_the_named_book(monkeypatch, tmp_path) -> None:
+    """Squaring off one book must never touch the other's leg in the same contract."""
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="gift-15m",
+    )
+    nifty_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="nifty-60m",
+    )
+
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/square-off",
+        json={"strategy_id": "gift-15m", "confirm": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["strategy_id"] == "gift-15m"
+    assert body["paused"] is True, "a squared-off book is paused"
+    assert db.get_open_positions(mode=PAPER, strategy_id="gift-15m") == []
+    assert [p["id"] for p in db.get_open_positions(mode=PAPER, strategy_id="nifty-60m")] == [nifty_id]
+
+
+def test_square_off_requires_confirmation(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/square-off",
+        json={"strategy_id": "gift-15m"},
+    )
+    assert response.status_code == 400
+
+
+def test_pausing_one_book_does_not_pause_the_other(monkeypatch, tmp_path) -> None:
+    from order_manager import get_order_manager
+
+    use_test_database(monkeypatch, tmp_path)
+    manager = get_order_manager()
+    manager.pause_book("gift-15m", "MANUAL")
+
+    assert manager.book_paused("gift-15m") is True
+    assert manager.book_paused("nifty-60m") is False
+
+
+def test_the_two_configured_strategies_are_gift_15m_and_nifty_60m(monkeypatch) -> None:
+    """Exactly two strategies, each on its own series and timeframe."""
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_ID", "gift-15m")
+    monkeypatch.setenv("STRATEGY_1_INTERVAL", "15minute")
+    monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
+    monkeypatch.setenv("STRATEGY_2_ID", "nifty-60m")
+    monkeypatch.setenv("STRATEGY_2_INTERVAL", "60minute")
+
+    configs = {c.id: c for c in config.strategy_configs()}
+
+    assert set(configs) == {"gift-15m", "nifty-60m"}
+    assert configs["gift-15m"].source == "gift"
+    assert configs["gift-15m"].interval == "15minute"
+    assert configs["nifty-60m"].source == "nifty"
+    assert configs["nifty-60m"].interval == "60minute"

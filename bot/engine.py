@@ -1,17 +1,19 @@
-"""Strategy engine: evaluate ``st.pine`` on NIFTY 50, execute on Nifty futures.
+"""Strategy engine: evaluate ``st.pine`` on GIFT Nifty, execute on Nifty futures.
 
 Signal source and execution venue are deliberately different instruments:
 
-* **signals** come from NIFTY 50 (``NSE:NIFTY 50``) candles, loaded from Kite
-  history by :mod:`bar_source`.
+* **signals** come from GIFT Nifty (``NSEIX:GIFT NIFTY``) candles, loaded from
+  Kite history by :mod:`gift_nifty` (tick-built bars are a fallback). GIFT Nifty
+  is the 20-hour pre-market proxy for Nifty 50, so it reacts to overnight and
+  early-morning global moves before NSE opens.
 * **orders** go to the front-month NFO Nifty future via
-  :class:`~order_manager.OrderManager`, because the index itself is quote-only
-  on Kite and cannot be traded there.
+  :class:`~order_manager.OrderManager`, because GIFT Nifty is quote-only on
+  Kite and cannot be traded there.
 
-The engine **evaluates** on every closed NIFTY bar. LIVE orders execute only
-inside the NSE F&O session (09:15-15:30 IST). PAPER orders can also simulate
-after-hours using the just-closed candle; a deferred LIVE signal is never
-auto-executed later.
+The engine **evaluates** on every closed GIFT Nifty bar, around the clock.
+LIVE orders execute only inside the NSE F&O session (09:15-15:30 IST). PAPER
+orders can also simulate after-hours using the just-closed GIFT candle; a
+deferred LIVE signal is never auto-executed later.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from typing import Any, Optional
 
 import database as db
 import risk
+import stops
 import strategy
 from config import (
     PAPER,
@@ -34,7 +37,8 @@ from config import (
     strategy_configs,
     strategy_params,
 )
-from bar_source import NiftyBarSource
+from bar_source import GiftBarSource
+from gift_nifty import GIFT_KEY, get_feed
 from strategy_run import StrategyRun
 from kite_client import (
     IST,
@@ -188,30 +192,8 @@ PENDING_SIGNAL_KEY = "engine_pending_signal"
 PENDING_SIGNAL_BAR_KEY = "engine_pending_signal_bar"
 
 
-class _LazyBarSource:
-    """A bar source that constructs the real one on first use.
-
-    ``StrategyRun`` reads ``seconds`` and ``symbol`` off its source, so the
-    concrete source is built the first time either is asked for - which is after
-    the engine exists and after any substitution of ``NiftyBarSource``.
-    """
-
-    def __init__(self, interval: str) -> None:
-        self._interval = interval
-        self._source: Any = None
-
-    @property
-    def source(self) -> Any:
-        if self._source is None:
-            self._source = NiftyBarSource(self._interval)
-        return self._source
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.source, name)
-
-
 class StrategyEngine:
-    """Watches NIFTY bars and trades the Nifty future on fresh signals.
+    """Watches GIFT Nifty bars and trades the Nifty future on fresh signals.
 
     Entry is *transition-driven*: the bot trades the bar on which the two rules
     start agreeing, not every bar on which they still agree. That is what makes an
@@ -274,6 +256,8 @@ class StrategyEngine:
                     lots=cfg.lots,
                     display_name=cfg.name or cfg.id,
                     live=getattr(cfg, "live", False),
+                    legs=getattr(cfg, "resolved_legs", None),
+                    stop_rules=getattr(cfg, "stop_rules", None),
                 )
             )
         if not runs:
@@ -283,7 +267,7 @@ class StrategyEngine:
             runs.append(
                 StrategyRun(
                     self.strategy_id,
-                    NiftyBarSource(settings.candle_interval),
+                    GiftBarSource(get_feed()),
                     params=strategy_params(),
                     lots=getattr(settings, "default_lots", 1),
                 )
@@ -293,13 +277,18 @@ class StrategyEngine:
     def _build_source(self, cfg: Any):
         """The bar source for one strategy.
 
-        Returned lazily: the concrete source is constructed on first use rather
-        than here. That keeps engine construction free of the source's own
-        dependencies, and it is what lets the module-level ``NiftyBarSource`` be
-        substituted in one place (a test, or a future source swap) after the
-        engine exists.
+        The GIFT source is built without a feed, so it resolves ``get_feed()`` on
+        first use rather than at construction. That keeps every existing stub and
+        reset of the feed working, and it is also what lets two GIFT strategies
+        share the one process-global websocket instead of opening a second.
         """
-        return _LazyBarSource(cfg.interval)
+        from config import build_bar_source_for
+
+        # The module-level get_feed is resolved here rather than inside
+        # build_bar_source_for so that a patched engine.get_feed (which is what
+        # every test and the feed reset do) is the one that takes effect.
+        feed = get_feed() if cfg.source.startswith("gift") else None
+        return build_bar_source_for(cfg, gift_feed=feed)
 
     @property
     def run(self) -> StrategyRun:
@@ -341,8 +330,8 @@ class StrategyEngine:
     def _set_overnight_pending(self, value: bool, run: Optional[StrategyRun] = None) -> None:
         """Set the pre-open reconcile flag on the book that owns it.
 
-        One field for every book meant a pre-open bar in one series armed a
-        reconcile for another book as well, which would then decide the
+        One field for every book meant a pre-open bar in the GIFT series armed a
+        reconcile for the NIFTY book as well, which would then decide the
         morning on a leg it does not hold. The engine-level attribute mirrors the
         active run, so the dashboard and existing callers still see one value.
         """
@@ -381,7 +370,7 @@ class StrategyEngine:
         so a latch set by any book belonged to the first one: the entry was then
         consumed against that book's position and booked under its id. That is
         how a palette book's fill ended up in the wrong ledger - the position
-        showed one strategy's name but its ``strategy_id`` was the engine's
+        showed ``strategy: gift-flip`` but its ``strategy_id`` was the engine's
         legacy default, and no tile could find it.
         """
         book = run if run is not None else self.run
@@ -407,7 +396,7 @@ class StrategyEngine:
                 log.info("Exit notice dismissed: %s", self._breach.detail)
             self._breach = None
 
-    def reset_for_mode(self, mode: str) -> None:
+    def reset_for_mode(self, mode: str, strategy_id: Optional[str] = None) -> None:
         """Drop the strategy state that belongs to the mode being left.
 
         The *rules* are identical in PAPER and LIVE - ``strategy`` and ``risk``
@@ -438,16 +427,21 @@ class StrategyEngine:
         """
         with self._lock:
             for run in self.runs:
+                # A per-book switch clears only that book; the global switch
+                # clears every book. ``strategy_id`` narrows it.
+                if strategy_id is not None and run.id != strategy_id:
+                    continue
                 run.state.last_bar_at = None
                 run.state.last_action = None
                 run.state.overnight_pending = False
                 # Written through to SQLite, so a PAPER-era owed entry cannot be
                 # filled as a real order by the live book.
                 run.set_pending_signal(None)
-            self._last_bar_at = None
-            self._last_signal = strategy.NO_SIGNAL
-            self._overnight_pending = False
-            self._pending_signal = None
+            if strategy_id is None:
+                self._last_bar_at = None
+                self._last_signal = strategy.NO_SIGNAL
+                self._overnight_pending = False
+                self._pending_signal = None
             self._pending_signal_bar = None
             # The memoised dashboard verdicts are keyed by bar, not by mode, so
             # they stay valid - the indicators do not care which book is trading.
@@ -526,6 +520,143 @@ class StrategyEngine:
         if not status["rolled"]:
             self._rollover_logged = False
         return status
+
+    def check_stops(self, prices: Optional[dict[str, float]] = None) -> list[dict[str, Any]]:
+        """Advance every open position's stop and close the ones that breached.
+
+        Runs on the mark cadence against **live futures prices**, not on a bar
+        close: a stop that waited for the candle would be a stop that lets the
+        market run through it for up to a whole bar. It is deliberately not gated
+        on the pause switch - pausing blocks *entries*, and a position that is
+        already on must stay protected.
+
+        Each position is evaluated against its own book's rules, so the two
+        strategies keep independent stops even though they hold the same
+        contract. A position whose book has no rules is left exactly as it was.
+
+        Returns one report per position that was closed, for the caller to log
+        and alert on. Never raises: a stop check that throws would leave the
+        position unprotected, which is the one outcome it must not produce.
+        """
+        reports: list[dict[str, Any]] = []
+        manager = get_order_manager()
+        if prices is None:
+            try:
+                prices = manager.price_map()
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Could not price positions for the stop check")
+                return reports
+
+        rules_by_book = {
+            run.id: run.stop_rules for run in self.runs if getattr(run, "stop_rules", None)
+        }
+        if not any(rules is not None and rules.enabled for rules in rules_by_book.values()):
+            return reports
+
+        try:
+            positions = db.get_open_positions()
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Could not read open positions for the stop check")
+            return reports
+
+        for position in positions:
+            book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID
+            rules = rules_by_book.get(book)
+            if rules is None or not rules.enabled:
+                continue
+            mark = prices.get(position["symbol"])
+            if mark is None:
+                continue
+            try:
+                report = self._check_one_stop(position, float(mark), rules)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Stop check failed for position %s", position.get("id"))
+                continue
+            if report is not None:
+                reports.append(report)
+        return reports
+
+    def _check_one_stop(
+        self, position: dict[str, Any], mark: float, rules: stops.StopRules
+    ) -> Optional[dict[str, Any]]:
+        """Evaluate one position's stop at ``mark``; close it if it breached."""
+        position_key = int(position["position_key"])
+        entry = float(position["entry_price"])
+        state, breached = stops.evaluate(
+            entry_price=entry,
+            position_key=position_key,
+            mark=mark,
+            rules=rules,
+            current_stop=position.get("trailing_stop"),
+            best_price=position.get("best_price"),
+        )
+        if not breached:
+            db.update_position_stops(
+                position["id"], stop=state.current, best_price=state.best_price
+            )
+            return None
+
+        book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID
+        mode = position.get("mode") or get_execution_mode()
+        stop_level = position.get("trailing_stop")
+        points = (mark - entry) * position_key
+        detail = (
+            f"stop hit at {mark:.2f} (stop {stop_level if stop_level is not None else '—'}, "
+            f"{points:+.2f} pts)"
+        )
+        result = get_order_manager().square_off(
+            "STOP_LOSS",
+            source="STOP_LOSS",
+            mode=mode,
+            mark_price=mark,
+            position_id=position["id"],
+            strategy_id=book,
+        )
+        confirmed = bool(result.ok)
+        if confirmed:
+            db.update_position_stops(
+                position["id"], stop=state.current, best_price=state.best_price
+            )
+        with self._lock:
+            self._breach = risk.Breach(
+                kind="STOP_LOSS",
+                symbol=position["symbol"],
+                points=round(points, 2),
+                position_id=position["id"],
+                detail=detail,
+            )
+            if not confirmed:
+                self.state.last_error = f"stop-out unconfirmed: {result.reason}"
+        log.warning(
+            "Stop-out %s %s: %s (confirmed=%s)",
+            book, position["symbol"], detail, confirmed,
+        )
+        _trade_alert(
+            "STOP_OUT",
+            f"{position['symbol']} stopped out: {detail}",
+            severity="warning",
+            symbol=position["symbol"],
+            fields={
+                "strategy": book,
+                "venue": mode,
+                "symbol": position["symbol"],
+                "action": "EXIT",
+                "points": f"{points:+.2f}",
+                "stop": f"{stop_level:.2f}" if stop_level is not None else None,
+                "confirmed": confirmed,
+            },
+        )
+        return {
+            "kind": "STOP_LOSS",
+            "strategy_id": book,
+            "symbol": position["symbol"],
+            "position_id": position["id"],
+            "mark": mark,
+            "stop": stop_level,
+            "points": round(points, 2),
+            "confirmed": confirmed,
+            "reason": result.reason,
+        }
 
     def exit_on_signal(
         self,
@@ -850,7 +981,7 @@ class StrategyEngine:
                 "symbol": symbol,
                 "qty_lots": settings.default_lots,
                 "strategy": book,
-                "signal_detail": detail,
+                "gift_detail": detail,
             },
             source="OPEN_RECONCILE",
             strategy_id=book,
@@ -914,6 +1045,16 @@ class StrategyEngine:
         latch all belong to the strategy, not to the process.
         """
         source = run.source
+        if run is self.run and isinstance(source, GiftBarSource) and source.feed is not get_feed():
+            # The process feed was replaced (a reconnect, or a test stub). The
+            # run must follow it rather than read a series that has stopped.
+            #
+            # The interval is carried across. Rebuilding without it silently
+            # reset the book to the feed's own timeframe: a 15-minute GIFT book
+            # became 60-minute on the first reconnect, so it reported - and
+            # evaluated - the wrong series for the rest of the process's life.
+            source = GiftBarSource(get_feed(), interval=source.interval)
+            run.source = source
         # Kite history is authoritative; refresh it so the indicators run on
         # exchange OHLC rather than tick-built approximations.
         try:
@@ -934,8 +1075,8 @@ class StrategyEngine:
         needed = required_bars()
         # The engine-level warm-up counters describe the *active* run, because
         # that is the one the hero panel shows. Writing them from every run let
-        # the last strategy to evaluate win: with one book on 63 bars and another
-        # on 310, the hero reported 310 bars next to the first book's signal.
+        # the last strategy to evaluate win: with a GIFT book on 63 bars and a
+        # NIFTY book on 310, the hero reported 310 bars next to a GIFT signal.
         if run is self.run:
             with self._lock:
                 self.state.warmup_needed = needed
@@ -1187,7 +1328,10 @@ class StrategyEngine:
             # The pair disagrees, which is not an exit: an open position is held
             # through it until the indicators turn the other way. Nothing to
             # enter, and nothing to close.
-            return decision(None, "no signal")
+            return decision(
+                None,
+                "no signal",
+            )
 
         action = BUY if signal == strategy.BULL else SELL
         direction = 1 if signal == strategy.BULL else -1
@@ -1236,7 +1380,10 @@ class StrategyEngine:
             # Already positioned the way the owed entry wanted. The latch has
             # done its job, so it is cleared rather than left to fire later.
             self._set_pending_signal(None, None, run)
-            return decision(None, "position already matches the verdict")
+            return decision(
+                None,
+                "position already matches the verdict",
+            )
 
         # Portfolio rules, checked last so a refusal is only ever about exposure
         # rather than about a signal that was never going to trade anyway. These
@@ -1266,7 +1413,7 @@ class StrategyEngine:
                     "portfolio": allowed.to_dict(),
                 }
             db.record_signal(
-                action, verdict.detail.strip(), False, allowed.reason,
+                action, f"GIFT {verdict.detail}".strip(), False, allowed.reason,
                 strategy_id=run.id,
             )
             log.warning("Portfolio refused %s: %s", action, allowed.reason)
@@ -1302,7 +1449,6 @@ class StrategyEngine:
         return {"ok": True, "signal": signal, "detail": verdict.detail, "action": action,
                 "result": result}
 
-
     def _position_needs_action(
         self, direction: int, run: Optional[StrategyRun] = None
     ) -> bool:
@@ -1337,13 +1483,13 @@ class StrategyEngine:
         the bar. One and a half bars covers the engine poll and execution while
         still refusing anything that outlived a full bar plus half.
 
-        Measured from the book's own bar length, not a global interval setting:
+        Measured from the book's own bar length, not the GIFT interval setting:
         with books on different timeframes, one global figure would expire the
         60-minute book's signals three quarters of an hour before they are stale,
-        or let a 15-minute book's through long after its bar has gone.
+        or let the 15-minute book's through long after its bar has gone.
         """
         try:
-            seconds = int(run.seconds) if run is not None else settings.candle_interval_seconds
+            seconds = int(run.seconds) if run is not None else settings.gift_candle_interval_seconds
         except Exception:  # pragma: no cover - defensive
             seconds = 900
         return max(300, int(seconds * 1.5))
@@ -1360,7 +1506,7 @@ class StrategyEngine:
         signal_candle: Optional[dict[str, Any]] = None,
         run: Optional[StrategyRun] = None,
     ) -> dict[str, Any]:
-        """Place a signal, using a close-only fill only for after-hours PAPER.
+        """Place a signal, using a GIFT-close fill only for after-hours PAPER.
 
         ``signal_candle`` is the completed bar the signal came from. It is
         forwarded for the audit trail, so the order can be traced back to the bar
@@ -1373,8 +1519,28 @@ class StrategyEngine:
         """
         book = run.id if run is not None else self.strategy_id
         manager = get_order_manager()
+        # A book configured with only the paper index leg must not place a
+        # futures order. Without this, ``LEGS=gift`` still traded the future: the
+        # operator's leg list said one instrument and the bot traded another.
+        # Exits are deliberately not gated this way - a position that is already
+        # on the futures ledger has to be closable whatever the config now says.
+        if run is not None and not run.trades_futures:
+            reason = (
+                f"{action} not placed: {book} executes on "
+                f"{'/'.join(run.legs)} only, with no futures leg"
+            )
+            log.info("%s", reason)
+            db.record_signal(action, detail or reason, True, reason, strategy_id=book)
+            with self._lock:
+                run.state.last_action = f"{action} (no futures leg)"
+                run.state.last_action_at = db.iso()
+                run.state.last_result = {
+                    "ok": True, "action": action, "reason": reason, "skipped": True,
+                }
+            return {"ok": True, "action": action, "reason": reason, "skipped": True}
         # This book's mode, not the bot's. A run that did not opt into live keeps
-        # its paper ledger even when the bot is armed.
+        # its paper ledger even when the bot is armed, which is what lets the GIFT
+        # book carry on unchanged beside a live NIFTY book.
         mode = run.mode() if run is not None else get_execution_mode()
         symbol = manager.current_symbol()
         market = market_status()
@@ -1405,7 +1571,7 @@ class StrategyEngine:
                 self.state.last_action = f"{action} blocked (expired contract)"
                 self.state.last_action_at = db.iso()
                 self.state.last_result = {"ok": False, "action": action, "reason": reason}
-            db.record_signal(action, detail, False, reason)
+            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
             log.error("%s", reason)
             return {"ok": False, "reason": reason, "expired": True}
 
@@ -1425,7 +1591,7 @@ class StrategyEngine:
                 self.state.last_action = f"{action} blocked (expiry unresolved)"
                 self.state.last_action_at = db.iso()
                 self.state.last_result = {"ok": False, "action": action, "reason": reason}
-            db.record_signal(action, detail, False, reason)
+            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
             log.error("%s", reason)
             return {"ok": False, "reason": reason, "expired": True}
 
@@ -1435,10 +1601,10 @@ class StrategyEngine:
                 self.state.last_action = f"{action} deferred"
                 self.state.last_action_at = db.iso()
             reason = (
-                f"{action} signal held: NSE F&O closed "
+                f"{action} signal from GIFT Nifty held: NSE F&O closed "
                 f"({market['reason']}). Not auto-firing later."
             )
-            db.record_signal(action, detail, False, reason)
+            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
             with self._lock:
                 self.state.last_result = {"ok": False, "action": action, "reason": reason,
                                           "deferred": True}
@@ -1455,7 +1621,7 @@ class StrategyEngine:
                 self.state.orders_blocked += 1
                 self.state.last_error = reason
                 self.state.last_result = {"ok": False, "action": action, "reason": reason}
-            db.record_signal(action, detail, False, reason)
+            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
             log.error("%s", reason)
             return {"ok": False, "reason": reason}
 
@@ -1472,12 +1638,12 @@ class StrategyEngine:
                 f"{action} blocked: {book} paused "
                 f"({detail_reason(book) or 'PAUSED'})"
             )
-            db.record_signal(action, detail, False, reason)
+            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
             log.warning("%s", reason)
             return {"ok": False, "reason": reason}
 
         # The fill is the *future's* price, always - never the signal source's.
-        # NIFTY 50 is an index that cannot be traded, so booking an entry at its
+        # GIFT Nifty is an index that cannot be traded, so booking an entry at its
         # level writes the index/future basis straight into the position: the row
         # opens already showing a P&L that no trade produced, and the paper book
         # disagrees with the very LTP the dashboard shows for the same contract.
@@ -1494,15 +1660,22 @@ class StrategyEngine:
             "qty_lots": settings.default_lots,
             # The bar this *book* acted on, not the engine's. ``_last_bar_at``
             # tracks the active run only, so a 60-minute book's order was stamped
-            # with another book's bar - and the duplicate guard then compared it
-            # against the wrong row.
-            "signal_id": f"NIFTY-{action}-{book}-{run.state.last_bar_at if run is not None else self._last_bar_at}",
+            # with the 15-minute book's bar - and the duplicate guard then
+            # compared it against the wrong row.
+            "signal_id": f"GIFT-{action}-{book}-{run.state.last_bar_at if run is not None else self._last_bar_at}",
             "strategy": book,
-            "source": "NIFTY_ENGINE",
-            "signal_detail": detail,
+            "source": "GIFT_NIFTY_ENGINE",
+            "gift_detail": detail,
             "paper_after_hours": paper_after_hours,
             "max_age_seconds": max_age_seconds or self._signal_max_age(),
         }
+        # The protective stop, computed from the book's own rules. The order
+        # manager places it at the fill, so the level is relative to the price
+        # the broker actually gave rather than to the signal close. A book with
+        # no stop configured sends nothing and keeps the signal-only exit.
+        rules = getattr(run, "stop_rules", None) if run is not None else None
+        if rules is not None and rules.enabled:
+            payload["stop_rules"] = rules.to_dict()
         if signal_timestamp is not None:
             payload["timestamp"] = signal_timestamp.astimezone(IST).isoformat()
         # The completed signal bar, for the audit trail. Only the bar the signal
@@ -1510,7 +1683,7 @@ class StrategyEngine:
         # had it.
         if signal_candle:
             payload["signal_candle"] = signal_candle
-        # `price` is deliberately NOT set to the index close. A payload price is
+        # `price` is deliberately NOT set to the GIFT close. A payload price is
         # treated as an after-hours *fill* reference, so stamping the index level
         # there is what put the basis into every pre-market entry. `/api/signal`
         # callers may still supply one for the close-only webhook and mirror
@@ -1568,7 +1741,7 @@ class StrategyEngine:
 
     # -- loop ------------------------------------------------------------
     def loop(self, stop: threading.Event, interval: Optional[float] = None) -> None:
-        """Evaluate whenever a new bar closes.
+        """Evaluate whenever a new GIFT Nifty bar closes.
 
         The loop is cheap: :meth:`evaluate_now` returns immediately unless the
         newest bar timestamp changed, so a short poll interval costs one
@@ -1577,7 +1750,7 @@ class StrategyEngine:
         period = float(interval if interval is not None else settings.engine_interval_seconds)
         with self._lock:
             self.state.interval_seconds = period
-        log.info("Strategy engine started (poll %.1fs, NIFTY bars)", period)
+        log.info("Strategy engine started (poll %.1fs, GIFT Nifty bars)", period)
         while not stop.wait(period):
             try:
                 self.enforce_rollover()
@@ -1659,27 +1832,21 @@ class StrategyEngine:
             }
 
     def status(self) -> dict[str, Any]:
+        feed = get_feed()
         # Deliberately no history refresh here. This is the dashboard's poll
         # endpoint (every 1.5 s), and refresh_history is a synchronous Kite call
         # whenever its 30 s throttle expires - so one poll in twenty would block
         # on the network and the whole dashboard would visibly stall. The engine
         # loop and the mark loop already refresh it on their own cadence, so the
         # series this reads is at most one loop period old.
-        #
-        # The active run's own source, not a process-global feed: each book reads
-        # its own series, and the hero panel describes the active one.
-        source = self.run.source
-        candles = list(source.candles() or [])
-        # A history-only source has no forming bar - a bar appears when the
-        # exchange closes it - so every bar it returns is closed.
-        current_bar_in_progress = False
-        closed_candles = candles
+        candles, current_bar_in_progress = feed.candle_snapshot()
+        closed_candles = candles[:-1] if current_bar_in_progress else candles
         # The bar the engine trades, and the one before it. Named for what they
         # are rather than for their position in the list: "previous" used to mean
         # "the last closed bar", which read as the bar before that.
         last_closed_bar_at = closed_candles[-1]["time"] if closed_candles else None
         prior_closed_bar_at = closed_candles[-2]["time"] if len(closed_candles) > 1 else None
-        forming_bar_at = None
+        forming_bar_at = candles[-1]["time"] if current_bar_in_progress and candles else None
 
         # The dashboard polls this every 1.5s but the inputs only change when a
         # bar closes, so the verdicts are memoised on the bar timestamp. This
@@ -1700,7 +1867,7 @@ class StrategyEngine:
         market = market_status()
         with self._lock:
             payload = self.state.to_dict()
-        payload["feed"] = source.status()
+        payload["feed"] = feed.status()
         payload["current_values"] = current_verdict.values if current_verdict else None
         payload["current_conditions"] = current_verdict.conditions if current_verdict else None
         # The close the verdict was computed on. The indicator levels alone do not

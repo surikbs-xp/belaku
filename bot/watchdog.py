@@ -4,8 +4,8 @@ The container healthcheck answers "is the process alive?". That is not the same
 question. The failure modes that cost money are the ones where the process is
 perfectly healthy and the *trading* is not:
 
-* the signal series has stopped refreshing, or Kite history is failing (a token
-  that expired mid-session, or a dead network path);
+* the GIFT feed is connected but no ticks have arrived for minutes (a silently
+  dead websocket, or a token that expired mid-session);
 * the strategy is paused or latched on a risk breach and nobody noticed;
 * orders are being rejected - margin, a bad symbol, an expired instrument dump.
 
@@ -30,9 +30,9 @@ from config import settings
 
 log = logging.getLogger("watchdog")
 
-# A signal series that has not refreshed for this long is treated as stale. The
-# source polls Kite history every few seconds, so a multi-minute gap during
-# market hours means something is wrong, not that the market is quiet.
+# A feed with no tick for this long is treated as stale. GIFT Nifty trades
+# nearly continuously through the session, so a multi-minute gap during market
+# hours means something is wrong, not that the market is quiet.
 STALE_TICK_SECONDS = 180.0
 
 # The mark loop runs every ENGINE_INTERVAL_SECONDS (5s by default). Missing this
@@ -192,30 +192,31 @@ class Watchdog:
 
         if market_open:
             age = feed.get("tick_age_seconds")
-            if age is not None and age > self.stale_tick_seconds:
+            if feed.get("connected") and age is not None and age > self.stale_tick_seconds:
                 alerts.append(
                     _alert(
                         "STALE_FEED",
-                        f"The signal series has not refreshed for {age:.0f}s "
-                        f"(limit {self.stale_tick_seconds:.0f}s). "
-                        f"Signals cannot form on a series that is not updating.",
+                        f"The GIFT Nifty feed is connected but has delivered no tick "
+                        f"for {age:.0f}s (limit {self.stale_tick_seconds:.0f}s). "
+                        f"Signals cannot form on a feed that is not ticking.",
                         severity="critical",
-                        source=feed.get("symbol") or "NIFTY 50",
+                        source=feed.get("symbol") or "GIFT NIFTY",
                         last_tick=feed.get("last_tick_at"),
                         last_price=feed.get("last_price"),
-                        action_required="Check the Kite token and network; restart the bot if it does not recover.",
+                        action_required="Check the Kite websocket; restart the bot if it does not recover.",
                     )
                 )
-            if feed.get("error"):
+            if not feed.get("connected") and not feed.get("starting"):
                 alerts.append(
                     _alert(
                         "FEED_DOWN",
-                        f"The signal series is failing: {feed.get('error')}. "
-                        f"No signal can be generated until it recovers.",
+                        f"The GIFT Nifty feed is not connected: "
+                        f"{feed.get('error') or 'no error reported'}. "
+                        f"No signal can be generated until it reconnects.",
                         severity="critical",
-                        source=feed.get("symbol") or "NIFTY 50",
-                        error=feed.get("error"),
-                        action_required="Check the Kite access token and network; the bot cannot trade without market data.",
+                        source=feed.get("symbol") or "GIFT NIFTY",
+                        error=feed.get("error") or "no error reported",
+                        action_required="Check the Kite access token and network; the bot cannot trade without the feed.",
                     )
                 )
 
@@ -477,6 +478,7 @@ class Watchdog:
     def loop(self, stop: threading.Event, interval: float = 30.0) -> None:
         import database as db
         from engine import get_engine
+        from gift_nifty import get_feed
         from kite_client import market_status
 
         log.info("Watchdog started (every %.0fs)", interval)
@@ -487,11 +489,10 @@ class Watchdog:
                 # The full status payload, so the checks see the same figures the
                 # dashboard does - Kite auth lives beside `engine`, not inside it.
                 status = bot_module.api_status()
-                engine_status = status.get("engine") or {}
                 self.run_once(
                     market_open=bool(market_status().get("is_open")),
-                    feed=engine_status.get("feed") or {},
-                    engine=engine_status,
+                    feed=get_feed().status(),
+                    engine=status.get("engine") or {},
                     kite=status.get("kite") or {},
                     # The mark loop's own heartbeat. It lives beside `engine` in
                     # the payload, not inside it, because it describes the

@@ -39,6 +39,9 @@ log = logging.getLogger("strategy_run")
 # has its own pair and no two can collide.
 PENDING_SIGNAL_KEY = "engine_pending_signal"
 PENDING_SIGNAL_BAR_KEY = "engine_pending_signal_bar"
+# Per-strategy LIVE/PAPER override, persisted so a restart keeps the operator's
+# choice. The value is the book's own mode; absence means "follow the config".
+MODE_KEY = "strategy_mode"
 
 
 @dataclass
@@ -118,6 +121,8 @@ class StrategyRun:
         display_name: Optional[str] = None,
         enabled: bool = True,
         live: bool = False,
+        legs: Optional[tuple[str, ...]] = None,
+        stop_rules: Any = None,
     ) -> None:
         self.id = (strategy_id or db.DEFAULT_STRATEGY_ID).strip() or db.DEFAULT_STRATEGY_ID
         self.source = source
@@ -125,10 +130,23 @@ class StrategyRun:
         self.lots = int(lots) if lots is not None else int(settings.default_lots)
         self.display_name = display_name or self.id
         self.enabled = bool(enabled)
+        # The instruments this book places orders on. A signal is generated from
+        # one series; which venues carry it is a separate decision, and one
+        # strategy may want both.
+        #
+        # Unset defaults to what that book did before legs existed, which is not
+        # the same for both sources: a GIFT-sourced book has always settled the
+        # paper index book *and* placed the futures order, while a NIFTY-sourced
+        # one never had an index leg to settle. Defaulting both to futures alone
+        # would silently switch off an existing deployment's GIFT book.
+        self.legs: tuple[str, ...] = tuple(legs) if legs else self._default_legs()
         # Whether this book trades real money when the bot is in LIVE. Defaulted
         # off for the same reason as the config default: an unset flag must not
-        # be what arms a book.
+        # be what arms a book, and the GIFT book cannot be filled as itself.
         self.live = bool(live)
+        # This book's protective stop. ``None`` means the signal-only exit it had
+        # before stops existed, so an unconfigured book is unchanged.
+        self.stop_rules = stop_rules
         self.state = RunState()
 
         self._pending_signal: Optional[str] = None
@@ -145,23 +163,58 @@ class StrategyRun:
     def pending_bar_key(self) -> str:
         return f"{PENDING_SIGNAL_BAR_KEY}:{self.id}"
 
-    def mode(self, global_mode: Optional[str] = None) -> str:
-        """The mode *this book* trades in, given the bot's mode.
+    @property
+    def mode_key(self) -> str:
+        """Persisted key for this book's own LIVE/PAPER choice."""
+        return f"{MODE_KEY}:{self.id}"
 
-        The bot's switch stays the master control: in PAPER nothing is live, so a
-        book flagged ``live`` still simulates. Switched to LIVE, a book trades
-        real money only if it opted in - everything else keeps its paper ledger.
+    def stored_mode(self) -> Optional[str]:
+        """The mode this book was last switched to, or ``None`` if never set.
 
-        Resolved from the book rather than passed down from the caller so there
-        is exactly one definition of it. Every order path reads this instead of
-        ``get_execution_mode()``; the places that still need the bot's single
-        mode (the header, the readiness report) keep using the global one.
+        Read from the ledger so a restart resumes the operator's choice rather
+        than silently reverting to the config default - a book that was live
+        coming back as paper (or the reverse) is exactly the surprise this
+        persistence exists to prevent.
         """
-        from config import LIVE, PAPER, get_execution_mode
+        try:
+            value = db.get_settings().get(self.mode_key)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Could not read the stored mode for %s: %s", self.id, exc)
+            return None
+        from config import LIVE, PAPER
 
-        active = global_mode or get_execution_mode()
-        if active != LIVE:
-            return PAPER
+        return value if value in {LIVE, PAPER} else None
+
+    def set_mode(self, mode: str) -> str:
+        """Persist this book's own mode. Returns the mode now in force."""
+        from config import LIVE, PAPER
+
+        target = str(mode).strip().upper()
+        if target not in {LIVE, PAPER}:
+            raise ValueError(f"mode must be one of {[PAPER, LIVE]}")
+        db.set_settings({self.mode_key: target})
+        self.live = target == LIVE
+        log.warning("Book %s mode -> %s", self.id, target)
+        return target
+
+    def mode(self, global_mode: Optional[str] = None) -> str:
+        """The mode *this book* trades in.
+
+        Each strategy has its own LIVE/PAPER switch, independent of the other and
+        of the process-wide ``EXECUTION_MODE``. The stored choice wins; a book
+        that has never been switched falls back to its configured ``live`` flag,
+        and a book with neither stays in paper - the safe direction, because an
+        unset flag must never be what puts real money on a signal.
+
+        ``global_mode`` is accepted for callers that still pass the bot's mode,
+        but it no longer overrides the book: the whole point of the per-strategy
+        switch is that one book can be live while the other is paper.
+        """
+        from config import LIVE, PAPER
+
+        stored = self.stored_mode()
+        if stored is not None:
+            return stored
         return LIVE if self.live else PAPER
 
     @property
@@ -171,6 +224,40 @@ class StrategyRun:
     @property
     def symbol(self) -> str:
         return getattr(self.source, "key", self.id)
+
+    # -- execution legs --------------------------------------------------
+    def _default_legs(self) -> tuple[str, ...]:
+        """The legs a book had before ``LEGS`` existed.
+
+        Source-dependent on purpose: a GIFT-sourced book has always settled the
+        paper index book and placed the futures order, a NIFTY-sourced one never
+        had an index leg. One shared default would change existing behaviour.
+        """
+        return ("gift", "futures") if self.reads_gift else ("futures",)
+
+    @property
+    def reads_gift(self) -> bool:
+        """Whether this book's signal series is GIFT Nifty."""
+        try:
+            from bar_source import GiftBarSource
+
+            return isinstance(self.source, GiftBarSource)
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    @property
+    def trades_futures(self) -> bool:
+        """Whether this book places NFO futures orders."""
+        return "futures" in self.legs
+
+    @property
+    def trades_gift(self) -> bool:
+        """Whether this book settles the paper GIFT index leg.
+
+        Paper-only by construction: GIFT Nifty is a quote-only index on Kite, so
+        this leg can never reach a broker no matter what ``live`` says.
+        """
+        return "gift" in self.legs
 
     # -- owed-entry latch ------------------------------------------------
     def load_pending_signal(self) -> None:
@@ -305,6 +392,14 @@ class StrategyRun:
             "seconds": self.seconds,
             "lots": self.lots,
             "exit": self.params.get("exit", strategy.EXIT_FLIP),
+            # Which instruments carry this book's signals. The dashboard needs
+            # this to show one card per strategy with a row per execution leg
+            # rather than pretending each strategy is one position.
+            "legs": list(self.legs),
+            # The protective stop, so the dashboard can show the level and the
+            # rules behind it. ``stop_loss`` of zero means the book has no stop.
+            "stop_loss": getattr(self.stop_rules, "initial_points", 0.0) if self.stop_rules else 0.0,
+            "stop_rules": self.stop_rules.to_dict() if self.stop_rules else None,
             # The entry gates belong in the payload: a strategy labelled "ADX>15"
             # that is silently running unfiltered is worse than one with no
             # filter at all, because the label is what the operator trusts.
