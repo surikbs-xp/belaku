@@ -121,7 +121,6 @@ class StrategyRun:
         display_name: Optional[str] = None,
         enabled: bool = True,
         live: bool = False,
-        legs: Optional[tuple[str, ...]] = None,
         stop_rules: Any = None,
     ) -> None:
         self.id = (strategy_id or db.DEFAULT_STRATEGY_ID).strip() or db.DEFAULT_STRATEGY_ID
@@ -130,19 +129,9 @@ class StrategyRun:
         self.lots = int(lots) if lots is not None else int(settings.default_lots)
         self.display_name = display_name or self.id
         self.enabled = bool(enabled)
-        # The instruments this book places orders on. A signal is generated from
-        # one series; which venues carry it is a separate decision, and one
-        # strategy may want both.
-        #
-        # Unset defaults to what that book did before legs existed, which is not
-        # the same for both sources: a GIFT-sourced book has always settled the
-        # paper index book *and* placed the futures order, while a NIFTY-sourced
-        # one never had an index leg to settle. Defaulting both to futures alone
-        # would silently switch off an existing deployment's GIFT book.
-        self.legs: tuple[str, ...] = tuple(legs) if legs else self._default_legs()
         # Whether this book trades real money when the bot is in LIVE. Defaulted
         # off for the same reason as the config default: an unset flag must not
-        # be what arms a book, and the GIFT book cannot be filled as itself.
+        # be what arms a book.
         self.live = bool(live)
         # This book's protective stop. ``None`` means the signal-only exit it had
         # before stops existed, so an unconfigured book is unchanged.
@@ -224,40 +213,6 @@ class StrategyRun:
     @property
     def symbol(self) -> str:
         return getattr(self.source, "key", self.id)
-
-    # -- execution legs --------------------------------------------------
-    def _default_legs(self) -> tuple[str, ...]:
-        """The legs a book had before ``LEGS`` existed.
-
-        Source-dependent on purpose: a GIFT-sourced book has always settled the
-        paper index book and placed the futures order, a NIFTY-sourced one never
-        had an index leg. One shared default would change existing behaviour.
-        """
-        return ("gift", "futures") if self.reads_gift else ("futures",)
-
-    @property
-    def reads_gift(self) -> bool:
-        """Whether this book's signal series is GIFT Nifty."""
-        try:
-            from bar_source import GiftBarSource
-
-            return isinstance(self.source, GiftBarSource)
-        except Exception:  # pragma: no cover - defensive
-            return False
-
-    @property
-    def trades_futures(self) -> bool:
-        """Whether this book places NFO futures orders."""
-        return "futures" in self.legs
-
-    @property
-    def trades_gift(self) -> bool:
-        """Whether this book settles the paper GIFT index leg.
-
-        Paper-only by construction: GIFT Nifty is a quote-only index on Kite, so
-        this leg can never reach a broker no matter what ``live`` says.
-        """
-        return "gift" in self.legs
 
     # -- owed-entry latch ------------------------------------------------
     def load_pending_signal(self) -> None:
@@ -395,7 +350,6 @@ class StrategyRun:
             # Which instruments carry this book's signals. The dashboard needs
             # this to show one card per strategy with a row per execution leg
             # rather than pretending each strategy is one position.
-            "legs": list(self.legs),
             # The protective stop, so the dashboard can show the level and the
             # rules behind it. ``stop_loss`` of zero means the book has no stop.
             "stop_loss": getattr(self.stop_rules, "initial_points", 0.0) if self.stop_rules else 0.0,

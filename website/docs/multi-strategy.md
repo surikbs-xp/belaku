@@ -136,15 +136,15 @@ and only the third is obvious:
    broker net; with opposing books those agree by construction.
 
 The bot therefore enforces a portfolio rule: **two strategies may never hold
-opposing legs in the same contract.** An intended long is refused while another
-book holds a short, and the refusal names the book.
+opposing positions in the same contract.** An intended long is refused while
+another book holds a short, and the refusal names the book.
 
 ```mermaid
 graph TB
     A[StrategyRun A] -->|intends BUY| P[PortfolioAggregator]
     B[StrategyRun B] -->|intends SELL| P
     P -->|allowed| O[OrderManager]
-    P -->|refused: opposing legs| X[rejected, logged]
+    P -->|refused: opposing positions| X[rejected, logged]
 ```
 
 Other rules in the same place:
@@ -222,7 +222,7 @@ fact an operator needs to see.
 - **One loop means one slow feed delays both.** `refresh_history` cannot raise
   and cannot empty the series; keep that property.
 - **Sizing.** Two runs at 1 lot each with `MAX_OPEN_LOTS=4` leaves headroom. The
-  no-opposing-legs rule, not the lot cap, is what keeps the pair sane.
+  no-opposing-positions rule, not the lot cap, is what keeps the pair sane.
 
 ## Implementation map
 

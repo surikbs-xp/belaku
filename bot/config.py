@@ -179,33 +179,6 @@ class Settings:
     # distinguishable from a quiet market.
     alert_on_lifecycle: bool = _env_bool("ALERT_ON_LIFECYCLE", True)
 
-    # --- GIFT Nifty index book --------------------------------------------
-    # GIFT Nifty is a non-tradeable index on Kite, so it cannot be bought in LIVE
-    # mode at all. This runs the same signals through a separate paper book on the
-    # index level, which is the only way to see whether trading the index would
-    # have beaten trading the future. Off by default.
-    gift_book: bool = _env_bool("GIFT_BOOK", False)
-    # Own SQLite file, so the index ledger can never touch the futures ledger.
-    gift_book_db_path: str = _env_path("GIFT_BOOK_DB_PATH", str(BASE_DIR / "gift_book.db"))
-    # Units per position. Defaults to one NIFTY_LOT_SIZE, so the two books carry
-    # the same notional exposure and their P&L is directly comparable.
-    gift_book_units: int = _env_int("GIFT_BOOK_UNITS", 0)
-    gift_book_balance: float = _env_float("GIFT_BOOK_BALANCE", 200_000.0)
-
-    # --- Shadow paper book ------------------------------------------------
-    # While EXECUTION_MODE=LIVE, mirror every live position into a paper book
-    # kept in its own database, so the fill the model would have given can be
-    # compared against the fill the broker actually gave. Off by default: it
-    # doubles the order bookkeeping and is only useful while trading live.
-    paper_mirror: bool = _env_bool("PAPER_MIRROR", False)
-    # Separate SQLite file, so the shadow book can never touch the live ledger
-    # and can be deleted without losing trade history.
-    paper_mirror_db_path: str = _env_path(
-        "PAPER_MIRROR_DB_PATH", str(BASE_DIR / "paper_mirror.db")
-    )
-    # Paper balance the shadow book starts with, when the file is created.
-    paper_mirror_balance: float = _env_float("PAPER_MIRROR_BALANCE", 200_000.0)
-
     # How often the watchdog checks trading health, in seconds.
     watchdog_interval_seconds: float = _env_float("WATCHDOG_INTERVAL_SECONDS", 30.0)
     instrument_refresh_seconds: int = _env_int("INSTRUMENT_REFRESH_SECONDS", 3600)
@@ -369,16 +342,6 @@ class StrategyConfig:
     # in paper, which is the safe direction: an unset flag must never be what
     # puts real money on a signal the operator has not thought about.
     live: bool = False
-    # Which execution legs this strategy places orders on. A signal is generated
-    # from one series; executing it is a separate decision, and the two are not
-    # always the same instrument. ``gift`` is the *paper* index book - GIFT Nifty
-    # is quote-only on Kite, so a leg there can never reach a broker.
-    #
-    # Parsed from ``STRATEGY_<n>_LEGS=gift,futures``. An empty tuple means "not
-    # configured", and ``resolved_legs`` then answers with what that source did
-    # before this setting existed, so an .env written earlier trades exactly as
-    # before.
-    legs: tuple[str, ...] = ()
     # Protective stop, in index points, measured on the *futures* execution
     # price. ``stop_loss`` is the initial distance from the fill; the trail
     # activates at ``trail_after`` points of open profit and then follows the
@@ -402,20 +365,6 @@ class StrategyConfig:
             trail_points_after=self.trail_points_after,
         )
 
-    @property
-    def resolved_legs(self) -> tuple[str, ...]:
-        """The legs to trade, with the historical default applied.
-
-        Source-dependent, because the two sources did not behave alike: a
-        GIFT-sourced strategy has always settled the paper index book *and*
-        placed the futures order, while a NIFTY-sourced one never had an index
-        leg to settle. One shared default would silently switch off an existing
-        deployment's GIFT book on upgrade.
-        """
-        if self.legs:
-            return tuple(self.legs)
-        return ("gift", "futures") if self.source.strip().lower().startswith("gift") else ("futures",)
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "index": self.index,
@@ -429,7 +378,6 @@ class StrategyConfig:
             "filter_adx": self.filter_adx,
             "filter_ma": self.filter_ma,
             "live": self.live,
-            "legs": list(self.resolved_legs),
             "stop_loss": self.stop_loss,
             "trail_points": self.trail_points,
             "trail_after": self.trail_after,
@@ -498,7 +446,6 @@ def strategy_configs() -> list[StrategyConfig]:
                 filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
                 filter_ma=_env_int(prefix + "FILTER_MA", 0),
                 live=_env_bool(prefix + "LIVE", False),
-                legs=_parse_legs(_env(prefix + "LEGS", "")),
                 stop_loss=_env_float(prefix + "STOP_LOSS", 0.0),
                 trail_points=_env_float(prefix + "TRAIL_POINTS", 0.0),
                 trail_after=_env_float(prefix + "TRAIL_AFTER", 0.0),
@@ -506,41 +453,6 @@ def strategy_configs() -> list[StrategyConfig]:
             )
         )
     return out
-
-
-# The instruments a strategy may execute on. `futures` is the NFO Nifty future,
-# the only leg that can reach a broker for real money; `gift` is the paper index
-# book, which exists to compare the venue against the future.
-VALID_LEGS = ("futures", "gift")
-
-
-def _parse_legs(raw: str) -> tuple[str, ...]:
-    """Parse ``STRATEGY_<n>_LEGS`` into execution legs.
-
-    An unknown name raises rather than silently dropping the leg: a typo in the
-    leg list would otherwise trade one instrument fewer than the operator asked
-    for, which looks like a strategy that simply never fires.
-
-    Unset returns an empty tuple rather than a guess: the historical default
-    depends on the signal source, and ``StrategyConfig.resolved_legs`` is the one
-    place that knows it.
-    """
-    names = [part.strip().lower() for part in (raw or "").split(",") if part.strip()]
-    if not names:
-        # Unset, not "futures": StrategyConfig.resolved_legs owns the historical
-        # default, and it depends on the source.
-        return ()
-    unknown = [n for n in names if n not in VALID_LEGS]
-    if unknown:
-        raise ValueError(
-            f"Unknown execution leg(s) {unknown}; expected any of {list(VALID_LEGS)}"
-        )
-    # Deduplicated but ordered, so a repeated leg cannot double the size.
-    seen: list[str] = []
-    for name in names:
-        if name not in seen:
-            seen.append(name)
-    return tuple(seen)
 
 
 def enabled_strategies() -> list[StrategyConfig]:

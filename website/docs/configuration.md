@@ -109,35 +109,49 @@ harmless and cannot add an instance.
 
 :::warning[Docker paths must be on the volume]
 The image is `read_only: true`. Any path inside the image cannot be written,
-so `DB_PATH`, `LOG_FILE`, `HOLIDAY_CACHE_PATH`, `GIFT_BOOK_DB_PATH` and
-`PAPER_MIRROR_DB_PATH` must all point at `/data`.
+so `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` must all point at `/data`.
 :::
 
 
-## GIFT Nifty index book
+## Strategy
+
+The strategy uses exactly two indicators: **SuperTrend (14-period ATR × 3)** and
+**Parabolic SAR (0.02 / 0.02 / 0.2)**. The SuperTrend is fixed in code rather than
+configured — a second instance would reintroduce the vote the strategy dropped —
+so only the PSAR inputs are settings.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `GIFT_BOOK` | `0` | Also settle every signal in a paper book on the GIFT Nifty index. |
-| `GIFT_BOOK_DB_PATH` | `bot/gift_book.db` | Docker: `/data/gift_book.db`. Separate file, so the index ledger is isolated. |
-| `GIFT_BOOK_UNITS` | `0` | Units per position. `0` means "use `NIFTY_LOT_SIZE`", so both books carry the same notional. |
-| `GIFT_BOOK_BALANCE` | `200000` | Virtual balance the index book starts with, applied only when its file is created. |
+| `STRATEGY_PSAR_START` | `0.02` | |
+| `STRATEGY_PSAR_INCREMENT` | `0.02` | |
+| `STRATEGY_PSAR_MAXIMUM` | `0.2` | |
 
-GIFT Nifty is a non-tradeable index, so this book is **paper-only** by
-construction. See [Execution → Two books, one signal stream](./execution.md#two-books-one-signal-stream).
-State is on `/api/gift/*`, `/api/venues`, and under `gift_book` in `/api/status`.
+The warm-up requirement follows the fixed SuperTrend: 14 ATR bars plus one to
+compare against, so **15 closed candles**. `STRATEGY_SUPERTRENDS` and
+`STRATEGY_ST_MIN_AGREE` are no longer read; leaving them in an old `.env` is
+harmless and cannot add an instance.
 
-
-## Shadow paper book
+## Market data
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PAPER_MIRROR` | `0` | Mirror live positions into a parallel paper book. Only active with `EXECUTION_MODE=LIVE`. |
-| `PAPER_MIRROR_DB_PATH` | `bot/paper_mirror.db` | Docker: `/data/paper_mirror.db`. Separate file, so the shadow book can never touch the live ledger. |
-| `PAPER_MIRROR_BALANCE` | `200000` | Virtual balance the shadow book starts with, applied only when its file is created. |
+| `GIFT_CANDLE_INTERVAL` | `60minute` | Signal timeframe. See the tuning note below. |
+| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop and closed-bar check cadence |
+| `QUOTE_POLL_SECONDS` | `5` | |
+| `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
+| `HTTP_TIMEOUT_SECONDS` | `4.0` | |
 
-See [Execution → Shadow paper book](./execution.md#shadow-paper-book). State is
-on `/api/mirror` and under `mirror` in `/api/status`.
+## Storage
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DB_PATH` | `bot/paper_trading.db` | Docker: `/data/paper_trading.db` |
+| `HOLIDAY_CACHE_PATH` | `bot/data/nse_holidays.json` | Docker: `/data/nse_holidays.json` |
+
+:::warning[Docker paths must be on the volume]
+The image is `read_only: true`. Any path inside the image cannot be written,
+so `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` must all point at `/data`.
+:::
 
 
 ## Strategy

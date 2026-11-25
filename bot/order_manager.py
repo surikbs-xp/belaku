@@ -204,12 +204,6 @@ class OrderManager:
             return self.client.front_month_symbol(now)
         return future_symbol(now)
 
-    def _force_off_hours(self) -> bool:
-        """Testing/ops escape hatch: TRADING_ALLOW_OFF_HOURS=1."""
-        import os
-
-        return os.getenv("TRADING_ALLOW_OFF_HOURS", "0").lower() in {"1", "true", "yes"}
-
     def _price(
         self, symbol: str, payload: dict[str, Any], allow_payload_price: bool
     ) -> Optional[float]:
@@ -227,7 +221,7 @@ class OrderManager:
         ltp = self.client.get_ltp(symbol, max_age=0)
         if ltp:
             return float(ltp)
-        if allow_payload_price and payload.get("paper_after_hours") is not True:
+        if allow_payload_price:
             for key in ("price", "ltp", "close"):
                 if payload.get(key) not in (None, ""):
                     try:
@@ -613,16 +607,10 @@ class OrderManager:
         if signal_id and self._already_processed(signal_id, mode, strategy_id):
             return reject(f"Duplicate signal_id {signal_id}")
 
-        after_hours_paper_engine_signal = (
-            mode == PAPER
-            and source == "ENGINE"
-            and payload.get("paper_after_hours") is True
-        )
-        if (
-            action not in {FLAT, PANIC}
-            and not is_market_open()
-            and not after_hours_paper_engine_signal
-        ):
+        # Both LIVE and PAPER trade only inside the NSE session. Exits (FLAT,
+        # PANIC) are never blocked: a position that cannot be closed is worse
+        # than one that cannot be opened.
+        if action not in {FLAT, PANIC} and not is_market_open():
             return reject(f"Outside market hours ({market_status()['reason']})")
 
         age = _signal_age_seconds(payload)
@@ -969,24 +957,6 @@ class OrderManager:
         )
         if order_id:
             order_ids.append(str(order_id))
-        # Hand the real fill to the shadow book. This is the whole point of the
-        # mirror: it prices its own fill from the price the broker actually gave,
-        # so the resulting difference is the paper model's slippage error rather
-        # than a difference in market data. Failures here must never affect a
-        # live order, so nothing is allowed to propagate.
-        if mode == LIVE:
-            try:
-                from paper_mirror import get_mirror
-
-                get_mirror().note_fill(
-                    symbol=symbol,
-                    transaction_type=action,
-                    quantity=filled_quantity,
-                    price=fill_price,
-                    kind="ENTRY",
-                )
-            except Exception:
-                log.exception("Could not hand a live fill to the shadow book")
         if mode == PAPER:
             self._mark_equity()
 
@@ -1173,21 +1143,6 @@ class OrderManager:
                 )
             if status in {"OPEN", "TRIGGER_PENDING", "PENDING"}:
                 failures.append(f"{pos['symbol']}: exit order remains unresolved")
-            # Feed the real exit fill to the shadow book so the paper model is
-            # graded against the broker's price, not a quote taken later.
-            if mode == LIVE:
-                try:
-                    from paper_mirror import get_mirror
-
-                    get_mirror().note_fill(
-                        symbol=pos["symbol"],
-                        transaction_type=side,
-                        quantity=filled_quantity,
-                        price=exit_price,
-                        kind="EXIT",
-                    )
-                except Exception:
-                    log.exception("Could not hand a live fill to the shadow book")
             last_symbol = pos["symbol"]
 
         if closed_count and mode == PAPER:

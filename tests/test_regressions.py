@@ -38,23 +38,6 @@ def use_test_database(monkeypatch, tmp_path) -> None:
     db.init_db()
 
 
-def _isolate_gift_book(monkeypatch, tmp_path) -> None:
-    """Point the GIFT index book at a throwaway file.
-
-    Its own module-level singleton defaults to ``GIFT_BOOK_DB_PATH``, which on a
-    developer machine is the *real* ledger. A test that lets the engine settle the
-    index book would then append to it - and because the rows record the test's
-    own name, the damage is invisible until someone reads the dashboard.
-    """
-    import gift_book
-
-    book = gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=True, units=65)
-    monkeypatch.setattr(gift_book, "_book", book, raising=False)
-    # Every strategy id resolves to this one throwaway book, so a test cannot
-    # reach the real ledger through a per-strategy lookup.
-    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
-
-
 def use_risk_limits(
     monkeypatch,
     *,
@@ -968,54 +951,43 @@ def test_engine_status_evaluates_the_closed_bar_the_engine_actually_trades(monke
     assert status["last_signal"] == strategy.NO_SIGNAL
 
 
-def test_engine_after_hours_paper_order_does_not_price_from_the_gift_close(
-    monkeypatch,
-) -> None:
-    """The GIFT close gates the fill but must never *price* it.
+def test_engine_refuses_a_paper_entry_outside_market_hours(monkeypatch) -> None:
+    """PAPER obeys the same session gate as LIVE.
 
-    Booking an entry at the index level wrote the index/future basis into the
-    position, so the row opened showing a P&L no trade had produced. The fill has
-    to come from the future's own quote, which the order manager resolves.
+    There used to be an after-hours PAPER path that filled at the just-closed
+    index candle. It is gone: both modes trade only inside the NSE session, so an
+    out-of-session entry is deferred and never reaches the order manager.
     """
     captured = {}
-
-    class FakeResult:
-        ok = True
-        reason = "simulated"
-
-        def to_dict(self):
-            return {"ok": True, "action": "BUY"}
 
     class FakeManager:
         paused = False
 
         def current_symbol(self):
-            return "NIFTY26NOVFUT"
+            # The live front month, so the expiry backstop does not fire first.
+            return kite_client.future_symbol()
 
         def process_signal(self, payload, source, strategy_id=None, mode=None):
             captured.update(payload=payload, source=source)
-            return FakeResult()
+            raise AssertionError("an out-of-session PAPER entry must not be placed")
 
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
-    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False, "reason": "Post-market"})
+    monkeypatch.setattr(
+        engine, "market_status", lambda: {"is_open": False, "reason": "Post-market"}
+    )
     monkeypatch.setattr(engine, "get_order_manager", lambda: FakeManager())
-    signal_time = datetime.now(IST)
 
     result = engine.StrategyEngine().execute(
         "BUY",
         "closed-candle signal",
         paper_reference_price=24_418.5,
-        signal_timestamp=signal_time,
+        signal_timestamp=datetime.now(IST),
     )
 
-    assert result["ok"]
-    assert captured["source"] == "ENGINE"
-    # The reference price still marks the signal as after-hours, but it is not
-    # carried as a fill price - 24,418.5 must not appear in the payload at all.
-    assert captured["payload"]["paper_after_hours"] is True
-    assert "price" not in captured["payload"]
-    assert 24_418.5 not in captured["payload"].values()
-    assert captured["payload"]["timestamp"] == signal_time.isoformat()
+    assert result["ok"] is False
+    assert result["deferred"] is True
+    assert "closed" in result["reason"].lower()
+    assert captured == {}, "no order may be placed outside the session"
 
 
 def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_path) -> None:
@@ -1030,11 +1002,10 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
     until the first bar that closes in-session; without it the test would pass or
     fail depending on the wall clock when it ran.
     """
-    # Isolate the ledgers. Without this the engine's GIFT index book writes its
-    # signal trail into the developer's real gift_book.db, which is how that file
-    # came to hold hundreds of rows explaining that a test failed.
+    # Isolate the ledger. Without this the engine writes its signal trail into
+    # the developer's real database, which is how that file came to hold hundreds
+    # of rows explaining that a test failed.
     use_test_database(monkeypatch, tmp_path)
-    _isolate_gift_book(monkeypatch, tmp_path)
 
     monkeypatch.setattr(
         engine, "market_status",
@@ -1096,7 +1067,6 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
 
 def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog, tmp_path) -> None:
     use_test_database(monkeypatch, tmp_path)
-    _isolate_gift_book(monkeypatch, tmp_path)
 
     class FakeFeed:
         seconds = 300
@@ -1156,7 +1126,6 @@ def test_engine_exits_an_opposing_paper_position_on_startup(monkeypatch, tmp_pat
     two never share a candle.
     """
     use_test_database(monkeypatch, tmp_path)
-    _isolate_gift_book(monkeypatch, tmp_path)
 
     # Pinned open: the decision is held until the first in-session bar, so an
     # unstubbed market_status makes the test depend on the wall clock.
@@ -1276,14 +1245,18 @@ def test_after_hours_paper_engine_pnl_marks_the_future_not_gift(monkeypatch, tmp
     assert active_positions["positions"][0]["mode"] == PAPER
 
 
-def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_path) -> None:
+def test_paper_and_live_both_refuse_entries_outside_market_hours(monkeypatch, tmp_path) -> None:
+    """PAPER obeys the same session gate as LIVE.
+
+    The after-hours PAPER path is gone, so an out-of-session entry is rejected in
+    both modes. Exits are still allowed - a position that cannot be closed is
+    worse than one that cannot be opened.
+    """
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
     monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
     monkeypatch.setattr(
-        order_manager,
-        "market_status",
-        lambda: {"reason": "Post-market"},
+        order_manager, "market_status", lambda: {"reason": "Post-market"}
     )
 
     class FakeClient:
@@ -1293,12 +1266,7 @@ def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_p
             return 25_000.0
 
         def place_order(self, **kwargs):
-            return {
-                "order_id": "PAPER-TEST",
-                "status": "COMPLETE",
-                "filled_quantity": kwargs["quantity"],
-                "average_price": kwargs["price"],
-            }
+            raise AssertionError("no order may be placed outside the session")
 
         def data_source(self):
             return "CACHE"
@@ -1306,38 +1274,22 @@ def test_paper_engine_can_fill_after_hours_but_webhook_cannot(monkeypatch, tmp_p
     manager = OrderManager(FakeClient())
     payload = {
         "action": "BUY",
-        "symbol": "NIFTY26NOVFUT",
+        "symbol": kite_client.future_symbol(),
         "qty_lots": 1,
-        "price": 24_418.5,
-        "paper_after_hours": True,
         "timestamp": db.iso(),
         "signal_id": "after-hours-paper-test",
     }
 
     result = manager.process_signal(payload, source="ENGINE")
-    sell_payload = {
-        **payload,
-        "action": "SELL",
-        "price": 24_500.0,
-        "signal_id": "after-hours-paper-sell-test",
-    }
-    flipped = manager.process_signal(sell_payload, source="ENGINE")
-    rejected = manager.process_signal({**payload, "signal_id": "webhook-after-hours-test"}, source="WEBHOOK")
-    open_positions = db.get_open_positions(mode=PAPER)
+    webhook = manager.process_signal(
+        {**payload, "signal_id": "webhook-after-hours-test"}, source="WEBHOOK"
+    )
 
-    assert result.ok
-    assert result.quantity == 65
-    # Filled at the *future's* quote (25,000), not the payload's 24,418.5. The
-    # payload price is a GIFT/index level and booking it wrote the index/future
-    # basis into the row as P&L that no trade had produced.
-    assert result.price == 25_000.05
-    assert flipped.ok
-    assert flipped.quantity == 65
-    assert len(open_positions) == 1
-    assert open_positions[0]["position_key"] == -1
-    assert open_positions[0]["quantity"] == 65
-    assert not rejected.ok
-    assert "outside market hours" in rejected.reason.lower()
+    assert not result.ok
+    assert "outside market hours" in result.reason.lower()
+    assert not webhook.ok
+    assert "outside market hours" in webhook.reason.lower()
+    assert db.get_open_positions(mode=PAPER) == []
 
 
 def test_feed_connect_is_only_true_after_subscription_succeeds() -> None:
@@ -2511,7 +2463,7 @@ def test_engine_payload_carries_the_bar_scaled_max_age(monkeypatch) -> None:
         paused = False
 
         def current_symbol(self):
-            return "NIFTY26NOVFUT"
+            return kite_client.future_symbol()
 
         def process_signal(self, payload, source, strategy_id=None, mode=None):
             captured.update(payload=payload)
@@ -2522,7 +2474,7 @@ def test_engine_payload_carries_the_bar_scaled_max_age(monkeypatch) -> None:
         SimpleNamespace(gift_candle_interval_seconds=900, default_lots=1),
     )
     monkeypatch.setattr(engine, "get_execution_mode", lambda: PAPER)
-    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": False, "reason": "Post-market"})
+    monkeypatch.setattr(engine, "market_status", lambda: {"is_open": True, "reason": "Market open"})
     monkeypatch.setattr(engine, "get_order_manager", lambda: FakeManager())
 
     engine.StrategyEngine().execute(
@@ -2533,703 +2485,11 @@ def test_engine_payload_carries_the_bar_scaled_max_age(monkeypatch) -> None:
     assert captured["payload"]["max_age_seconds"] == 1350
 
 
-# ---------------------------------------------------------------------------
-# Shadow paper book
-#
-# The mirror is graded against real broker fills, so these tests pin the
-# behaviour that makes the comparison mean something: it copies the live
-# quantity rather than reconstructing it, it prices from the actual fill when
-# one is fresh (and says so when it is not), and it cannot leak into the live
-# ledger or stop trading.
-# ---------------------------------------------------------------------------
-def _mirror(monkeypatch, tmp_path, *, enabled=True, lot_size=65):
-    """A mirror on its own database, with a pinned size and no broker access."""
-    import order_manager
-    import paper_mirror as pm
-
-    use_test_database(monkeypatch, tmp_path)
-    # Settings is a frozen dataclass, so the modules' references are swapped for
-    # stand-ins rather than mutated - the same approach use_test_database takes.
-    stub = SimpleNamespace(
-        product="NRML",
-        order_type="MARKET",
-        tick_size=0.05,
-        slippage_ticks=1.0,
-        lot_size=lot_size,
-        paper_mirror_balance=200_000.0,
-        virtual_balance=1_000_000.0,
-    )
-    monkeypatch.setattr(pm, "settings", stub)
-    monkeypatch.setattr(order_manager, "settings", stub)
-    return pm.PaperMirror(
-        path=str(tmp_path / "mirror.db"),
-        mirror=enabled,
-        lot_size=lot_size,
-    )
-
-
-def _live_position(monkeypatch, symbol="NIFTY26NOVFUT", quantity=65):
-    """Put a position in the live ledger, which is what the mirror copies."""
-    db.open_position(symbol, quantity, 25_000.0, mode=LIVE, source="ENGINE")
-    monkeypatch.setenv("EXECUTION_MODE", LIVE)
-
-
-def test_mirror_does_nothing_unless_armed(monkeypatch, tmp_path) -> None:
-    """Off by default, and inert outside LIVE - it must never fire on a paper run."""
-    mirror = _mirror(monkeypatch, tmp_path, enabled=False)
-    monkeypatch.setenv("EXECUTION_MODE", LIVE)
-
-    assert mirror.reconcile() is None
-    assert mirror.status()["enabled"] is False
-    assert not (tmp_path / "mirror.db").exists()
-
-    # Configured but not live is the other half: a paper session is already the
-    # paper book, so a shadow copy of it would be meaningless.
-    import paper_mirror as pm
-
-    mirror = pm.PaperMirror(path=str(tmp_path / "mirror.db"), mirror=True, lot_size=65)
-    monkeypatch.setenv("EXECUTION_MODE", PAPER)
-    assert mirror.reconcile() is None
-    assert "LIVE" in mirror.status()["reason"]
-
-
-def test_mirror_copies_the_live_quantity_and_direction(monkeypatch, tmp_path) -> None:
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=-65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-
-    mirror.reconcile()
-
-    positions = db.get_open_positions(str(tmp_path / "mirror.db"), mode=PAPER)
-    assert len(positions) == 1
-    assert positions[0]["symbol"] == "NIFTY26NOVFUT"
-    assert positions[0]["quantity"] == 65
-    assert positions[0]["position_key"] == -1
-    assert positions[0]["source"] == "MIRROR"
-
-
-def test_mirror_matches_a_flip_without_a_broker_round_trip(monkeypatch, tmp_path) -> None:
-    """A flip is what the live book does; the mirror must follow it out and back."""
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-    mirror.reconcile()
-
-    live = db.get_open_positions(mode=LIVE)[0]
-    db.close_position(live["id"], 25_100.0, exit_reason="FLIP")
-    db.open_position("NIFTY26NOVFUT", -65, 25_100.0, mode=LIVE, source="ENGINE")
-    mirror._prices["NIFTY26NOVFUT"] = 25_100.0
-    mirror.reconcile()
-
-    net = mirror.status()["mirror_net"]
-    assert net == {"NIFTY26NOVFUT": -65}
-    assert mirror.status()["in_sync"] is True
-    trades = db.get_trades(path=str(tmp_path / "mirror.db"))
-    assert len(trades) == 1 and trades[0]["exit_reason"] == "MIRROR"
-
-
-def test_mirror_prices_from_the_real_fill_not_a_later_quote(monkeypatch, tmp_path) -> None:
-    """The whole point: the gap measured is the slippage model's error.
-
-    With a fresh broker fill at 25_010 the paper entry must be that price plus
-    the model's own one-tick slippage, and must record the fill lag. A quote of
-    25_000 is deliberately supplied to prove it is not what was used.
-    """
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-    mirror.note_fill(
-        symbol="NIFTY26NOVFUT",
-        transaction_type="BUY",
-        quantity=65,
-        price=25_010.0,
-    )
-
-    mirror.reconcile()
-
-    position = db.get_open_positions(str(tmp_path / "mirror.db"), mode=PAPER)[0]
-    assert position["entry_price"] == 25_010.05  # fill price + 1 tick slippage
-    notes = json.loads(position["notes"])
-    assert notes["basis"] == "live_fill"
-    assert notes["fill_lag_seconds"] is not None
-    assert notes["live_entry_price"] == 25_000.0
-
-
-def test_mirror_labels_a_fill_it_could_not_match(monkeypatch, tmp_path) -> None:
-    """A stale fill is booked from the quote but never passed off as a fill match.
-
-    Without the label the dataset would silently mix "measured against a real
-    fill" with "measured against a quote", which is the one distinction the
-    comparison exists to make.
-    """
-    import paper_mirror as pm
-
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-    mirror.note_fill(
-        symbol="NIFTY26NOVFUT",
-        transaction_type="BUY",
-        quantity=65,
-        price=25_010.0,
-    )
-    # Age the fill past the tolerance rather than sleeping for it.
-    for fill in mirror._recent_fills:
-        fill["at"] -= pm.FILL_TOLERANCE_SECONDS + 1
-
-    mirror.reconcile()
-
-    position = db.get_open_positions(str(tmp_path / "mirror.db"), mode=PAPER)[0]
-    assert json.loads(position["notes"])["basis"] == "live_fill_stale"
-    assert position["entry_price"] == 25_000.05  # the quote, not the old fill
-
-
-def test_mirror_writes_only_to_its_own_database(monkeypatch, tmp_path) -> None:
-    """The shadow book must never be able to touch the live ledger."""
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-
-    mirror.reconcile()
-
-    live = db.get_open_positions(mode=LIVE)
-    assert len(live) == 1 and live[0]["source"] == "ENGINE"
-    assert db.get_trades() == []
-    assert db.get_trades(path=str(tmp_path / "mirror.db")) == []
-
-
-def test_mirror_records_a_failure_instead_of_raising(monkeypatch, tmp_path) -> None:
-    """A broken shadow book reports itself; it cannot take the bot down with it."""
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-    monkeypatch.setattr(
-        db, "open_position", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full"))
-    )
-
-    status = mirror.reconcile()
-
-    assert status is not None
-    assert status["consecutive_failures"] >= 1
-    assert "disk full" in status["last_error"]
-    assert status["in_sync"] is False
-
-
-def test_mirror_skips_a_live_quantity_below_one_lot(monkeypatch, tmp_path) -> None:
-    """A partial fill under a lot cannot be mirrored, and must be reported."""
-    mirror = _mirror(monkeypatch, tmp_path, lot_size=65)
-    _live_position(monkeypatch, quantity=30)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-
-    status = mirror.reconcile()
-
-    assert db.get_open_positions(str(tmp_path / "mirror.db"), mode=PAPER) == []
-    assert "under one lot" in status["last_error"]
-
-
-def test_mirror_marks_itself_to_market(monkeypatch, tmp_path) -> None:
-    """Unrealised PnL has to be real, or the comparison is not like for like."""
-    mirror = _mirror(monkeypatch, tmp_path)
-    _live_position(monkeypatch, quantity=65)
-    mirror._prices["NIFTY26NOVFUT"] = 25_000.0
-    mirror.reconcile()
-
-    mirror.mark({"NIFTY26NOVFUT": 25_100.0})
-
-    position = db.get_open_positions(str(tmp_path / "mirror.db"), mode=PAPER)[0]
-    assert position["last_price"] == 25_100.0
-    # 65 units x 100 points, less the round-trip cost the shadow book booked.
-    unrealized = mirror.status()["comparison"]["mirror"]["unrealized_pnl"]
-    assert 6_400.0 < unrealized < 6_500.0, unrealized
-
-
-def test_mark_open_positions_refreshes_last_price(monkeypatch, tmp_path) -> None:
-    """The stop-loss reads `last_price`, so a mark that never lands blinds it."""
-    use_test_database(monkeypatch, tmp_path)
-    db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
-
-    touched = db.mark_open_positions(PAPER, {"NIFTY26NOVFUT": 24_900.0})
-
-    assert touched == 1
-    assert db.get_open_positions(mode=PAPER)[0]["last_price"] == 24_900.0
-
-
-def test_mirror_endpoint_reports_a_disabled_mirror(monkeypatch, tmp_path) -> None:
-    """Off is a normal answer, not an error - the dashboard has to render it."""
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-    import paper_mirror as pm
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app,
-        "get_mirror",
-        lambda: pm.PaperMirror(path=str(tmp_path / "mirror.db"), mirror=False),
-    )
-
-    response = TestClient(bot_app.app).get("/api/mirror")
-
-    assert response.status_code == 200
-    assert response.json()["enabled"] is False
-    assert response.json()["reason"] == "PAPER_MIRROR is off"
-
-
-def test_status_carries_the_mirror_block_and_survives_a_broken_mirror(
-    monkeypatch, tmp_path
-) -> None:
-    """The mirror is a side-car: its failure must not take /api/status with it."""
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-
-    client = TestClient(bot_app.app)
-    payload = client.get("/api/status").json()
-    assert payload["mirror"]["enabled"] is False
-
-    class Exploding:
-        def status(self):
-            raise RuntimeError("shadow book on fire")
-
-    monkeypatch.setattr(bot_app, "get_mirror", lambda: Exploding())
-    payload = client.get("/api/status").json()
-
-    assert payload["mirror"]["enabled"] is False
-    assert "shadow book on fire" in payload["mirror"]["reason"]
-
-
-def test_status_reports_the_build_that_is_serving(monkeypatch, tmp_path) -> None:
-    """The dashboard must be able to answer "is the latest commit live?".
-
-    Provenance is baked into the image at build time, so it is read from the
-    environment rather than from git - the container has no repository. An image
-    built without it reports empty strings, which the dashboard renders as
-    "Build unknown" instead of inventing a version.
-    """
-    from fastapi.testclient import TestClient
-
-    import dataclasses
-
-    import bot as bot_app
-    from config import settings
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-
-    client = TestClient(bot_app.app)
-
-    monkeypatch.setattr(
-        bot_app, "settings",
-        dataclasses.replace(
-            settings,
-            build_sha="4ba5f00af39f1234567890abcdef1234567890ab",
-            build_time="2026-11-21T16:23:00Z",
-            build_ref="main",
-        ),
-    )
-    build = client.get("/api/status").json()["build"]
-    assert build["sha"] == "4ba5f00af39f1234567890abcdef1234567890ab"
-    assert build["short_sha"] == "4ba5f00af39f"
-    assert build["time"] == "2026-11-21T16:23:00Z"
-    assert build["ref"] == "main"
-
-    monkeypatch.setattr(
-        bot_app, "settings",
-        dataclasses.replace(settings, build_sha="", build_time="", build_ref=""),
-    )
-    build = client.get("/api/status").json()["build"]
-    assert build["sha"] == ""
-    assert build["short_sha"] == "", "no provenance must not become a fake version"
-
-
-def test_status_reports_the_broker_round_trip(monkeypatch, tmp_path) -> None:
-    """The dashboard must be able to show how far the host is from Kite.
-
-    The region choice is justified by this number, so it has to be measured
-    rather than assumed. It is a real round-trip, so it is cached: the UI polls
-    every 1.5s and must not add a broker call per poll.
-    """
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-    import kite_client
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-
-    client = TestClient(bot_app.app)
-    # The client is process-global, so a sample from an earlier test would make
-    # the cache assertion below pass or fail for the wrong reason.
-    kite = kite_client.reset_client()
-
-    calls = []
-
-    class FakeKite:
-        def profile(self):
-            calls.append(1)
-            return {"user_id": "AB1234"}
-
-    monkeypatch.setattr(type(kite), "sdk_ready", property(lambda self: True))
-    monkeypatch.setattr(kite, "_kite", FakeKite())
-
-    latency = client.get("/api/status").json()["kite"]["latency"]
-    assert latency["available"] is True
-    assert latency["samples"] == 1
-    assert latency["median_ms"] >= 0
-
-    # A second poll inside the cache window must not add a sample. Counting
-    # profile() calls would not prove this: auth_status() calls it too.
-    client.get("/api/status")
-    latency = client.get("/api/status").json()["kite"]["latency"]
-    assert latency["samples"] == 1, "the latency probe must be cached, not per-poll"
-
-
-def test_latency_reports_unavailable_rather_than_zero(monkeypatch) -> None:
-    """No measurement must not look like a perfect one.
-
-    A zero would render as the best possible latency, which is the opposite of
-    the truth when the SDK is not ready or the token has expired.
-    """
-    import kite_client
-
-    kite = kite_client.KiteClient()
-    monkeypatch.setattr(type(kite), "sdk_ready", property(lambda self: False))
-
-    latency = kite.probe_latency()
-    assert latency["available"] is False
-    assert "median_ms" not in latency
-    assert latency["reason"]
-
-
-def test_latency_keeps_a_bounded_sample_window(monkeypatch) -> None:
-    """A long-running process must not grow the sample list without limit."""
-    import kite_client
-
-    kite = kite_client.KiteClient()
-    monkeypatch.setattr(type(kite), "sdk_ready", property(lambda self: True))
-    monkeypatch.setattr(kite, "_kite", type("K", (), {"profile": lambda self: {}})())
-
-    for _ in range(kite_client.LATENCY_SAMPLE_COUNT + 5):
-        kite.probe_latency(max_age=0)
-
-    assert len(kite._latency_samples) == kite_client.LATENCY_SAMPLE_COUNT
-
-
-# ---------------------------------------------------------------------------
-# GIFT Nifty index book
-#
 # The index book exists to answer one question - would trading the signal source
 # have beaten trading the future? - so these tests pin the properties that make
 # the comparison valid: both books act on the same bar, the index is paper-only
 # because it cannot be traded, and the two ledgers stay in separate files.
 # ---------------------------------------------------------------------------
-def _gift_book(monkeypatch, tmp_path, *, enabled=True, units=65):
-    import gift_book
-    import order_manager
-
-    use_test_database(monkeypatch, tmp_path)
-    stub = SimpleNamespace(
-        tick_size=0.05,
-        slippage_ticks=1.0,
-        lot_size=65,
-        gift_book_balance=200_000.0,
-        virtual_balance=1_000_000.0,
-        gift_book_units=units,
-    )
-    monkeypatch.setattr(gift_book, "settings", stub)
-    monkeypatch.setattr(order_manager, "settings", stub)
-    return gift_book.GiftBook(
-        path=str(tmp_path / "gift_book.db"),
-        enabled=enabled,
-        units=units,
-    )
-
-
-def test_gift_book_is_off_by_default(monkeypatch, tmp_path) -> None:
-    """It changes what the UI shows, so it must never switch itself on."""
-    book = _gift_book(monkeypatch, tmp_path, enabled=False)
-
-    assert book.execute("BUY", 25_000.0) is None
-    assert book.positions() == []
-    assert not (tmp_path / "gift_book.db").exists()
-    assert book.status() == {"enabled": False, "configured": False, "symbol": "NSEIX:GIFT NIFTY"}
-
-
-def test_gift_book_trades_the_index_level_not_a_contract(monkeypatch, tmp_path) -> None:
-    book = _gift_book(monkeypatch, tmp_path)
-
-    book.execute("BUY", 25_000.0, detail="2 of 3 ST agreed")
-
-    positions = book.positions()
-    assert len(positions) == 1
-    assert positions[0]["symbol"] == "NSEIX:GIFT NIFTY"
-    assert positions[0]["source"] == "GIFT_BOOK"
-    # One tick of slippage on the signal's close, in the adverse direction.
-    assert positions[0]["entry_price"] == 25_000.05
-    assert positions[0]["quantity"] == 65
-
-
-def test_gift_book_flips_like_the_pine_entries(monkeypatch, tmp_path) -> None:
-    """BUY/SELL are target positions, so an opposite signal flips in one step."""
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-
-    book.execute("SELL", 25_100.0)
-
-    assert book.net_units() == -65
-    trades = book.trades()
-    assert len(trades) == 1
-    assert trades[0]["exit_reason"] == "FLIP"
-    assert trades[0]["direction"] == "LONG"
-
-
-def test_gift_book_settles_at_the_signal_close_with_no_quote(monkeypatch, tmp_path) -> None:
-    """The bar's own close prices the fill, so the index book cannot be blocked.
-
-    This is the mechanism that lets it act at 02:00, when the futures book has to
-    defer - the single most important difference between the two books.
-    """
-    book = _gift_book(monkeypatch, tmp_path)
-
-    book.execute("SELL", 24_950.0, bar_at="2026-11-11T02:00:00+05:30")
-
-    assert book.net_units() == -65
-    assert book.trades() == []  # still open
-
-
-def test_gift_book_skips_a_bar_with_no_price(monkeypatch, tmp_path) -> None:
-    """An unpriced signal is recorded, never filled at a guess."""
-    book = _gift_book(monkeypatch, tmp_path)
-
-    assert book.execute("BUY", None) is None
-    assert book.execute("BUY", 0.0) is None
-    assert book.positions() == []
-    status = book.status()
-    assert status["skipped"] == 2
-    assert "no GIFT Nifty price" in status["last_error"]
-
-
-def test_gift_book_repeats_nothing_when_already_positioned(monkeypatch, tmp_path) -> None:
-    """A repeat of the same signal must not stack a second position."""
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-
-    assert book.execute("BUY", 25_050.0) is None
-    assert book.net_units() == 65
-    assert book.status()["fills"] == 1
-
-
-def test_gift_book_flattens_on_a_flat_signal(monkeypatch, tmp_path) -> None:
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-
-    book.execute("FLAT", 25_120.0)
-
-    assert book.net_units() == 0
-    assert book.trades()[0]["exit_reason"] == "FLAT"
-    # 65 units x ~119 points net of two ticks of slippage, less the round-trip
-    # cost stack. At 0.05% sell-side STT the stack is ~970 on this turnover, so
-    # the net lands near 6,823 - below 7,000, which is the statutory cost biting.
-    assert 6_700 < book.trades()[0]["net_pnl"] < 7_000
-
-
-def test_gift_book_keeps_its_own_ledger(monkeypatch, tmp_path) -> None:
-    """The two books must not be able to see or corrupt each other."""
-    book = _gift_book(monkeypatch, tmp_path)
-    db.open_position("NIFTY26NOVFUT", 65, 25_400.0, mode=PAPER, source="ENGINE")
-
-    book.execute("BUY", 25_000.0)
-
-    futures = db.get_open_positions(mode=PAPER)
-    assert [p["symbol"] for p in futures] == ["NIFTY26NOVFUT"]
-    assert [p["symbol"] for p in book.positions()] == ["NSEIX:GIFT NIFTY"]
-    assert db.get_trades() == []
-
-
-def test_gift_book_marks_to_the_index_level(monkeypatch, tmp_path) -> None:
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-
-    book.mark(25_100.0)
-
-    position = book.positions()[0]
-    assert position["last_price"] == 25_100.0
-    assert book.summary()["metrics"]["unrealized_pnl"] > 6_000
-
-
-def test_gift_book_records_a_failure_instead_of_raising(monkeypatch, tmp_path) -> None:
-    """It runs ahead of the futures order, so it can never be allowed to throw."""
-    book = _gift_book(monkeypatch, tmp_path)
-    monkeypatch.setattr(
-        db, "open_position", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full"))
-    )
-
-    result = book.execute("BUY", 25_000.0)
-
-    assert result is None
-    assert "disk full" in book.status()["last_error"]
-
-
-def test_gift_book_honours_the_pause_switch(monkeypatch, tmp_path) -> None:
-    """A paused bot must not open index trades either.
-
-    The index book is a separate ledger, so it does not go through the order
-    manager's entry guard. Without its own check, pausing the bot still opened
-    index positions - which is what made a "clean" reset re-enter within seconds.
-    """
-    import order_manager
-
-    book = _gift_book(monkeypatch, tmp_path)
-    manager = order_manager.get_order_manager()
-    manager.pause("RESET: books wiped")
-
-    try:
-        assert book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:30:00+05:30") is None
-        assert book.open_positions() == []
-        # The refusal is recorded, so the trail explains why nothing happened.
-        rows = book.signals()
-        assert rows and rows[0]["accepted"] == 0
-        assert "paused" in rows[0]["reason"]
-    finally:
-        manager.resume()
-
-    # Unpaused, the same call opens the position.
-    assert book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:35:00+05:30") is not None
-    assert len(book.open_positions()) == 1
-
-
-def test_gift_book_still_exits_while_paused(monkeypatch, tmp_path) -> None:
-    """A pause blocks entries, not exits - an open leg must still be closable."""
-    import order_manager
-
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:30:00+05:30")
-
-    manager = order_manager.get_order_manager()
-    manager.pause("RESET: books wiped")
-    try:
-        assert book.execute("FLAT", 25_100.0, bar_at="2026-11-12T21:35:00+05:30") is not None
-        assert book.open_positions() == []
-    finally:
-        manager.resume()
-
-
-def test_gift_book_records_its_own_signal_trail(monkeypatch, tmp_path) -> None:
-    """The index book's decisions must be readable from its own ledger.
-
-    The Orders tab scopes its signal trail to the selected venue, so an index
-    book that traded without recording a signal would render as "no signals"
-    while its order book showed fills - the exact mismatch this fixes.
-    """
-    book = _gift_book(monkeypatch, tmp_path)
-
-    book.execute("BUY", 25_000.0, bar_at="2026-11-12T21:30:00+05:30", detail="test")
-    book.execute("FLAT", 25_100.0, bar_at="2026-11-12T21:35:00+05:30", detail="test")
-
-    rows = book.signals()
-    assert [row["action"] for row in rows] == ["FLAT", "BUY"]
-    assert all(row["accepted"] == 1 for row in rows)
-    # The futures ledger is a different database and must stay untouched.
-    assert db.get_signals() == []
-
-
-def test_gift_book_records_a_refused_signal(monkeypatch, tmp_path) -> None:
-    """A skipped bar is a decision the trail has to explain, not silence."""
-    book = _gift_book(monkeypatch, tmp_path)
-
-    book.execute("BUY", None)
-
-    rows = book.signals()
-    assert len(rows) == 1
-    assert rows[0]["accepted"] == 0
-    assert "no GIFT Nifty price" in rows[0]["reason"]
-
-
-def test_gift_book_does_not_record_a_repeat_as_a_signal(monkeypatch, tmp_path) -> None:
-    """Holding the same position is a no-op, not a new decision."""
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-
-    book.execute("BUY", 25_050.0)
-
-    assert len(book.signals()) == 1
-
-
-def test_gift_signals_endpoint_reads_the_index_ledger(monkeypatch, tmp_path) -> None:
-    from fastapi.testclient import TestClient
-
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("SELL", 25_000.0)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(bot_app, "gift_books", lambda: [book])
-
-    payload = TestClient(bot_app.app).get("/api/gift/signals").json()
-
-    assert payload["enabled"] is True
-    assert payload["tradeable"] is False
-    assert payload["count"] == 1
-    assert payload["signals"][0]["action"] == "SELL"
-
-
-def test_gift_signals_endpoint_reports_a_disabled_book(monkeypatch, tmp_path) -> None:
-    from fastapi.testclient import TestClient
-
-    import gift_book
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app,
-        "gift_books",
-        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
-    )
-
-    payload = TestClient(bot_app.app).get("/api/gift/signals").json()
-
-    assert payload["enabled"] is False
-    assert payload["signals"] == []
-
-
-def test_gift_book_endpoints_report_a_disabled_book(monkeypatch, tmp_path) -> None:
-    """Off is a normal state for the UI to render, not a 500."""
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-    import gift_book
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app,
-        "gift_books",
-        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
-    )
-
-    client = TestClient(bot_app.app)
-    for path in ("/api/gift/positions", "/api/gift/trades", "/api/gift/orders"):
-        response = client.get(path)
-        assert response.status_code == 200, path
-        assert response.json()["tradeable"] is False
-    summary = client.get("/api/gift/summary").json()
-    assert summary["enabled"] is False
-    assert summary["reason"] == "GIFT_BOOK is off"
-
-
-# ---------------------------------------------------------------------------
-# St strategy: one SuperTrend (14x3) AND PSAR, both required
-# ---------------------------------------------------------------------------
-def _rising_candles(count: int = 40) -> list[dict[str, float]]:
-    """A clean uptrend, which an uptrend-following pair should both agree on."""
-    return [
-        {"high": 101.0 + i, "low": 99.0 + i, "close": 100.0 + i}
-        for i in range(count)
-    ]
-
-
 def test_single_supertrend_is_14x3_by_default() -> None:
     """The strategy is one SuperTrend instance, not a 2-of-3 vote."""
     assert strategy.SUPERTREND_ATR_LENGTH == 14
@@ -3657,181 +2917,6 @@ def test_status_exposes_the_contract_expiry_for_the_exec_panel(monkeypatch, tmp_
 # ---------------------------------------------------------------------------
 # Venue-scoped ledger: the Orders and Performance tabs read one book at a time
 # ---------------------------------------------------------------------------
-def test_gift_analytics_reads_its_own_ledger(monkeypatch, tmp_path) -> None:
-    """The index book's statistics must come from its own database. A shared
-    query would silently report futures trades under the index heading."""
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-    book.execute("SELL", 25_100.0)
-
-    analytics = book.analytics()
-
-    assert analytics["summary"]["trades"] == 1
-    assert analytics["summary"]["net_pnl"] > 0
-    # The futures ledger is untouched, so its own analytics stay empty.
-    assert db.get_trade_analytics(mode=PAPER)["summary"]["trades"] == 0
-
-
-def test_gift_analytics_is_empty_when_the_book_is_off(monkeypatch, tmp_path) -> None:
-    book = _gift_book(monkeypatch, tmp_path, enabled=False)
-
-    assert book.analytics() == {}
-
-
-def test_gift_analytics_endpoint_reports_a_disabled_book(monkeypatch, tmp_path) -> None:
-    """Off is a normal state for the UI to render, not a 500."""
-    from fastapi.testclient import TestClient
-
-    import gift_book
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app,
-        "gift_books",
-        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
-    )
-
-    response = TestClient(bot_app.app).get("/api/gift/analytics")
-
-    assert response.status_code == 200
-    assert response.json()["enabled"] is False
-    assert response.json()["tradeable"] is False
-
-
-def test_gift_portfolio_matches_the_futures_payload_shape(monkeypatch, tmp_path) -> None:
-    """The Performance tab's tiles are fed from either endpoint, so the two must
-    expose the same keys or the index venue would render em dashes."""
-    from fastapi.testclient import TestClient
-
-    book = _gift_book(monkeypatch, tmp_path)
-    book.execute("BUY", 25_000.0)
-    book.execute("SELL", 25_100.0)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(bot_app, "gift_books", lambda: [book])
-
-    payload = TestClient(bot_app.app).get("/api/gift/portfolio").json()
-
-    for key in ("total_pnl", "total_return_pct", "max_drawdown_pct", "total_trades",
-                "win_rate", "realized_total", "unrealized_pnl", "equity",
-                "initial_balance", "open_position_count"):
-        assert key in payload, key
-    assert payload["total_trades"] == 1
-    assert payload["tradeable"] is False
-    assert payload["mode"] == PAPER
-
-
-def test_gift_portfolio_is_empty_when_the_book_is_off(monkeypatch, tmp_path) -> None:
-    from fastapi.testclient import TestClient
-
-    import gift_book
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app,
-        "gift_books",
-        lambda: [gift_book.GiftBook(path=str(tmp_path / "gift_book.db"), enabled=False)],
-    )
-
-    payload = TestClient(bot_app.app).get("/api/gift/portfolio").json()
-
-    assert payload["enabled"] is False
-
-
-# ---------------------------------------------------------------------------
-# Rollover execution: a signal inside the window closes the old leg and opens
-# the new contract in one action
-# ---------------------------------------------------------------------------
-class _FrozenDatetime(datetime):
-    """A ``datetime`` whose ``now()`` is pinned, for expiry-boundary tests.
-
-    Only ``now()`` is overridden; construction and arithmetic behave normally, so
-    the module under test can still build and compare real timestamps.
-    """
-
-    _now: Optional[datetime] = None
-
-    @classmethod
-    def now(cls, tz=None):
-        moment = cls._now
-        return moment if tz is None else moment.astimezone(tz)
-
-
-def _pin_clock(monkeypatch, moment: datetime) -> None:
-    """Freeze ``kite_client``'s clock, which is where expiry is decided."""
-    _FrozenDatetime._now = moment
-    monkeypatch.setattr(kite_client, "datetime", _FrozenDatetime)
-
-
-def _pin_signal_clock(monkeypatch, moment: datetime) -> None:
-    """Freeze the clock the *staleness* check reads.
-
-    ``order_manager`` measures a signal's age against ``datetime.now`` in its own
-    module, so pinning ``kite_client`` alone leaves the age computed from the real
-    wall clock. A test that builds bars at a fixed timestamp then drifts into
-    "Stale signal" as the calendar moves away from it.
-    """
-    _FrozenDatetime._now = moment
-    monkeypatch.setattr(order_manager, "datetime", _FrozenDatetime)
-
-
-def _rollover_manager(monkeypatch, tmp_path, *, lot_size=65, now=None):
-    """A manager whose fills always succeed, with no broker access.
-
-    The clock is pinned to ``now`` (default: a quiet day well before the November
-    2026 expiry). The rollover decision itself depends only on which contract is
-    held relative to the front month, but the *entry block* asks whether that
-    contract has stopped trading - which is a question about the current time, so
-    an unpinned clock would make these tests pass or fail by calendar date.
-    """
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    _pin_clock(monkeypatch, now or datetime(2026, 11, 19, 10, 0, tzinfo=IST))
-    stub = SimpleNamespace(
-        product="NRML",
-        order_type="MARKET",
-        tick_size=0.05,
-        slippage_ticks=1.0,
-        lot_size=lot_size,
-        default_lots=1,
-        max_open_lots=4,
-        lot_margin=150_000.0,
-        virtual_balance=1_000_000.0,
-    )
-    monkeypatch.setattr(order_manager, "settings", stub)
-
-    class FakeClient:
-        mode = PAPER
-
-        def __init__(self):
-            self.orders = []
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_000.0
-
-        def place_order(self, **kwargs):
-            self.orders.append(kwargs)
-            return {
-                "order_id": f"o{len(self.orders)}",
-                "status": "COMPLETE",
-                "filled_quantity": kwargs["quantity"],
-                "average_price": kwargs["price"],
-            }
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "test"
-
-        def auth_status(self):
-            return {"authenticated": True}
-
-    client = FakeClient()
-    return OrderManager(client), client
-
-
 def test_a_flip_inside_the_window_rolls_the_position_to_the_new_contract(
     monkeypatch, tmp_path
 ) -> None:
@@ -3909,34 +2994,6 @@ def test_a_position_in_a_later_month_is_refused_as_double_exposure(
     assert client.orders == []
     # Nothing was closed: the refusal happens before any order is placed.
     assert [p["symbol"] for p in db.get_open_positions(mode=PAPER)] == ["NIFTY27JANFUT"]
-
-
-def test_rollover_does_not_touch_the_gift_index_book(monkeypatch, tmp_path) -> None:
-    """The index book shares the position table's shape but is a different
-    instrument in a different database. A rollover must never close it."""
-    import gift_book
-
-    manager, client = _rollover_manager(monkeypatch, tmp_path)
-    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
-    monkeypatch.setattr(
-        gift_book,
-        "settings",
-        SimpleNamespace(
-            tick_size=0.05, slippage_ticks=1.0, lot_size=65,
-            gift_book_balance=200_000.0, virtual_balance=1_000_000.0, gift_book_units=65,
-        ),
-    )
-    book.execute("BUY", 25_000.0)
-    db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
-
-    # A SELL against a long November position is a flip, so the rollover path
-    # runs - which is the case where the index book could be wrongly swept up.
-    result = manager._execute_directional({}, "SELL", "NIFTY26DECFUT", PAPER, "test", strategy_id=db.DEFAULT_STRATEGY_ID)
-
-    assert result.ok, result.reason
-    # The index book is untouched: still long, still open.
-    assert [p["symbol"] for p in book.positions()] == ["NSEIX:GIFT NIFTY"]
-    assert book.net_units() == 65
 
 
 def test_rollover_is_refused_when_the_old_leg_cannot_be_closed(monkeypatch, tmp_path) -> None:
@@ -4366,6 +3423,105 @@ def test_live_flip_inside_the_window_rolls_the_position(monkeypatch, tmp_path) -
 # ---------------------------------------------------------------------------
 
 
+def _rising_candles(count: int = 40) -> list[dict[str, float]]:
+    """A clean uptrend, which an uptrend-following pair should both agree on."""
+    return [
+        {"high": 101.0 + i, "low": 99.0 + i, "close": 100.0 + i}
+        for i in range(count)
+    ]
+
+
+
+class _FrozenDatetime(datetime):
+    """A ``datetime`` whose ``now()`` is pinned, for expiry-boundary tests.
+
+    Only ``now()`` is overridden; construction and arithmetic behave normally, so
+    the module under test can still build and compare real timestamps.
+    """
+
+    _now: Optional[datetime] = None
+
+    @classmethod
+    def now(cls, tz=None):
+        moment = cls._now
+        return moment if tz is None else moment.astimezone(tz)
+
+
+def _pin_clock(monkeypatch, moment: datetime) -> None:
+    """Freeze ``kite_client``'s clock, which is where expiry is decided."""
+    _FrozenDatetime._now = moment
+    monkeypatch.setattr(kite_client, "datetime", _FrozenDatetime)
+
+
+def _pin_signal_clock(monkeypatch, moment: datetime) -> None:
+    """Freeze the clock the *staleness* check reads.
+
+    ``order_manager`` measures a signal's age against ``datetime.now`` in its own
+    module, so pinning ``kite_client`` alone leaves the age computed from the real
+    wall clock. A test that builds bars at a fixed timestamp then drifts into
+    "Stale signal" as the calendar moves away from it.
+    """
+    _FrozenDatetime._now = moment
+    monkeypatch.setattr(order_manager, "datetime", _FrozenDatetime)
+
+
+def _rollover_manager(monkeypatch, tmp_path, *, lot_size=65, now=None):
+    """A manager whose fills always succeed, with no broker access.
+
+    The clock is pinned to ``now`` (default: a quiet day well before the November
+    2026 expiry). The rollover decision itself depends only on which contract is
+    held relative to the front month, but the *entry block* asks whether that
+    contract has stopped trading - which is a question about the current time, so
+    an unpinned clock would make these tests pass or fail by calendar date.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    _pin_clock(monkeypatch, now or datetime(2026, 11, 19, 10, 0, tzinfo=IST))
+    stub = SimpleNamespace(
+        product="NRML",
+        order_type="MARKET",
+        tick_size=0.05,
+        slippage_ticks=1.0,
+        lot_size=lot_size,
+        default_lots=1,
+        max_open_lots=4,
+        lot_margin=150_000.0,
+        virtual_balance=1_000_000.0,
+    )
+    monkeypatch.setattr(order_manager, "settings", stub)
+
+    class FakeClient:
+        mode = PAPER
+
+        def __init__(self):
+            self.orders = []
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_000.0
+
+        def place_order(self, **kwargs):
+            self.orders.append(kwargs)
+            return {
+                "order_id": f"o{len(self.orders)}",
+                "status": "COMPLETE",
+                "filled_quantity": kwargs["quantity"],
+                "average_price": kwargs["price"],
+            }
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "test"
+
+        def auth_status(self):
+            return {"authenticated": True}
+
+    client = FakeClient()
+    return OrderManager(client), client
+
+
+
 def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER):
     """An engine whose session, broker and executor are all stubbed.
 
@@ -4677,7 +3833,6 @@ def test_evaluate_now_closes_an_opposing_overnight_leg_without_reversing(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BEAR
 
@@ -4738,7 +3893,6 @@ def test_evaluate_now_holds_the_position_when_the_morning_bar_agrees(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.NO_SIGNAL
 
@@ -4824,7 +3978,6 @@ def test_evaluate_now_enters_when_the_signal_arrived_while_the_market_was_shut(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4912,7 +4065,6 @@ def test_evaluate_now_does_not_re_enter_while_already_positioned(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -4966,7 +4118,6 @@ def _fresh_signal_env(monkeypatch, tmp_path, verdicts, bars=None):
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(script))
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     return eng, feed, client
 
@@ -4997,7 +4148,6 @@ def test_each_run_reports_the_close_its_own_verdict_used(monkeypatch, tmp_path) 
     """
     import bar_source
 
-    _isolate_gift_book(monkeypatch, tmp_path)
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
         _verdict(strategy.BEAR, strategy.BULL, close=25_000.0),
         _verdict(strategy.BEAR, strategy.BULL, close=25_500.0),
@@ -5039,7 +4189,6 @@ def test_status_reports_the_close_the_verdict_was_computed_on(monkeypatch, tmp_p
     operator cannot tell whether the next bar is likely to keep the verdict. The
     close is the third number that makes the other two mean something.
     """
-    _isolate_gift_book(monkeypatch, tmp_path)
     # status() recomputes the verdict for the dashboard, so the script needs an
     # entry for that pass as well as for the evaluation.
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
@@ -5072,7 +4221,6 @@ def test_the_hero_warmup_counters_belong_to_the_active_run(monkeypatch, tmp_path
     """
     import bar_source
 
-    _isolate_gift_book(monkeypatch, tmp_path)
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
         _verdict(strategy.BULL, strategy.NO_SIGNAL),
         _verdict(strategy.BULL, strategy.BULL),
@@ -5107,50 +4255,6 @@ def test_the_hero_warmup_counters_belong_to_the_active_run(monkeypatch, tmp_path
     assert eng.state.warmup_have == active_bars, (
         "a non-active run overwrote the hero panel's bar count"
     )
-
-
-def test_only_a_gift_signalled_run_settles_the_gift_index_book(
-    monkeypatch, tmp_path
-) -> None:
-    """The GIFT index book is priced on GIFT Nifty, so only GIFT may settle it.
-
-    ``_settle_gift_book`` used to be called from ``evaluate_run`` with no check on
-    which strategy was running. Once a second strategy existed, every run settled
-    the same book: a NIFTY-signalled strategy would drive a GIFT-priced ledger,
-    and two runs would each read the other's position as their own.
-    """
-    import bar_source
-    import gift_book
-
-    _isolate_gift_book(monkeypatch, tmp_path)
-    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
-        _verdict(strategy.BULL, strategy.NO_SIGNAL),
-    ])
-    # _fresh_signal_env stubs settlement out so the order tests stay focused.
-    # Put the real method back: the guard is what is under test here.
-    monkeypatch.setattr(
-        eng, "_settle_gift_book",
-        engine.StrategyEngine._settle_gift_book.__get__(eng),
-    )
-
-    book = gift_book.get_gift_book()
-    before = len(book.positions())
-
-    # A NIFTY-signalled run must not touch the GIFT-priced book.
-    nifty_run = engine.StrategyRun(
-        "nifty-book", bar_source.NiftyBarSource(), params={}, lots=1
-    )
-    eng._settle_gift_book("BUY", _verdict(strategy.BULL, strategy.NO_SIGNAL),
-                          "2026-11-16T09:30:00+05:30", nifty_run)
-    assert len(book.positions()) == before, "a NIFTY run settled the GIFT book"
-
-    # The GIFT-signalled run still does.
-    gift_run = engine.StrategyRun(
-        "gift-book", bar_source.GiftBarSource(feed), params={}, lots=1
-    )
-    eng._settle_gift_book("BUY", _verdict(strategy.BULL, strategy.NO_SIGNAL),
-                          "2026-11-16T09:30:00+05:30", gift_run)
-    assert len(book.positions()) == before + 1, "the GIFT run did not settle its book"
 
 
 def test_a_flip_exit_reverses_on_the_same_bar(monkeypatch, tmp_path) -> None:
@@ -5248,7 +4352,6 @@ def test_the_owed_entry_survives_a_restart(monkeypatch, tmp_path) -> None:
     db.close_position(db.get_open_positions(mode=PAPER)[0]["id"], 25_000.0)
 
     restarted = engine.StrategyEngine()
-    monkeypatch.setattr(restarted, "_settle_gift_book", lambda *a, **k: None)
     restarted._last_bar_at = "seed"
 
     feed.n = 2
@@ -5567,7 +4670,6 @@ def test_evaluate_now_holds_through_a_disagreeing_bar(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -5625,7 +4727,6 @@ def test_strategy_exit_flat_restores_the_disagreeing_bar_exit(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {"exit": "flat"})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: verdict)
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -5690,7 +4791,6 @@ def test_a_run_of_opposite_bars_exits_only_once(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BULL
 
@@ -5753,7 +4853,6 @@ def test_evaluate_now_flips_a_paper_position_on_the_opposite_verdict(
     monkeypatch.setattr(engine, "required_bars", lambda: 1)
     monkeypatch.setattr(engine, "strategy_params", lambda: {})
     monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    monkeypatch.setattr(eng, "_settle_gift_book", lambda *a, **k: None)
     eng._last_bar_at = "seed"
     eng._last_signal = strategy.BEAR
 
@@ -5766,162 +4865,6 @@ def test_evaluate_now_flips_a_paper_position_on_the_opposite_verdict(
 
     assert result["action"] == "SELL"
     assert db.get_open_positions(mode=PAPER)[0]["position_key"] == -1
-
-
-def test_evaluate_now_drives_the_gift_index_book_after_hours(
-    monkeypatch, tmp_path
-) -> None:
-    """The index book must act on the same bars whatever the NSE session is.
-
-    GIFT Nifty trades ~20 hours while NSE F&O trades 6 h 15 m, so gating the index
-    book on the 09:15 open would make it react to the *overnight* verdict while
-    the futures book waited for the morning's - the two venues would disagree on
-    when they acted, which is the one thing that comparison exists not to do. A
-    bar with no signal must leave the index book alone: there is no neutral exit,
-    so its position is carried until the opposite pair confirms or its stop trips.
-    """
-    import gift_book
-
-    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
-    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
-    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
-
-    # After hours: the futures decision is held, the index book is not.
-    monkeypatch.setattr(
-        engine, "market_status",
-        lambda: {"is_open": False, "reason": "Post-market - closed at 15:30 IST"},
-    )
-    bars = [
-        {"time": "2026-11-16T15:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T16:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T16:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-    ]
-    # BULL is a transition on the first bar, then the state persists; the third
-    # bar flips the pair into BEAR, which is the exit - a disagreeing bar before
-    # it is carried, because NO_SIGNAL is not an exit.
-    verdicts = iter([
-        SimpleNamespace(signal=strategy.BULL, previous_signal=strategy.NO_SIGNAL,
-                        opposite=False, flat=False,
-                        fresh=True, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-        SimpleNamespace(signal=strategy.NO_SIGNAL, previous_signal=strategy.BULL,
-                        opposite=False, flat=True,
-                        fresh=False, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.NO_SIGNAL,
-                        opposite=False, flat=False,
-                        fresh=True, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-    ])
-
-    class FakeFeed:
-        seconds = 900
-
-        def __init__(self):
-            self.n = 0
-
-        def refresh_history(self):
-            return None
-
-        def candles(self):
-            return bars[: self.n]
-
-    feed = FakeFeed()
-    monkeypatch.setattr(engine, "get_feed", lambda: feed)
-    monkeypatch.setattr(engine, "required_bars", lambda: 1)
-    monkeypatch.setattr(engine, "strategy_params", lambda: {})
-    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    eng._last_bar_at = "seed"
-    eng._last_signal = strategy.NO_SIGNAL
-
-    feed.n = 1
-    opened = eng.evaluate_now()
-    assert opened["action"] is None
-    assert opened["gift_book"]["action"] == "BUY"
-    assert book.net_units() == 65
-    # The futures book did nothing: it is out of session.
-    assert client.orders == []
-
-    # The pair merely disagrees: the book keeps its long. There is no neutral
-    # exit, so a NO_SIGNAL bar is carried exactly as the futures leg carries it.
-    feed.n = 2
-    held = eng.evaluate_now()
-    assert held["gift_book"] is None
-    assert book.net_units() == 65
-
-    # The pair confirms the other way: the book flips, still without the futures
-    # book, which is out of session.
-    feed.n = 3
-    flipped = eng.evaluate_now()
-    assert flipped["gift_book"]["action"] == "SELL"
-    assert book.net_units() == -65
-    assert client.orders == []
-
-
-def test_evaluate_now_drives_the_gift_index_book_in_live(monkeypatch, tmp_path) -> None:
-    """LIVE must not change the index book's behavior - it is paper in every mode.
-
-    GIFT Nifty has no tradeable contract, so the mode the futures book is in has
-    no bearing on the index book: it follows the same verdict either way.
-    """
-    import gift_book
-
-    eng, manager, client = _overnight_env(monkeypatch, tmp_path, mode=LIVE)
-    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
-    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
-
-    monkeypatch.setattr(
-        engine, "market_status",
-        lambda: {"is_open": True, "reason": "Market open"},
-    )
-    bars = [
-        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-    ]
-    verdicts = iter([
-        SimpleNamespace(signal=strategy.BULL, previous_signal=strategy.NO_SIGNAL,
-                        opposite=False,
-                        flat=False,
-                        fresh=True, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.BULL,
-                        opposite=True,
-                        flat=False,
-                        fresh=True, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-    ])
-
-    class FakeFeed:
-        seconds = 900
-
-        def __init__(self):
-            self.n = 0
-
-        def refresh_history(self):
-            return None
-
-        def candles(self):
-            return bars[: self.n]
-
-    feed = FakeFeed()
-    monkeypatch.setattr(engine, "get_feed", lambda: feed)
-    monkeypatch.setattr(engine, "required_bars", lambda: 1)
-    monkeypatch.setattr(engine, "strategy_params", lambda: {})
-    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    eng._last_bar_at = "seed"
-    eng._last_signal = strategy.NO_SIGNAL
-
-    feed.n = 1
-    entered = eng.evaluate_now()
-    assert entered["gift_book"]["action"] == "BUY"
-    assert book.net_units() == 65
-
-    # The pair flips, so the book flattens - the exit rule is the same in LIVE as
-    # in PAPER, because the index book is paper in every mode.
-    feed.n = 2
-    exited = eng.evaluate_now()
-    assert exited["gift_book"]["action"] == "SELL"
-    assert book.net_units() == -65
 
 
 def test_a_book_may_not_open_against_another_books_position(monkeypatch, tmp_path) -> None:
@@ -6035,7 +4978,6 @@ def test_every_run_reports_its_own_state(monkeypatch, tmp_path) -> None:
     broken.
     """
     use_test_database(monkeypatch, tmp_path)
-    _isolate_gift_book(monkeypatch, tmp_path)
 
     import bar_source
     import strategy_run
@@ -6745,170 +5687,20 @@ def test_two_strategies_positions_are_isolated(monkeypatch, tmp_path) -> None:
     assert len(db.get_open_positions(mode=PAPER)) == 2
 
 
-def test_both_books_reverse_on_the_same_flip(monkeypatch, tmp_path) -> None:
-    """PAPER must trade both venues, and both must reverse on the flip.
-
-    The two books are the whole point of PAPER mode: GIFT Nifty signals, GIFT
-    Nifty fills in the index book *and* futures fills in the paper futures book,
-    settled on the same bar. A reversal that happened in only one of them would
-    make the comparison meaningless from the first flip onwards.
-    """
-    import gift_book
-
-    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
-    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
-    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
-    _pin_signal_clock(monkeypatch, datetime(2026, 11, 16, 9, 15, tzinfo=IST))
-    monkeypatch.setattr(
-        engine, "market_status", lambda: {"is_open": True, "reason": "Market open"}
-    )
-    bars = [
-        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-    ]
-    verdicts = iter([
-        SimpleNamespace(signal=strategy.BULL, previous_signal=strategy.NO_SIGNAL,
-                        opposite=False, flat=False, fresh=True, detail="test",
-                        bars=100, conditions={}, values={}, close=25_000.0),
-        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.BULL,
-                        opposite=True, flat=False, fresh=True, detail="test",
-                        bars=100, conditions={}, values={}, close=25_100.0),
-    ])
-
-    class FakeFeed:
-        seconds = 3600
-
-        def __init__(self):
-            self.n = 0
-
-        def refresh_history(self):
-            return None
-
-        def candles(self):
-            return bars[: self.n]
-
-    feed = FakeFeed()
-    monkeypatch.setattr(engine, "get_feed", lambda: feed)
-    monkeypatch.setattr(engine, "required_bars", lambda: 1)
-    monkeypatch.setattr(engine, "strategy_params", lambda: {"exit": "flip"})
-    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    eng._last_bar_at = "seed"
-    eng._last_signal = strategy.NO_SIGNAL
-
-    feed.n = 1
-    opened = eng.evaluate_now()
-    assert opened["gift_book"]["action"] == "BUY"
-    assert book.net_units() == 65
-
-    feed.n = 2
-    flipped = eng.evaluate_now()
-
-    # Both venues took the flip on the same bar, in opposite directions.
-    assert flipped["action"] == "SELL"
-    assert flipped["gift_book"]["action"] == "SELL"
-    assert book.net_units() == -65
-    assert [p["position_key"] for p in db.get_open_positions(mode=PAPER)] == [-1]
-
-
-def test_overnight_reconcile_also_settles_the_gift_index_book(
-    monkeypatch, tmp_path
-) -> None:
-    """The overnight path must settle the index book too, not only the futures.
-
-    The two venues keep their own hours, so on the pre-open bar the index book
-    takes the flip immediately while the futures leg waits for the morning's
-    in-session bar. The point of the test is that the *futures* reconcile does not
-    swallow the index book's settle: both ledgers end the morning on the verdict,
-    and neither is left a bar behind.
-    """
-    import gift_book
-
-    eng, manager, client = _overnight_env(monkeypatch, tmp_path)
-    db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
-    book = gift_book.GiftBook(path=str(tmp_path / "gift.db"), enabled=True, units=65)
-    monkeypatch.setattr(gift_book, "get_gift_book", lambda strategy_id=None: book)
-    book.execute("BUY", 25_000.0)
-
-    state = {"open": False}
-    monkeypatch.setattr(
-        engine, "market_status",
-        lambda: {"is_open": state["open"], "reason": "Pre-market"},
-    )
-    bars = [
-        {"time": "2026-11-16T08:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-    ]
-    # The pre-open bar merely disagrees, which is not an exit and not an entry:
-    # both books hold and the futures leg is deferred to the morning's own bar.
-    # That bar then opens the short, which closes the long overnight leg.
-    verdicts = iter([
-        SimpleNamespace(signal=strategy.NO_SIGNAL, previous_signal=strategy.BULL,
-                        opposite=False,
-                        flat=True,
-                        fresh=False, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-        SimpleNamespace(signal=strategy.BEAR, previous_signal=strategy.NO_SIGNAL,
-                        opposite=False,
-                        flat=False,
-                        fresh=True, detail="test", bars=100, conditions={},
-                        values={}, close=25_000.0),
-    ])
-
-    class FakeFeed:
-        seconds = 900
-
-        def __init__(self):
-            self.n = 0
-
-        def refresh_history(self):
-            return None
-
-        def candles(self):
-            return bars[: self.n]
-
-    feed = FakeFeed()
-    monkeypatch.setattr(engine, "get_feed", lambda: feed)
-    monkeypatch.setattr(engine, "required_bars", lambda: 1)
-    monkeypatch.setattr(engine, "strategy_params", lambda: {})
-    monkeypatch.setattr(engine.strategy, "evaluate", lambda c, p: next(verdicts))
-    eng._last_bar_at = "seed"
-    eng._last_signal = strategy.BEAR
-
-    # Pre-open: nothing moves. The index book has no exit to take, and the
-    # futures leg is deferred to the first in-session close.
-    feed.n = 1
-    pre_open = eng.evaluate_now()
-    assert eng._overnight_pending is True
-    assert pre_open["gift_book"] is None
-    assert book.net_units() == 65
-    assert db.get_open_positions(mode=PAPER)[0]["position_key"] == 1
-
-    # The 09:00 bar closes in-session and confirms BEAR. The reconcile flips the
-    # wrong long to the short; the index book opens the same side on the same bar,
-    # on its own hours. Neither ledger is left a bar behind.
-    state["open"] = True
-    feed.n = 2
-    result = eng.evaluate_now()
-
-    assert result["action"] == "SELL"
-    assert book.net_units() == -65
-    assert db.get_open_positions(mode=PAPER)[0]["position_key"] == -1
-
-
-def test_after_hours_paper_entry_books_the_future_price_not_the_gift_close(
+def test_a_paper_entry_books_the_future_price_not_the_signal_close(
     monkeypatch, tmp_path
 ) -> None:
     """The row must not open holding the index/future basis.
 
-    Reproduces the reported symptom: a long opened from a GIFT close and marked
-    at the future's LTP showed a loss equal to the basis, with no trade behind it.
-    Filling and marking from one instrument is what removes it.
+    A long opened from the signal close and marked at the future's LTP showed a
+    loss equal to the basis, with no trade behind it. Filling and marking from
+    one instrument is what removes it.
     """
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
     monkeypatch.setattr(
-        order_manager, "market_status", lambda: {"reason": "Post-market", "is_open": False}
+        order_manager, "market_status", lambda: {"reason": "Market open", "is_open": True}
     )
     monkeypatch.setattr(
         order_manager, "settings",
@@ -6919,7 +5711,7 @@ def test_after_hours_paper_entry_books_the_future_price_not_the_gift_close(
         ),
     )
 
-    # The GIFT close (25,293) and the future's LTP (25,235) differ by the basis.
+    # The signal close (25,293) and the future's LTP (25,235) differ by the basis.
     class FakeClient:
         mode = PAPER
 
@@ -6950,10 +5742,9 @@ def test_after_hours_paper_entry_books_the_future_price_not_the_gift_close(
 
     payload = {
         "action": "BUY",
-        "symbol": "NIFTY26NOVFUT",
+        "symbol": kite_client.future_symbol(),
         "qty_lots": 1,
-        "paper_after_hours": True,
-        "price": 25_293.0,   # a GIFT close supplied by a caller
+        "price": 25_293.0,   # a signal close supplied by a caller
     }
     result = manager.process_signal(payload, source="ENGINE")
 
@@ -6964,14 +5755,14 @@ def test_after_hours_paper_entry_books_the_future_price_not_the_gift_close(
     assert position["entry_price"] != 25_293.0
 
     marks = manager.price_map()
-    assert marks["NIFTY26NOVFUT"] == 25_235.0
+    assert marks[position["symbol"]] == 25_235.0
     # Opened flat, not down by the basis.
-    pnl = (marks["NIFTY26NOVFUT"] - position["entry_price"]) * position["quantity"]
+    pnl = (marks[position["symbol"]] - position["entry_price"]) * position["quantity"]
     assert pnl == 0.0
 
 
-def test_after_hours_fill_is_impossible_without_a_future_quote(monkeypatch, tmp_path) -> None:
-    """Fail closed: no future price means no fill, not a GIFT-index fill.
+def test_a_paper_entry_fails_closed_without_a_future_quote(monkeypatch, tmp_path) -> None:
+    """Fail closed: no future price means no fill, not a signal-index fill.
 
     Booking at the index was the old fallback, and it is what put basis into the
     position. Refusing is the honest outcome - a paper entry at a price the
@@ -6979,9 +5770,9 @@ def test_after_hours_fill_is_impossible_without_a_future_quote(monkeypatch, tmp_
     """
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
     monkeypatch.setattr(
-        order_manager, "market_status", lambda: {"reason": "Post-market", "is_open": False}
+        order_manager, "market_status", lambda: {"reason": "Market open", "is_open": True}
     )
     monkeypatch.setattr(
         order_manager, "settings",
@@ -7009,11 +5800,9 @@ def test_after_hours_fill_is_impossible_without_a_future_quote(monkeypatch, tmp_
     result = manager.process_signal(
         {
             "action": "BUY",
-            "symbol": "NIFTY26NOVFUT",
+            "symbol": kite_client.future_symbol(),
             "qty_lots": 1,
-            "price": 25_293.0,          # a GIFT close must not rescue this
-            "paper_after_hours": True,
-            "signal_id": "no-quote-after-hours",
+            "signal_id": "no-quote-entry",
         },
         source="ENGINE",
     )
@@ -7838,41 +6627,6 @@ def test_a_position_closed_by_another_check_is_not_reported_as_a_failure(monkeyp
         assert "already closed" in str(exc)
     else:
         raise AssertionError("expected the second close to report already-closed")
-
-
-def test_the_gift_index_book_alerts_on_its_own_open_and_close(monkeypatch) -> None:
-    """The index book is a separate ledger, so its fills are their own events.
-
-    Without this the only notifications were for the futures book, and an index
-    exit went unseen - which is exactly what happened when the GIFT book stopped
-    out at 10:03 and no alert arrived.
-    """
-    import gift_book
-    import notifier
-
-    sent: list[dict] = []
-    monkeypatch.setattr(notifier, "configured", lambda: True)
-    monkeypatch.setattr(notifier, "send", lambda payload, timeout=8.0: sent.append(payload) or True)
-
-    gift_book._book_alert("GIFT_TRADE_OPENED", "BUY 65 units @ 25374.55", severity="info")
-    gift_book._book_alert("GIFT_TRADE_CLOSED", "closed 1 position at 25403.45", severity="warning")
-
-    assert [p["kind"] for p in sent] == ["GIFT_TRADE_OPENED", "GIFT_TRADE_CLOSED"]
-    assert all(p["symbol"] == "NSEIX:GIFT NIFTY" for p in sent)
-
-
-def test_a_gift_book_alert_never_raises_when_the_channel_is_broken(monkeypatch) -> None:
-    """A notification must never be able to break the index book."""
-    import gift_book
-    import notifier
-
-    monkeypatch.setattr(notifier, "configured", lambda: True)
-
-    def boom(payload, timeout=8.0):
-        raise RuntimeError("telegram is down")
-
-    monkeypatch.setattr(notifier, "send", boom)
-    gift_book._book_alert("GIFT_TRADE_CLOSED", "closed 1 position")
 
 
 def test_a_token_written_by_the_login_flow_beats_the_deployment_spec(monkeypatch, tmp_path) -> None:
@@ -8885,7 +7639,7 @@ def test_a_switched_off_channel_is_not_reported_as_unconfigured(
     assert state["channel_ready"] is False
 
 
-def test_a_gift_books_configured_interval_is_honoured() -> None:
+def test_a_gift_runs_configured_interval_is_honoured() -> None:
     """A GIFT book must read the timeframe it was configured for.
 
     `build_bar_source_for` dropped `cfg.interval` for GIFT sources, so
@@ -9207,11 +7961,9 @@ def test_a_portfolio_refusal_does_not_raise_on_an_undefined_name() -> None:
     import engine
 
     source = inspect.getsource(engine.StrategyEngine.evaluate_run)
-    assert 'f"GIFT {detail}"' not in source, (
-        "`detail` is not defined in evaluate_run; the record_signal call will "
-        "raise NameError the first time it runs"
-    )
-    assert 'f"GIFT {verdict.detail}"' in source
+    # `detail` is not a name in evaluate_run's scope; the verdict's own detail is.
+    assert 'f"GIFT {detail}"' not in source
+    assert "db.record_signal(" in source
 
 
 # ---------------------------------------------------------------------------
@@ -9223,717 +7975,41 @@ def test_a_portfolio_refusal_does_not_raise_on_an_undefined_name() -> None:
 # silent: a strategy configured for the index alone still traded the future,
 # which looks like a working bot trading an instrument nobody asked for.
 # ---------------------------------------------------------------------------
-def test_legs_are_parsed_and_deduplicated(monkeypatch) -> None:
-    """A repeated leg must not double the position size."""
-    import config
+def test_the_dashboard_draws_one_tile_per_strategy() -> None:
+    """Exactly two books, one tile each, and no per-leg machinery left.
 
-    assert config._parse_legs("") == ()
-    assert config._parse_legs("gift") == ("gift",)
-    assert config._parse_legs("GIFT, futures") == ("gift", "futures")
-    assert config._parse_legs("futures,futures") == ("futures",)
-    # An unknown leg is a startup error, not a silently dropped order.
-    try:
-        config._parse_legs("gift,options")
-    except ValueError as exc:
-        assert "options" in str(exc)
-    else:  # pragma: no cover - the assertion above is the test
-        raise AssertionError("an unknown leg was accepted")
-
-
-def test_unset_legs_default_to_what_that_source_used_to_do(monkeypatch) -> None:
-    """The historical default differs by source, so one shared default is wrong.
-
-    A GIFT-sourced book has always settled the paper index book *and* placed the
-    futures order. A NIFTY-sourced one never had an index leg. Defaulting both to
-    futures alone would silently switch off an existing deployment's GIFT book on
-    upgrade - a change nobody asked for and nothing would report.
-    """
-    import config
-
-    gift = config.StrategyConfig(index=1, id="a", source="gift", interval="15minute")
-    nifty = config.StrategyConfig(index=2, id="b", source="nifty", interval="60minute")
-    explicit = config.StrategyConfig(
-        index=3, id="c", source="gift", interval="60minute", legs=("gift",)
-    )
-
-    assert gift.resolved_legs == ("gift", "futures")
-    assert nifty.resolved_legs == ("futures",)
-    assert explicit.resolved_legs == ("gift",)
-    # Reported to the dashboard, so the tile can draw a row per leg.
-    assert gift.to_dict()["legs"] == ["gift", "futures"]
-    assert nifty.to_dict()["legs"] == ["futures"]
-
-
-def test_a_gift_only_book_places_no_futures_order(monkeypatch, tmp_path) -> None:
-    """``LEGS=gift`` means the index leg and nothing else.
-
-    Without the guard the leg list was parsed, reported, and then ignored: the
-    book settled its index ledger *and* placed a futures order, so a strategy the
-    operator had confined to a paper index was trading a real contract.
-    """
-    import bar_source
-
-    _isolate_gift_book(monkeypatch, tmp_path)
-    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
-        _verdict(strategy.BULL, strategy.NO_SIGNAL),
-    ])
-    gift_only = engine.StrategyRun(
-        "gift-only", bar_source.GiftBarSource(feed), params={"exit": "flip"}, lots=1,
-        legs=("gift",),
-    )
-    eng.runs = [gift_only]
-
-    before = len(db.get_open_positions(mode=PAPER, strategy_id="gift-only"))
-    feed.n = 1
-    result = eng.evaluate_run(gift_only)
-
-    assert result["action"] == "BUY"
-    assert len(db.get_open_positions(mode=PAPER, strategy_id="gift-only")) == before, (
-        "a gift-only book placed a futures order"
-    )
-
-
-def test_a_two_leg_book_places_the_futures_order_and_settles_the_index(monkeypatch, tmp_path) -> None:
-    """The two legs are independent: one filling does not stand in for the other."""
-    import bar_source
-    import gift_book
-
-    _isolate_gift_book(monkeypatch, tmp_path)
-    book = gift_book.get_gift_book()
-    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
-        _verdict(strategy.BULL, strategy.NO_SIGNAL),
-    ])
-    monkeypatch.setattr(
-        eng, "_settle_gift_book",
-        engine.StrategyEngine._settle_gift_book.__get__(eng),
-    )
-    both = engine.StrategyRun(
-        "both-legs", bar_source.GiftBarSource(feed), params={"exit": "flip"}, lots=1,
-        legs=("gift", "futures"),
-    )
-    eng.runs = [both]
-
-    feed.n = 1
-    result = eng.evaluate_run(both)
-
-    assert result["action"] == "BUY"
-    # The futures leg is on the ledger...
-    assert len(db.get_open_positions(mode=PAPER, strategy_id="both-legs")) == 1
-    # ...and the index leg is on its own, priced on the index.
-    assert book.net_units() == 65
-
-
-def test_the_index_ledger_is_scoped_to_the_strategy_that_owns_it(monkeypatch, tmp_path) -> None:
-    """Two GIFT-sourced strategies are two books, not two views of one.
-
-    A single process-wide book let the 15-minute strategy read the 60-minute
-    strategy's position as its own, close it, and report P&L that belonged to
-    neither - which looks like a strategy closing trades it never opened.
-    """
-    import gift_book
-
-    monkeypatch.setattr(
-        gift_book, "settings",
-        SimpleNamespace(
-            gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
-            gift_book_units=65, gift_book_balance=200_000.0,
-            tick_size=0.05, slippage_ticks=1.0, lot_size=65,
-        ),
-    )
-    gift_book.reset_gift_books()
-    try:
-        fast = gift_book.get_gift_book("gift-15m")
-        slow = gift_book.get_gift_book("gift-60m")
-
-        assert fast is not slow
-        assert fast.strategy_id == "gift-15m"
-        # Separate files, so one cannot even read the other's rows.
-        assert fast.path != slow.path
-
-        fast.execute("BUY", 25_000.0)
-        assert fast.net_units() == 65
-        assert slow.net_units() == 0, "one strategy's book read another's position"
-    finally:
-        gift_book.reset_gift_books()
-
-
-def test_a_paused_book_also_holds_its_index_leg(monkeypatch, tmp_path) -> None:
-    """The pause is one operator decision, not one per venue.
-
-    The index book read the global switch only, so a book paused from its own
-    tile kept opening index trades - the pause looked applied on the futures leg
-    and ignored on the other.
-    """
-    import order_manager
-
-    book = _gift_book(monkeypatch, tmp_path)
-    book.strategy_id = "gift-15m"
-    monkeypatch.setattr(
-        order_manager, "get_order_manager",
-        lambda: SimpleNamespace(book_paused=lambda sid: sid == "gift-15m"),
-    )
-
-    assert book.execute("BUY", 25_000.0) is None
-    assert book.net_units() == 0
-
-
-def test_the_dashboard_draws_one_card_per_execution_leg() -> None:
-    """A two-leg strategy is two positions, and each must get its own card.
-
-    The tile had one Position cell, so a strategy carrying its signal on two
-    venues showed one of them and hid the other - the half that was working and
-    the half that was not were indistinguishable. A table row was the first fix;
-    it still put both legs under one shared P&L and one shared mode, so the split
-    is now a card per leg with its own levels and score.
+    The legs abstraction is gone: both strategies execute on the same NIFTY
+    future, so a "leg" was never a second instrument - it was a second venue
+    that no longer exists. A leftover renderer would draw an empty card.
     """
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent / "bot" / "web"
     js = (root / "app.js").read_text(encoding="utf-8")
     css = (root / "styles.css").read_text(encoding="utf-8")
-
-    assert "function renderLegCards(run, legPerf, columnKey)" in js
-    assert "book-leg-cards" in js and ".book-leg-cards" in css
-    assert "leg-card-venue" in js and ".leg-card-venue" in css
-    assert "leg-card-levels" in js and ".leg-card-levels" in css
-    # Both legs' scores come from the server, per venue.
-    assert "payload.leg_performance" in js
-    assert '"leg_performance": legs' in (Path(__file__).resolve().parent.parent
-                                         / "bot" / "bot.py").read_text(encoding="utf-8")
-    # A single-leg book keeps its one footer row: a card would repeat the same
-    # numbers in twice the height.
-    assert "if (legs.length < 2) return '';" in js
-    assert "Array.isArray(run.legs)" in js
-    # The GIFT leg is paper by construction and must never inherit a LIVE chip.
-    assert "isGift ? 'PAPER'" in js
-    # The split tile must not restyle itself from its own container query.
-    assert ".book-band-split { container-type: inline-size; }" in css
-
-
-def test_a_half_filled_two_leg_strategy_is_reported_as_partial(monkeypatch, tmp_path) -> None:
-    """Two legs, two fills, and either can fail on its own.
-
-    Treating "the strategy acted" as one outcome is what made a half-filled
-    strategy invisible: the tile showed a position and nothing said the other leg
-    had been rejected. The report is what turns a partial fill into a recorded
-    fact rather than something to infer from two unrelated logs.
-    """
-    import bar_source
-
-    _isolate_gift_book(monkeypatch, tmp_path)
-    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
-        _verdict(strategy.BULL, strategy.NO_SIGNAL),
-    ])
-    run = engine.StrategyRun(
-        "both-legs", bar_source.GiftBarSource(feed), params={"exit": "flip"}, lots=1,
-        legs=("gift", "futures"),
+    server = (Path(__file__).resolve().parent.parent / "bot" / "bot.py").read_text(
+        encoding="utf-8"
     )
 
-    # The futures order was rejected; the index leg settled.
-    report = eng._report_partial_legs(
-        "BUY", {"ok": False, "reason": "rejected"}, {"action": "BUY"}, run,
-        "2026-11-16T09:30:00+05:30",
-    )
-
-    assert report is not None
-    assert report["filled"] == ["gift"]
-    assert report["failed"] == ["futures"]
-    assert "Partial execution" in run.state.last_error
-
-
-def test_both_legs_filling_is_not_reported_as_partial(monkeypatch, tmp_path) -> None:
-    """A clean two-leg fill must not be flagged; a warning on every bar is noise."""
-    import bar_source
-
-    _isolate_gift_book(monkeypatch, tmp_path)
-    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [])
-    run = engine.StrategyRun(
-        "both-legs", bar_source.GiftBarSource(feed), params={}, lots=1,
-        legs=("gift", "futures"),
-    )
-
-    assert eng._report_partial_legs(
-        "BUY", {"ok": True}, {"action": "BUY"}, run, "2026-11-16T09:30:00+05:30"
-    ) is None
-    # A single-leg book has nothing to be partial about.
-    single = engine.StrategyRun(
-        "one-leg", bar_source.GiftBarSource(feed), params={}, lots=1, legs=("futures",),
-    )
-    assert eng._report_partial_legs(
-        "BUY", {"ok": False}, None, single, "2026-11-16T09:30:00+05:30"
-    ) is None
-
-
-def test_merged_gift_analytics_keeps_the_single_book_shape() -> None:
-    """A consolidated report must not blank the page it consolidates for.
-
-    The Performance tab reads ``days`` and ``summary`` off the top level. With one
-    book per strategy, returning only a per-book map left both undefined and the
-    calendar rendered empty - a consolidation that silently removed the page.
-    """
-    import bot as bot_app
-
-    merged = bot_app._merge_analytics([
-        {
-            "summary": {"trades": 2, "wins": 1, "losses": 1, "net_pnl": 100.0,
-                        "gross_pnl": 300.0, "fees": 200.0, "points": 10.0,
-                        "gross_win": 300.0, "gross_loss": -200.0,
-                        "largest_win": 300.0, "largest_loss": -200.0,
-                        "avg_hold_minutes": 30.0},
-            "streaks": {"max_win": 1, "max_loss": 1},
-            "days": [{"date": "2026-11-19", "trades": 2, "wins": 1, "losses": 1,
-                      "net_pnl": 100.0, "gross_pnl": 300.0, "fees": 200.0, "points": 10.0}],
-            "by_hour": [{"hour": 10, "trades": 2, "wins": 1, "losses": 1,
-                         "net_pnl": 100.0, "gross_pnl": 300.0, "fees": 200.0, "points": 10.0}],
-            "by_direction": {"LONG": {"trades": 2, "wins": 1, "losses": 1, "net_pnl": 100.0}},
-        },
-        {
-            "summary": {"trades": 3, "wins": 3, "losses": 0, "net_pnl": 50.0,
-                        "gross_pnl": 100.0, "fees": 50.0, "points": 5.0,
-                        "gross_win": 100.0, "gross_loss": 0.0,
-                        "largest_win": 60.0, "largest_loss": 0.0,
-                        "avg_hold_minutes": 90.0},
-            "streaks": {"max_win": 3, "max_loss": 0},
-            # The same date, from the other book: one day carrying both.
-            "days": [{"date": "2026-11-19", "trades": 3, "wins": 3, "losses": 0,
-                      "net_pnl": 50.0, "gross_pnl": 100.0, "fees": 50.0, "points": 5.0}],
-            "by_hour": [{"hour": 10, "trades": 3, "wins": 3, "losses": 0,
-                         "net_pnl": 50.0, "gross_pnl": 100.0, "fees": 50.0, "points": 5.0}],
-            "by_direction": {"LONG": {"trades": 3, "wins": 3, "losses": 0, "net_pnl": 50.0}},
-        },
-    ])
-
-    # Additive figures are summed...
-    assert merged["summary"]["trades"] == 5
-    assert merged["summary"]["net_pnl"] == 150.0
-    # ...and the ratios are recomputed, not averaged: 4 wins of 5 trades.
-    assert merged["summary"]["win_rate"] == 80.0
-    assert merged["summary"]["profit_factor"] == pytest.approx(400.0 / 200.0)
-    assert merged["summary"]["avg_win"] == pytest.approx(400.0 / 4)
-    # The same date must be one bucket carrying both books.
-    assert len(merged["days"]) == 1
-    assert merged["days"][0]["trades"] == 5
-    assert merged["days"][0]["net_pnl"] == 150.0
-    assert merged["by_hour"][0]["trades"] == 5
-    assert merged["by_direction"]["LONG"]["trades"] == 5
-    # The maxima survive, so a long streak in one book is not lost.
-    assert merged["streaks"]["max_win"] == 3
-    # Nothing may be a non-finite float that JSON cannot represent.
-    import json
-
-    json.dumps(merged, allow_nan=False)
-
-
-def test_the_default_gift_book_keeps_the_unsuffixed_ledger(monkeypatch, tmp_path) -> None:
-    """Pointing the default book at a new file would erase the operator's history.
-
-    Every row written before books were per-strategy lives in ``gift_book.db``.
-    A per-strategy file for the default id would open an empty ledger beside it,
-    so the dashboard would show a GIFT book that had never traded while the real
-    history sat unread on disk - a silent data loss on upgrade.
-    """
-    import gift_book
-
-    monkeypatch.setattr(
-        gift_book, "settings",
-        SimpleNamespace(
-            gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
-            gift_book_units=65, gift_book_balance=200_000.0,
-        ),
-    )
-    gift_book.reset_gift_books()
-    try:
-        default = gift_book.get_gift_book()
-        explicit = gift_book.get_gift_book("gift-15m")
-
-        assert default.strategy_id == gift_book.DEFAULT_STRATEGY
-        # The legacy path, not a suffixed one.
-        assert default.path == str(tmp_path / "gift.db")
-        # A named strategy still gets its own file.
-        assert explicit.path == str(tmp_path / "gift.db.gift-15m")
-    finally:
-        gift_book.reset_gift_books()
-
-
-def test_a_legacy_index_ledger_is_listed_rather_than_hidden(monkeypatch, tmp_path) -> None:
-    """Rows from before per-strategy books must not vanish from the dashboard.
-
-    A book nobody configured still holds the operator's GIFT history. Omitting it
-    from the list does not delete the rows - it hides them, so the venue reports
-    a book that has never traded while the real history sits unread on disk.
-    """
-    import gift_book
-    import order_manager
-
-    stub = SimpleNamespace(
-        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
-        gift_book_units=65, gift_book_balance=200_000.0,
-        tick_size=0.05, slippage_ticks=1.0, lot_size=65,
-        default_lots=1,
-    )
-    monkeypatch.setattr(gift_book, "settings", stub)
-    monkeypatch.setattr(order_manager, "settings", stub)
-    # One configured strategy that trades the index leg.
-    monkeypatch.setattr(
-        "config.strategy_configs",
-        lambda: [SimpleNamespace(
-            id="gift-15m", enabled=True, resolved_legs=("gift", "futures"),
-        )],
-    )
-    gift_book.reset_gift_books()
-    try:
-        # The legacy book trades; the configured one has not.
-        gift_book.get_gift_book().execute("BUY", 25_000.0)
-
-        listed = {book.strategy_id for book in gift_book.gift_books()}
-
-        assert "gift-15m" in listed
-        assert gift_book.DEFAULT_STRATEGY in listed, (
-            "the legacy ledger holds real rows and must be listed"
-        )
-    finally:
-        gift_book.reset_gift_books()
-
-
-def test_live_readiness_refuses_an_account_that_cannot_fund_one_lot(
-    monkeypatch, tmp_path
-) -> None:
-    """Every other check passes on an unfunded account, which is the trap.
-
-    Configuration, session, reconciliation and the loop all look healthy on an
-    account that cannot afford a single contract. Arming LIVE there produces a
-    bot that rejects every entry with "Insufficient margin" - which reads as a
-    strategy that never fires rather than as an account that cannot trade.
-    """
-    import bot as bot_app
-
-    # One NRML NIFTY lot needs ~Rs 1.87 lakh; the account holds Rs 91k.
-    _readiness_env(
-        monkeypatch, sync={"in_sync": True, "broker": 0, "ledger": 0, "error": None},
-        margin=187_507.19, cash=91_229.60,
-    )
-
-    report = bot_app._live_readiness()
-
-    margin = next(c for c in report["checks"] if c["key"] == "margin")
-    assert margin["ok"] is False
-    assert margin["blocking"] is True
-    assert "margin" in report["blocking"]
-    assert report["ready"] is False
-    # The figures are in the detail, so the operator knows how much is missing.
-    assert "91,230" in margin["detail"]
-    assert "187,507" in margin["detail"]
-
-
-def test_live_readiness_passes_when_the_account_can_fund_a_lot(
-    monkeypatch, tmp_path
-) -> None:
-    """A funded account must not be blocked by the new check."""
-    import bot as bot_app
-
-    _readiness_env(
-        monkeypatch, sync={"in_sync": True, "broker": 0, "ledger": 0, "error": None},
-        margin=187_507.19, cash=500_000.0,
-    )
-
-    report = bot_app._live_readiness()
-
-    margin = next(c for c in report["checks"] if c["key"] == "margin")
-    assert margin["ok"] is True
-    assert "margin" not in report["blocking"]
-
-
-def test_an_unreadable_margin_is_reported_but_does_not_block(
-    monkeypatch, tmp_path
-) -> None:
-    """Unknown is not the same as fine, but it is not evidence of a problem.
-
-    The margin API can be unavailable while the session is valid, and refusing
-    the arm outright would block an operator who funded the account another way.
-    """
-    import bot as bot_app
-
-    _readiness_env(
-        monkeypatch, sync={"in_sync": True, "broker": 0, "ledger": 0, "error": None},
-        margin=None, cash=91_229.60,
-    )
-
-    report = bot_app._live_readiness()
-
-    margin = next(c for c in report["checks"] if c["key"] == "margin")
-    assert margin["ok"] is False
-    assert margin["blocking"] is False
-    assert "margin" not in report["blocking"]
-
-
-def test_the_board_files_a_book_under_the_venue_it_is_exposed_to() -> None:
-    """Both books execute on the NIFTY future, so both sit in the NIFTY column.
-
-    The signal series differs (GIFT 15m vs NIFTY 60m) and each tile names its own,
-    but the venue the operator is exposed to is the same for both - so there is
-    one column and no book is filed under a venue it does not trade.
-    """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "bot" / "web"
-    js = (root / "app.js").read_text(encoding="utf-8")
-
-    # One column, and every run is filed into it.
-    assert "key: 'nifty', title: 'NIFTY 50'" in js
-    assert "key: 'gift', title: 'GIFT Nifty'" not in js
-    assert "buckets.get('nifty').push(run);" in js
-    # The tile names its signal series when that differs from the column, and
-    # the comparison is case-insensitive - the column key is lowercase and the
-    # label is not, so a strict compare printed "signal NIFTY" on the NIFTY tile.
-    assert "signal ${signalVenue}" in js
-    assert "signalVenue.toLowerCase() !== String(columnKey || '').toLowerCase()" in js
-
-
-def test_a_gift_signalled_book_can_trade_the_future_live(monkeypatch) -> None:
-    """The signal series and the traded instrument are separate decisions.
-
-    GIFT Nifty is quote-only, so the *index* can never be filled - but a book
-    that reads GIFT and executes on the Nifty future is trading a real
-    instrument on a real venue. Refusing it live would be refusing the future
-    because of the index, which is not the thing being bought.
-    """
-    import config
-
-    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
-    monkeypatch.setenv("STRATEGY_1_ID", "gift-15m")
-    monkeypatch.setenv("STRATEGY_1_INTERVAL", "15minute")
-    monkeypatch.setenv("STRATEGY_1_LEGS", "gift,futures")
-    monkeypatch.setenv("STRATEGY_1_LIVE", "1")
-
-    cfg = next(c for c in config.strategy_configs() if c.id == "gift-15m")
-
-    assert cfg.source == "gift"
-    assert cfg.resolved_legs == ("gift", "futures")
-    assert cfg.live is True
-
-
-def test_an_armed_book_says_so_before_the_switch_is_thrown() -> None:
-    """A PAPER chip alone cannot distinguish an armed book from a paper-only one.
-
-    ``run.live`` is the book's consent to trade real money; ``run.mode`` is what
-    it is doing now. With the bot still in PAPER both books show "PAPER", so the
-    operator could not tell which one will place real orders the moment the
-    switch is thrown - and that is the one fact the chip exists to convey.
-    """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "bot" / "web"
-    js = (root / "app.js").read_text(encoding="utf-8")
-    css = (root / "styles.css").read_text(encoding="utf-8")
-
-    assert "book-band-armed" in js and ".book-band-armed" in css
-    # Only when armed but not yet live - a live book already says LIVE.
-    assert "run.live && bookMode !== 'LIVE'" in js
-    # The tooltip has to explain the difference, not just repeat the label.
-    assert "Armed for LIVE - real orders once the bot is switched to LIVE" in js
-
-
-def test_arming_live_is_refused_when_a_blocking_check_fails(monkeypatch, tmp_path) -> None:
-    """The pre-flight report must be enforced, not merely displayed.
-
-    It used to be advisory: the dashboard showed "LIVE blocked by 1 check" and
-    the switch armed anyway, so an account that could not fund a single lot went
-    live and then rejected every entry with "Insufficient margin" - which reads
-    as a strategy that never fires rather than as an unfunded account. A gate
-    that only warns is not a gate.
-    """
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app, "settings",
-        SimpleNamespace(is_live_configured=True, lot_size=65, product="NRML"),
-    )
-    monkeypatch.setattr(
-        bot_app, "_live_readiness",
-        lambda: {
-            "ready": False,
-            "blocking": ["margin"],
-            "checks": [{
-                "key": "margin", "ok": False, "blocking": True,
-                "detail": "Rs 91,230 available, Rs 187,519 needed for 1 lot",
-            }],
-        },
-    )
-    # If the gate fails to stop it, this records the switch so the test can say
-    # so rather than passing on a silent no-op.
-    switched: list[str] = []
-    monkeypatch.setattr(bot_app, "set_execution_mode", lambda mode: switched.append(mode))
-
-    response = TestClient(bot_app.app, base_url="http://localhost").post(
-        "/api/toggle-mode", json={"mode": "LIVE", "confirm": True}
-    )
-
-    assert response.status_code == 409
-    assert "margin" in response.json()["detail"]
-    assert "187,519" in response.json()["detail"]
-    assert switched == [], "LIVE was armed despite a blocking check"
-
-
-def test_arming_live_is_allowed_when_every_check_passes(monkeypatch, tmp_path) -> None:
-    """A clean report must not be blocked by the new gate."""
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-    monkeypatch.setattr(
-        bot_app, "settings",
-        SimpleNamespace(is_live_configured=True, lot_size=65, product="NRML"),
-    )
-    monkeypatch.setattr(
-        bot_app, "_live_readiness",
-        lambda: {"ready": True, "blocking": [], "checks": []},
-    )
-    monkeypatch.setattr(bot_app, "set_execution_mode", lambda mode: None)
-    monkeypatch.setattr(
-        bot_app, "get_client", lambda: SimpleNamespace(mode="PAPER"),
-    )
-    monkeypatch.setattr(
-        bot_app, "get_engine", lambda: SimpleNamespace(reset_for_mode=lambda mode: None),
-    )
-
-    response = TestClient(bot_app.app, base_url="http://localhost").post(
-        "/api/toggle-mode", json={"mode": "LIVE", "confirm": True}
-    )
-
-    assert response.status_code == 200
-    assert response.json()["mode"] == "LIVE"
-
-
-def test_leg_performance_scores_each_venue_separately(monkeypatch, tmp_path) -> None:
-    """A two-leg strategy is two positions, so its score is two scores.
-
-    Reporting one P&L for the pair hides the half that is working and the half
-    that is not - which is the whole reason the legs are tracked separately. The
-    index legs live in their own databases, so they have to be read from there;
-    the futures ledger cannot see them.
-    """
-    import gift_book
-    import order_manager
-
-    use_test_database(monkeypatch, tmp_path)
-    stub = SimpleNamespace(
-        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
-        gift_book_units=65, gift_book_balance=200_000.0,
-        tick_size=0.05, slippage_ticks=1.0, lot_size=65, default_lots=1,
-    )
-    monkeypatch.setattr(gift_book, "settings", stub)
-    monkeypatch.setattr(order_manager, "settings", stub)
-    monkeypatch.setattr(
-        "config.strategy_configs",
-        lambda: [SimpleNamespace(
-            id="gift-15m", enabled=True, resolved_legs=("gift", "futures"),
-        )],
-    )
-    gift_book.reset_gift_books()
-    try:
-        # One index leg round trip, in profit.
-        book = gift_book.get_gift_book("gift-15m")
-        book.execute("BUY", 25_000.0)
-        book.execute("SELL", 25_100.0)
-
-        # One futures round trip, in loss.
-        db.open_position("NIFTY26NOVFUT", 65, 25_400.0, mode=PAPER,
-                         source="ENGINE", strategy_id="gift-15m")
-        position_id = db.get_open_positions(mode=PAPER, strategy_id="gift-15m")[0]["id"]
-        db.close_position(position_id, 25_300.0, fees=0.0, exit_reason="FLIP",
-                          quantity=65)
-
-        legs = bot_app._leg_performance(PAPER)
-
-        assert set(legs["gift-15m"]) == {"gift", "futures"}
-        assert legs["gift-15m"]["gift"]["trades"] == 1
-        assert legs["gift-15m"]["gift"]["net_pnl"] > 0
-        assert legs["gift-15m"]["futures"]["trades"] == 1
-        assert legs["gift-15m"]["futures"]["net_pnl"] < 0
-        # Each venue's own win rate, not the pair's.
-        assert legs["gift-15m"]["gift"]["win_rate"] == 100.0
-        assert legs["gift-15m"]["futures"]["win_rate"] == 0.0
-    finally:
-        gift_book.reset_gift_books()
-
-
-def test_leg_performance_omits_a_leg_that_never_traded(monkeypatch, tmp_path) -> None:
-    """An absent key means "no closed trades", not a fabricated zero row.
-
-    Inventing a 0.00 result for a leg that never filled would claim a
-    performance it never had; the UI draws the configured legs and fills them
-    from here, so absence is the honest answer.
-    """
-    use_test_database(monkeypatch, tmp_path)
-    db.open_position("NIFTY26NOVFUT", 65, 25_400.0, mode=PAPER,
-                     source="ENGINE", strategy_id="gift-15m")
-    position_id = db.get_open_positions(mode=PAPER, strategy_id="gift-15m")[0]["id"]
-    db.close_position(position_id, 25_300.0, fees=0.0, exit_reason="FLIP", quantity=65)
-
-    legs = bot_app._leg_performance(PAPER)
-
-    assert set(legs["gift-15m"]) == {"futures"}
-    assert "gift" not in legs["gift-15m"]
-
-
-def test_a_flat_leg_does_not_render_as_a_wall_of_dashes() -> None:
-    """A flat leg is the common case and it was the least readable.
-
-    Four columns of em-dashes under a big "Flat" said nothing about why the leg
-    was not holding, or where it would act. A flat leg now says so in words -
-    and it says the *right* words: this strategy enters on a transition, so "the
-    rules agree" is not a reason it would enter, and printing that would leave
-    the reader expecting an entry that cannot come.
-    """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "bot" / "web"
-    js = (root / "app.js").read_text(encoding="utf-8")
-    css = (root / "styles.css").read_text(encoding="utf-8")
-
-    assert "leg-card-flat-state" in js and ".leg-card-flat-state" in css
-    assert "leg-card-flat-note" in js and ".leg-card-flat-note" in css
-    # The reason names the transition rule, not just "the rules agree".
-    assert "enters on the next flip, not on the state" in js
-    # And the disagreement case is distinguished from it.
-    assert "disagree, so there is no signal to act on" in js
-    # The flat card must not carry the four-column level grid at all.
-    flat_block = js.split("if (!row) {", 1)[1].split("return `", 2)[1]
-    assert "leg-card-levels" not in flat_block
-
-
-def test_the_exit_level_is_stated_once_per_book() -> None:
-    """It belongs to the signal, so both legs share it.
-
-    Printing it inside each leg card showed the same number twice and implied
-    each leg had its own. It is hoisted to the verdict it came from, and derived
-    once - two copies of one rule is how the two drift apart.
-    """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "bot" / "web"
-    js = (root / "app.js").read_text(encoding="utf-8")
-
-    # One derivation, used by both the split tile and the single-leg tile.
-    assert js.count("Math.max(...singleLevels)") == 1
-    assert "const flipLevels" not in js
-    assert "singleFlip" in js
-    assert "Both legs would act at" in js
+    assert "renderLegCards" not in js
+    assert "leg-card" not in js and ".leg-card" not in css
+    assert "book-leg-cards" not in js and ".book-leg-cards" not in css
+    assert "leg_performance" not in js and "leg_performance" not in server
+    assert "run.legs" not in js
+    # The tile still renders the book's own identity and controls.
+    assert "book-band-title" in js
+    assert "data-book-mode=" in js
+    assert "data-book-pause=" in js
+    assert "data-book-square-off=" in js
+    assert "data-book-manual=" in js
 
 
 def test_the_tile_footer_is_words_not_the_raw_verdict_string() -> None:
     """The last line of a tile is read by a person.
 
     The verdict ships "close=… psar=… ST bullish confirm BUY 2/2 SELL 0/2",
-    which is fine in a tooltip and unreadable as the visible summary. Both the
-    split and single-leg tiles show a sentence and keep the raw string in the
-    title attribute.
+    which is fine in a tooltip and unreadable as the visible summary. The tile
+    shows a sentence and keeps the raw string in the title attribute.
     """
     from pathlib import Path
 
@@ -9941,11 +8017,9 @@ def test_the_tile_footer_is_words_not_the_raw_verdict_string() -> None:
     js = (root / "app.js").read_text(encoding="utf-8")
 
     assert "singleFooter" in js
-    assert "legFooter" in js
     # The raw detail still has to be reachable for diagnosis.
     assert 'class="strategy-detail${err ? \' is-bad\' : \'\'}" title="${escapeHtml(detail)}"' in js
     # An error is never replaced by the friendly sentence - it is the thing to fix.
-    assert "${escapeHtml(err ? detail : legFooter)}" in js
     assert "${escapeHtml(err ? detail : singleFooter)}" in js
 
 
@@ -10325,49 +8399,6 @@ def test_a_flat_exit_does_not_reverse_on_the_exiting_bar(monkeypatch, tmp_path) 
     )
 
 
-def test_a_flat_exit_closes_the_index_leg_when_the_futures_leg_is_empty(
-    monkeypatch, tmp_path
-) -> None:
-    """A two-leg book must not be left holding one leg after an exit.
-
-    ``exit_on_signal`` returns early when the *futures* book holds nothing, and
-    the caller only settles the index leg inside the ``exit_report is not None``
-    branch. So a book whose futures leg never filled - an out-of-session entry, a
-    rejected order, a restart between the two legs - kept its index position
-    forever: the exit rule fired, the futures book had nothing to close, and the
-    index book was never told.
-
-    Observed live: gift-15m held LONG 65 on the index with no futures leg, and
-    the flat exit did nothing.
-    """
-    import gift_book
-
-    _isolate_gift_book(monkeypatch, tmp_path)
-    book = gift_book.get_gift_book()
-    # The index leg is open; the futures leg is not.
-    book.execute("BUY", 25_000.0)
-    assert book.net_units() == 65
-
-    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
-        _verdict(strategy.NO_SIGNAL, strategy.BULL),
-    ])
-    monkeypatch.setattr(engine, "strategy_params", lambda: {"exit": "flat"})
-    eng.run.params = {"exit": "flat"}
-    # Put the real settlement back: _fresh_signal_env stubs it out.
-    monkeypatch.setattr(
-        eng, "_settle_gift_book",
-        engine.StrategyEngine._settle_gift_book.__get__(eng),
-    )
-
-    feed.n = 1
-    result = eng.evaluate_now()
-
-    assert result["action"] == "FLAT", result
-    assert book.net_units() == 0, (
-        "the index leg was left open after a flat exit with no futures position"
-    )
-
-
 def test_a_lagging_history_refresh_does_not_discard_a_tick_closed_bar() -> None:
     """Kite's history lags the tick feed, and replacing the series lost the bar.
 
@@ -10474,99 +8505,16 @@ def test_the_signal_id_names_the_book_and_its_own_bar() -> None:
     import engine
 
     source = inspect.getsource(engine.StrategyEngine.execute)
-    assert 'f"GIFT-{action}-{book}-' in source, (
+    assert 'f"NIFTY-{action}-{book}-' in source, (
         "the signal id does not name the book"
     )
     assert "run.state.last_bar_at" in source, (
         "the signal id is not built from the book's own bar"
     )
     # The engine-level field must not be the primary source any more.
-    assert 'f"GIFT-{action}-{self._last_bar_at}"' not in source
+    assert 'f"NIFTY-{action}-{self._last_bar_at}"' not in source
 
 
-def test_panic_flattens_the_index_books_too(monkeypatch, tmp_path) -> None:
-    """An emergency stop must not leave an index position open.
-
-    ``/api/panic`` squares off through the order manager, which owns the
-    *futures* ledger. The index book is a separate database, so the operator's
-    square-off could not reach it - and an emergency stop that leaves a position
-    open is the one state it must never leave behind.
-    """
-    from fastapi.testclient import TestClient
-
-    import bot as bot_app
-    import gift_book
-    import order_manager
-
-    use_test_database(monkeypatch, tmp_path)
-    stub = SimpleNamespace(
-        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
-        gift_book_units=65, gift_book_balance=200_000.0,
-        tick_size=0.05, slippage_ticks=1.0, lot_size=65, default_lots=1,
-    )
-    monkeypatch.setattr(gift_book, "settings", stub)
-    monkeypatch.setattr(order_manager, "settings", stub)
-    gift_book.reset_gift_books()
-    try:
-        book = gift_book.get_gift_book("gift-15m")
-        book.execute("BUY", 25_000.0)
-        book.mark(25_050.0)
-        assert book.net_units() == 65
-
-        monkeypatch.setattr(bot_app, "LOG_FILE", tmp_path / "bot.log")
-        monkeypatch.setattr(
-            bot_app, "get_order_manager",
-            lambda: SimpleNamespace(
-                square_off=lambda *a, **k: SimpleNamespace(
-                    ok=True, reason="squared off", to_dict=lambda: {"ok": True},
-                ),
-                pause=lambda reason: None,
-                paused=True,
-            ),
-        )
-        # Patched on `gift_book`, not on `bot`: `api_panic` imports `gift_books`
-        # inside the function, so a `bot_app.gift_books` attribute is never read.
-        # The old patch therefore did nothing at all, and the test only passed
-        # where `.env` configured a strategy whose id happened to match the book.
-        monkeypatch.setattr(gift_book, "gift_books", lambda: [book])
-
-        payload = TestClient(bot_app.app, base_url="http://localhost").post(
-            "/api/panic", json={"confirm": True, "reason": "PANIC"}
-        ).json()
-
-        assert book.net_units() == 0, (
-            "PANIC left the index leg open - the emergency stop did not reach it"
-        )
-        assert "gift-15m" in payload["index_books"]
-    finally:
-        gift_book.reset_gift_books()
-
-
-def test_flatten_is_a_no_op_when_the_index_book_is_flat(monkeypatch, tmp_path) -> None:
-    """Flattening an empty book must not invent a trade."""
-    import gift_book
-    import order_manager
-
-    use_test_database(monkeypatch, tmp_path)
-    stub = SimpleNamespace(
-        gift_book=True, gift_book_db_path=str(tmp_path / "gift.db"),
-        gift_book_units=65, gift_book_balance=200_000.0,
-        tick_size=0.05, slippage_ticks=1.0, lot_size=65, default_lots=1,
-    )
-    monkeypatch.setattr(gift_book, "settings", stub)
-    monkeypatch.setattr(order_manager, "settings", stub)
-    gift_book.reset_gift_books()
-    try:
-        book = gift_book.get_gift_book("gift-15m")
-        assert book.flatten("PANIC") is None
-        assert book.net_units() == 0
-    finally:
-        gift_book.reset_gift_books()
-
-
-# ---------------------------------------------------------------------------
-# Alert delivery and message shape
-# ---------------------------------------------------------------------------
 def test_watchdog_delivers_on_a_channel_that_has_no_webhook_url(monkeypatch) -> None:
     """Telegram is addressed by token and chat id, so ALERT_WEBHOOK_URL is empty.
 
@@ -10760,7 +8708,6 @@ def test_a_second_book_enters_on_its_own_fresh_signal(monkeypatch, tmp_path) -> 
     """
     import bar_source
 
-    _isolate_gift_book(monkeypatch, tmp_path)
     eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
         _verdict(strategy.BULL, strategy.NO_SIGNAL, close=25_000.0),
         _verdict(strategy.BULL, strategy.NO_SIGNAL, close=25_000.0),
@@ -11305,6 +9252,191 @@ def test_square_off_requires_confirmation(monkeypatch, tmp_path) -> None:
         json={"strategy_id": "gift-15m"},
     )
     assert response.status_code == 400
+
+
+def test_a_manual_order_requires_confirmation(monkeypatch, tmp_path) -> None:
+    """A stray click must not place an order."""
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/manual-order",
+        json={"strategy_id": "gift-15m", "action": "BUY"},
+    )
+    assert response.status_code == 400
+    assert "confirm" in response.json()["detail"]
+
+
+def test_a_manual_order_rejects_an_unknown_action(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/manual-order",
+        json={"strategy_id": "gift-15m", "action": "HOLD", "confirm": True},
+    )
+    assert response.status_code == 400
+    assert "action must be one of" in response.json()["detail"]
+
+
+def test_a_manual_order_is_refused_outside_market_hours(monkeypatch, tmp_path) -> None:
+    """Manual entries obey the same NSE session gate as a signal."""
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
+    monkeypatch.setattr(
+        order_manager, "market_status",
+        lambda: {"reason": "Outside NSE hours", "is_open": False},
+    )
+
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/manual-order",
+        json={"strategy_id": "gift-15m", "action": "BUY", "confirm": True},
+    )
+
+    body = response.json()
+    assert body["ok"] is False
+    assert "outside market hours" in body["reason"].lower()
+    assert db.get_open_positions(mode=PAPER, strategy_id="gift-15m") == []
+
+
+def test_a_manual_order_is_refused_while_the_book_is_paused(monkeypatch, tmp_path) -> None:
+    """Pause blocks manual entries too - it is the same entry path."""
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
+    monkeypatch.setattr(
+        order_manager, "market_status", lambda: {"reason": "Market open", "is_open": True}
+    )
+    order_manager.get_order_manager().pause_book("gift-15m", "MANUAL")
+
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/manual-order",
+        json={"strategy_id": "gift-15m", "action": "BUY", "confirm": True},
+    )
+
+    body = response.json()
+    assert body["ok"] is False
+    assert "paused" in body["reason"].lower()
+    assert db.get_open_positions(mode=PAPER, strategy_id="gift-15m") == []
+
+
+def test_a_manual_order_carries_the_books_own_stop_rules(monkeypatch, tmp_path) -> None:
+    """A manual entry must be protected exactly like an automated one.
+
+    The stop is placed at the fill from the book's own rules, so a manual
+    position without them would run unprotected - the one thing the operator
+    cannot see from the dashboard.
+    """
+    from fastapi.testclient import TestClient
+
+    from engine import get_engine
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
+    monkeypatch.setattr(
+        order_manager, "market_status", lambda: {"reason": "Market open", "is_open": True}
+    )
+
+    captured: dict = {}
+    real = order_manager.OrderManager.process_signal
+
+    def spy(self, payload, source="WEBHOOK", strategy_id=None, mode=None):
+        captured["payload"] = payload
+        captured["strategy_id"] = strategy_id
+        return order_manager.ExecutionResult(
+            True, payload.get("action", "BUY"), mode or PAPER, "NIFTY26NOVFUT"
+        )
+
+    monkeypatch.setattr(order_manager.OrderManager, "process_signal", spy)
+
+    response = TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/manual-order",
+        json={"strategy_id": "gift-15m", "action": "BUY", "confirm": True},
+    )
+
+    assert response.status_code == 200
+    assert captured["strategy_id"] == "gift-15m"
+    rules = captured["payload"]["stop_rules"]
+    run = next(r for r in get_engine().runs if r.id == "gift-15m")
+    assert rules == run.stop_rules.to_dict()
+    assert rules["initial_points"] == 50.0
+    # Not a bar signal, so it must not be aged out by the staleness check.
+    assert captured["payload"]["max_age_seconds"] == 0
+
+
+def test_a_manual_order_never_touches_the_other_book(monkeypatch, tmp_path) -> None:
+    """The strategy id scopes the order; the other book's leg is untouched."""
+    from fastapi.testclient import TestClient
+
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
+    monkeypatch.setattr(
+        order_manager, "market_status", lambda: {"reason": "Market open", "is_open": True}
+    )
+    nifty_id = db.open_position(
+        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
+        strategy_id="nifty-60m",
+    )
+
+    TestClient(bot_app.app, base_url="http://localhost").post(
+        "/api/books/manual-order",
+        json={"strategy_id": "gift-15m", "action": "BUY", "confirm": True},
+    )
+
+    assert [p["id"] for p in db.get_open_positions(mode=PAPER, strategy_id="nifty-60m")] == [nifty_id]
+
+
+def test_gift_15m_exits_on_no_signal_and_nifty_60m_holds_through_it() -> None:
+    """The two books run different exit rules, and neither is the other's.
+
+    GIFT 15M exits on the first NO_SIGNAL after a directional bar; NIFTY 60M
+    holds through it and waits for a flip. Re-entry is a *fresh* signal, so the
+    bar that closed the position cannot immediately reopen it.
+    """
+    from strategy import EXIT_FLAT, EXIT_FLIP, exits
+
+    class Verdict:
+        def __init__(self, flat, opposite):
+            self.flat = flat
+            self.opposite = opposite
+
+    # The first NO_SIGNAL after a directional bar.
+    no_signal = Verdict(flat=True, opposite=False)
+    assert exits(no_signal, EXIT_FLAT) is True
+    assert exits(no_signal, EXIT_FLIP) is False
+
+    # A reversal closes both.
+    flip = Verdict(flat=False, opposite=True)
+    assert exits(flip, EXIT_FLAT) is False
+    assert exits(flip, EXIT_FLIP) is True
+
+    # A continuing trend closes neither.
+    trend = Verdict(flat=False, opposite=False)
+    assert exits(trend, EXIT_FLAT) is False
+    assert exits(trend, EXIT_FLIP) is False
+
+
+def test_the_configured_exit_rules_are_flat_for_gift_and_flip_for_nifty(
+    monkeypatch,
+) -> None:
+    """The shipped config must match the spec: GIFT 15M flat, NIFTY 60M flip."""
+    from config import strategy_configs
+
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_ID", "gift-15m")
+    monkeypatch.setenv("STRATEGY_1_INTERVAL", "15minute")
+    monkeypatch.setenv("STRATEGY_1_EXIT", "flat")
+    monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
+    monkeypatch.setenv("STRATEGY_2_ID", "nifty-60m")
+    monkeypatch.setenv("STRATEGY_2_INTERVAL", "60minute")
+    monkeypatch.setenv("STRATEGY_2_EXIT", "flip")
+
+    configs = {cfg.id: cfg for cfg in strategy_configs()}
+    assert configs["gift-15m"].exit == "flat"
+    assert configs["nifty-60m"].exit == "flip"
 
 
 def test_pausing_one_book_does_not_pause_the_other(monkeypatch, tmp_path) -> None:

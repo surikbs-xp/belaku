@@ -12,9 +12,9 @@ Amazon Lightsail container service, and deploys it.
 :::danger Read this first: there is no persistent disk
 
 A Lightsail container service has **no volumes**. Every deployment starts from
-the image's own filesystem, so `/data` — and with it `paper_trading.db`,
-`gift_book.db`, `paper_mirror.db`, the log file, and the Kite token the bot
-writes back into `.env` — is **recreated empty on every deploy**.
+the image's own filesystem, so `/data` — and with it `paper_trading.db`, the log
+file, and the Kite token the bot writes back into `.env` — is **recreated empty
+on every deploy**.
 
 A *restart* is different from a *deploy*: the container filesystem survives a
 restart, so a token written by a dashboard login is still there afterwards. It
@@ -282,8 +282,6 @@ repeated in the deployment spec. `build-spec.py` supplies them as defaults:
 | `WEBHOOK_HOST` | `0.0.0.0` | The platform forwards to the container, not to loopback |
 | `WEBHOOK_PORT` | `9000` | Matches the public endpoint |
 | `DB_PATH` | `/data/paper_trading.db` | |
-| `GIFT_BOOK_DB_PATH` | `/data/gift_book.db` | |
-| `PAPER_MIRROR_DB_PATH` | `/data/paper_mirror.db` | |
 | `LOG_FILE` | `/data/bot.log` | |
 | `HOLIDAY_CACHE_PATH` | `/data/nse_holidays.json` | |
 | `EXECUTION_MODE` | `PAPER` | A pipeline that deploys on every push must not arm LIVE |

@@ -47,22 +47,9 @@ additionally pinned to `WARNING`, because at `DEBUG` it prints the
 | `GET` | `/api/equity?limit=` | Cumulative equity curve |
 | `GET` | `/api/trades?limit=&mode=` | Settled round trips with fees and net PnL |
 | `GET` | `/api/analytics` | Trade statistics (KPIs, streaks, breakdowns) |
-| `GET` | `/api/mirror` | Shadow paper book: sync state, live vs paper comparison |
-| `GET` | `/api/venues` | Both books side by side — GIFT Nifty index vs Nifty future |
-| `GET` | `/api/gift/positions` | GIFT Nifty index-book positions (paper only) |
-| `GET` | `/api/gift/trades` | Settled round trips in the index book |
-| `GET` | `/api/gift/orders` | Index-book order log |
-| `GET` | `/api/gift/signals` | Index-book signal audit trail, including refusals |
-| `GET` | `/api/gift/summary` | Index-book health and metrics |
-| `GET` | `/api/gift/analytics` | Index-book trade statistics, shaped like `/api/analytics` |
-| `GET` | `/api/gift/portfolio` | Index-book account metrics, shaped like `/api/portfolio` |
-
-`/api/gift/analytics`, `/api/gift/portfolio` and `/api/gift/signals` are separate
-endpoints rather than a `venue` parameter on the futures ones. The two books are
-different databases, and a query parameter that silently switched ledgers would
-make a wrong number look like a real one. All of them report `enabled: false`
-when `GIFT_BOOK` is off, which is a normal state for the UI to render rather than
-a 500.
+Both strategies execute on the NIFTY future, so there is one ledger and no
+venue parameter. A `venue` switch that silently changed ledgers would make a
+wrong number look like a real one.
 
 ## Ledger
 
@@ -104,11 +91,19 @@ no longer shows them. Kept because they are still served.
 | `POST` | `/api/books/mode` | `{"strategy_id":str,"mode":"PAPER\|LIVE","confirm":bool}` | Switch one book's mode |
 | `POST` | `/api/books/pause` | `{"strategy_id":str,"paused":bool,"reason":str}` | Pause or resume one book |
 | `POST` | `/api/books/square-off` | `{"strategy_id":str,"confirm":true,"reason":str}` | Square off one book, then pause it |
+| `POST` | `/api/books/manual-order` | `{"strategy_id":str,"action":"BUY\|SELL","qty_lots":int,"confirm":true}` | Place a manual entry for one book |
 
 The per-book endpoints are what the two strategy panels use. Each is scoped to
 one `strategy_id`, so pausing or squaring off one book never touches the other's
-leg in the same contract. `/api/books/mode` refuses `LIVE → PAPER` while that
-book still holds a live position, and requires `confirm=true` to arm `LIVE`.
+position in the same contract. `/api/books/mode` refuses `LIVE → PAPER` while
+that book still holds a live position, and requires `confirm=true` to arm `LIVE`.
+
+`/api/books/manual-order` is routed through the same path as an automated
+signal, so a manual entry inherits the NSE session gate, the pause switch, the
+duplicate-entry guard, the lot and margin limits, the rollover rules and the
+book's own initial stop. The operator chooses the direction; the risk rules are
+not optional. It requires `confirm=true` because in `LIVE` it places a real
+order.
 
 Stops are configured per strategy with `STRATEGY_<n>_STOP_LOSS` and the trail
 keys, read from the environment rather than edited at runtime.
@@ -119,7 +114,8 @@ Enforced server-side, not just in the UI:
 
 - Switching to `LIVE` (globally or per book) requires `confirm=true` **and**
   complete Kite credentials, and passes the pre-flight report.
-- `/api/panic` and `/api/books/square-off` require `confirm=true`.
+- `/api/panic`, `/api/books/square-off` and `/api/books/manual-order` require
+  `confirm=true`.
 - A state-changing request (`POST`/`PUT`/`DELETE`) whose `Origin` is not the
   bot itself gets `403`.
 - A `Host` outside `ALLOWED_HOSTS` gets `400`.

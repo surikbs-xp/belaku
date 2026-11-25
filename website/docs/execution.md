@@ -32,8 +32,8 @@ Every one of these is enforced server-side, not just in the UI.
 
 | Gate | Where | Behaviour |
 |---|---|---|
-| NSE session only, 09:15–15:30 IST Mon–Fri | `kite_client.market_status` | LIVE orders blocked outside; holiday-aware |
-| Holiday calendar | `market_calendar` | NSE F&O closures block LIVE |
+| NSE session only, 09:15–15:30 IST Mon–Fri | `kite_client.market_status` | **Both PAPER and LIVE** entries blocked outside; holiday-aware |
+| Holiday calendar | `market_calendar` | NSE F&O closures block both modes |
 | Front-month symbol + lot size verified | `kite_client.front_month_contract` | Rejects an unverified contract |
 | Duplicate/replayed signals | `order_manager._already_processed` | Rejected |
 | Stale signals (1.5 bars, min 300 s) | `order_manager._signal_age_seconds` | Rejected |
@@ -54,11 +54,11 @@ timeframe moved to 15 minutes, because they arrive around 13 minutes old.
 | | PAPER | LIVE |
 |---|---|---|
 | Market data | Real (Kite) | Real (Kite) |
-| Signal | GIFT Nifty, closed bar | GIFT Nifty, closed bar |
+| Signal | Each book's own series, closed bar | Each book's own series, closed bar |
 | Orders | Simulated locally | Sent to Zerodha |
-| Venues traded | **Both**: the paper Nifty future *and* the GIFT Nifty index book | The Nifty future only |
+| Instrument traded | The Nifty future | The Nifty future |
 | Fills | The future's own last price | The broker's fill |
-| After hours | Simulates at the future's last price | Defers, never auto-executes |
+| Outside NSE hours | Refused, never simulated | Refused, never auto-executes |
 | Contract selection | Expiry calendar | Kite's instrument dump, same 5-day window |
 | Marked at | The future's own last price | The future's own last price |
 | Positions | Isolated by `mode` column | Isolated by `mode` column |
@@ -68,15 +68,13 @@ timeframe moved to 15 minutes, because they arrive around 13 minutes old.
 PAPER mocks *orders*, not market data. The strategy runs identically in both
 modes — only execution differs.
 
-PAPER trades **two venues on one signal**, which is the only way to compare them:
-the paper futures book (`DB_PATH`) and the GIFT Nifty index book
-(`GIFT_BOOK_DB_PATH`, enabled with `GIFT_BOOK=1`). Both are settled on the same
-closed bar with the same verdict, so they differ in venue and trading hours, never
-in when they acted. GIFT Nifty is a non-tradeable index, so that book has no LIVE
-path at all — in LIVE the signals still come from GIFT Nifty, but the only thing
-ordered is the future. That includes the rollover: both switch to the
-next contract `ROLLOVER_DAYS_BEFORE_EXPIRY` days before expiry, so the same signal
-names the same contract in either mode.
+Both strategies execute on the **NIFTY future**; only the signal series differs.
+GIFT NIFTY 15m reads the GIFT NIFTY index and NIFTY 60m reads the NIFTY spot
+index, and each settles its own book on its own closed bar. GIFT NIFTY is a
+non-tradeable index, so it is a signal source only — the only thing ever ordered
+is the future. Both books roll to the next contract
+`ROLLOVER_DAYS_BEFORE_EXPIRY` days before expiry, so the same signal names the
+same contract in either mode.
 
 ### The strategy is mode-independent by construction
 
@@ -221,87 +219,40 @@ the opposite side on a fresh signal. A leg that is against an existing state is
 closed and the bot goes flat: reversing on a signal that has been in force all
 night is exactly the re-entry the transition rule forbids.
 
-## Shadow paper book
+## Two strategies, one instrument
 
-PAPER and LIVE are never exercised on the same bar, so comparing their P&L over
-time says almost nothing — different quotes, different hours, different fills.
-What is worth knowing is narrower: **on this signal, at this moment, what fill
-would the paper model have invented, and how far is that from what the broker
-actually gave me?**
+Both strategies execute on the **NIFTY future**. Only the signal series and the
+timeframe differ:
 
-Set `PAPER_MIRROR=1` with `EXECUTION_MODE=LIVE` and the bot keeps a second,
-paper book in its own SQLite file (`PAPER_MIRROR_DB_PATH`), reproducing every
-reconciled change in the live book:
+| | GIFT NIFTY 15m | NIFTY 60m |
+|---|---|---|
+| Signal series | `NSEIX:GIFT NIFTY` | `NSE:NIFTY 50` |
+| Timeframe | 15 minutes | 60 minutes |
+| Execution | `NFO:NIFTY…FUT` | `NFO:NIFTY…FUT` |
+| Exit rule | `flat` — closes on the first `NO_SIGNAL` | `flip` — holds through `NO_SIGNAL` |
+| Initial stop | 50 points | 200 points |
+| Trail | 5 points, widening to 30 after +50 | 100 points after +200 |
+| Modes | PAPER or LIVE | PAPER or LIVE |
 
-1. The live book's **net signed quantity** per symbol is read from the ledger.
-2. The shadow book is moved to match — closing what it holds, then opening the
-   live quantity. Nothing is reconstructed from lot logic, so a partial fill or a
-   manual square-off is copied rather than guessed.
-3. Its fill is the **broker's actual fill price**, pushed through this bot's own
-   slippage model. The gap between the two books is therefore the *model's*
-   error, not a difference in market data.
+GIFT NIFTY is a non-tradeable index, so it is a **signal source only** — the only
+thing ever ordered is the future. Both books follow the same state rule on their
+own closed bars:
 
-The panel on the dashboard shows live vs paper net P&L, the gap between them,
-and whether the two books agree on the current position.
-
-| Detail | Why |
+| | Both books |
 |---|---|
-| Prices come from the mark loop's existing price map | Both books are valued identically, so the comparison does not measure a pricing artifact, and no extra API call is made |
-| Costs use the same model as PAPER | The point is to measure that model; substituting anything else would hide the error |
-| A fill older than 180 s is labelled `live_fill_stale` | An entry priced minutes later is not evidence about that fill, so the dataset keeps "measured against a real fill" separate from "measured against a quote" |
-| Only while `EXECUTION_MODE=LIVE` | During a paper run the main book *is* the paper book |
+| Flat + BULL/BEAR | Enter, if in session |
+| Agrees with the position | Hold |
+| Opposes the position | Flip |
+| `NO_SIGNAL` | GIFT 15m exits; NIFTY 60m holds |
 
-The mirror is read-only with respect to trading: it can never place, size or close
-a real order, it writes only to its own file, and a failure is recorded on
-`/api/mirror` rather than raised — a shadow book cannot be allowed to stop live
-trading. Deleting `PAPER_MIRROR_DB_PATH` loses only the shadow history.
+Each book is settled independently, on its own series and its own bar close, and
+each keeps its own position, orders, P&L and stop state. Because both trade the
+same contract, positions are **virtual per strategy** and reconciled against the
+broker's net position — squaring off one book can never close the other's leg.
 
-## Two books, one signal stream
-
-The same closed GIFT Nifty bar and the same verdict are settled in **two
-independent books**:
-
-| | GIFT Nifty index | Nifty future |
-|---|---|---|
-| Symbol | `NSEIX:GIFT NIFTY` | `NFO:NIFTY…FUT` |
-| Tradeable on Kite | **No** — index, quote-only | Yes |
-| Modes | PAPER only | PAPER or LIVE |
-| Hours | ~20 h/day, acts on the bar whenever it closes | NSE F&O session; LIVE defers outside it |
-| Fill reference | The bar's own close | Always the future's own quote |
-| Marked at | The bar's own close | Always the future's own last price |
-| Ledger | `GIFT_BOOK_DB_PATH` | `DB_PATH` |
-
-Set `GIFT_BOOK=1` to enable the index book. It exists to answer a question the
-futures book cannot: **would trading the signal source have beaten trading the
-future on the same signals?** The two books differ only in *venue and hours*,
-never in when they acted — which is what makes the comparison readable, and it
-isolates the two real differences: the future carries a **basis** to the index,
-and outside NSE hours the futures book must **defer** a signal that the index
-book fills immediately.
-
-Both books follow the **same state rule**, and the index book follows it on
-*every* closed bar whatever the NSE session is doing:
-
-| | GIFT Nifty index | Nifty future |
-|---|---|---|
-| Flat + BULL/BEAR | Enter | Enter, if in session |
-| Agrees with the position | Hold | Hold |
-| Opposes the position | Flip | Flip |
-| NO_SIGNAL | **Hold** | **Hold** |
-| Out of session | Acts on the bar anyway | Held until the first in-session bar |
-
-The index book is settled **before** the futures decision and outside the session
-gate, so a pre-market flip is not dependent on the futures book's overnight
-reconcile. Because the rule asserts a
-*state* rather than reacting to a one-bar change, settling on every bar is
-idempotent — `execute` returns `None` when the book already holds that position.
-The one asymmetry is deliberate: an entry or exit that the futures book has to
-**defer** outside NSE hours is **not** deferred by the index book, because GIFT
-Nifty trades ~20 h/day. That gap between the two books is the thing being
-measured, so it must stay.
-
-The dashboard shows them as separate sections (open positions for each, plus a
-same-signals comparison), and `/api/venues` returns both side by side.
+Both books act only inside the NSE session. GIFT NIFTY quotes outside it, but the
+GIFT 15m strategy must not generate or execute a trade outside the permitted
+session, and neither may the NIFTY 60m strategy.
 
 :::note[The futures book is filled and marked from the future only]
 An after-hours PAPER entry used to be both priced and marked from the GIFT Nifty
@@ -342,12 +293,11 @@ paper futures leg now models that:
   approximation as before (`SLIPPAGE_TICKS` against the future's LTP), so a
   depth-less quote grades exactly as it always did.
 
-The GIFT Nifty index book is unchanged: an index has no order book, so it still
-fills at the completed bar's close. The shadow paper mirror also keeps using the
-broker's actual fill as its reference — that is the entire point of the mirror.
+Both books fill from the future's own quote, so a paper fill and its mark share
+one instrument.
 :::
 
-:::danger[The index book refuses a bar with no range]
+:::danger[A bar with no range is refused]
 
 A bar whose `high == low` is not a traded bar. It carries the OHLC of whichever
 single tick seeded it, so its "close" is not a market level and pricing an order
@@ -363,15 +313,12 @@ Two upstream changes stop those bars from being produced at all — see
 
 :::
 
-:::warning[The index book can never go live]
+:::warning[GIFT NIFTY is a signal source, never an instrument]
 
-There is no GIFT Nifty futures contract on Kite, so this book has no LIVE path at
-all — there is no code in `gift_book.py` that can reach a broker. That is why it
-is a separate module rather than another branch inside `order_manager`.
-
-It is also **mode-independent**: the entry/exit rule and the hours it runs on are
-the same whether the futures book is in PAPER or LIVE. Arming LIVE changes where
-the *futures* orders go and nothing about the index book, which stays paper.
+There is no GIFT NIFTY futures contract on Kite, so the GIFT 15m book has no way
+to order the index — it reads GIFT NIFTY and trades the NIFTY future, exactly as
+the NIFTY 60m book does. Arming either book LIVE changes where its *futures*
+orders go and nothing about its signal series.
 
 :::
 

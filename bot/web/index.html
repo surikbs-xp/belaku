@@ -236,25 +236,6 @@
       </div>
     </div>
 
-    <!-- Shadow paper book: only meaningful while trading LIVE. -->
-    <div class="panel hidden" id="mirror-panel">
-      <div class="panel-head">
-        <h2 class="section-title">Shadow paper book</h2>
-        <span id="mirror-sync" class="pill pill-idle">—</span>
-      </div>
-      <p id="mirror-sub" class="metric-sub">—</p>
-      <div class="metric-strip">
-        <div class="strip-cell"><p class="metric-label">Live P&amp;L</p><p id="mirror-live-pnl" class="strip-value">—</p></div>
-        <div class="strip-cell"><p class="metric-label">Paper P&amp;L</p><p id="mirror-paper-pnl" class="strip-value">—</p></div>
-        <div class="strip-cell"><p class="metric-label">Model error</p><p id="mirror-gap" class="strip-value">—</p></div>
-        <div class="strip-cell"><p class="metric-label">Live trades</p><p id="mirror-live-trades" class="strip-value">—</p></div>
-        <div class="strip-cell"><p class="metric-label">Paper trades</p><p id="mirror-paper-trades" class="strip-value">—</p></div>
-      </div>
-      <p class="panel-footnote" title="The paper book copies every live position and prices its own fill from the broker's actual fill, plus its slippage model. The gap is therefore the paper model's error, not a difference in market data. It can never place or close a real order.">
-        Mirrors each live fill plus the slippage model — the gap is model error, not market data.
-      </p>
-    </div>
-
     <!-- Alerting: a channel that is silently misconfigured looks exactly like a
          quiet market, so it is testable on demand -->
     <div class="panel" id="alerts-panel">
@@ -324,10 +305,6 @@
           <p id="orders-caption" class="metric-sub">—</p>
         </div>
         <div class="toolbar">
-          <select id="orders-venue" class="field field-compact" aria-label="Venue">
-            <option value="futures">Nifty future</option>
-            <option value="gift">GIFT Nifty index</option>
-          </select>
           <input id="orders-search" type="search" placeholder="Search symbol, status, order id…" class="field field-search" />
           <select id="orders-mode" class="field field-compact">
             <option value="">All modes</option>
@@ -376,14 +353,8 @@
     <div class="panel panel-venue">
       <div class="panel-head panel-head-wrap">
         <div>
-          <h2 class="section-title">Venue</h2>
+          <h2 class="section-title">Book</h2>
           <p id="analytics-venue-note" class="metric-sub">—</p>
-        </div>
-        <div class="toolbar">
-          <select id="analytics-venue" class="field field-compact" aria-label="Venue">
-            <option value="futures">Nifty future</option>
-            <option value="gift">GIFT Nifty index</option>
-          </select>
         </div>
       </div>
     </div>

@@ -64,11 +64,9 @@ from config import (
 )
 from engine import get_engine
 from gift_nifty import GIFT_KEY, get_feed, reset_feed
-from gift_book import get_gift_book, gift_books
 from kite_client import expiry_label, future_symbol, get_client, market_status
 from market_calendar import get_calendar
-from order_manager import get_order_manager
-from paper_mirror import get_mirror
+from order_manager import BUY, SELL, get_order_manager
 from watchdog import get_watchdog
 import notifier
 
@@ -391,18 +389,9 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             # which the dashboard polls every 1.5s - Kite's quote API is rate
             # limited and that would be ~16k calls a session.
             get_feed().refresh_exec_quote()
-            # Mark both books from the one price map: the shadow book must value a
-            # position exactly as the live book does, or the comparison measures
-            # the pricing difference instead of the model's error.
             prices = manager.price_map()
             if prices:
                 db.mark_open_positions(get_execution_mode(), prices)
-                try:
-                    from paper_mirror import get_mirror
-
-                    get_mirror().mark(prices)
-                except Exception:  # pragma: no cover - defensive
-                    log.exception("Shadow book mark failed")
                 # Protective stops run on the live futures price, not on a bar
                 # close, and are not gated on the pause switch: pausing blocks
                 # entries, and a position already on must stay protected.
@@ -410,22 +399,6 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
                     get_engine().check_stops(prices)
                 except Exception:  # pragma: no cover - defensive
                     log.exception("Stop check failed")
-            # The index book is marked on its own level: there is no basis, which
-            # is exactly what makes the comparison interesting.
-            try:
-                from gift_book import gift_books
-
-                feed = get_feed()
-                feed_status = feed.status()
-                quote = feed_status.get("last_candle_close") or feed_status.get("price")
-                # Every strategy's index book, not just the default one. One mark
-                # per book: a single-book mark left the other books' open legs
-                # valued at their entry, so their unrealised P&L read zero while
-                # the index moved.
-                for book in gift_books():
-                    book.mark(quote)
-            except Exception:  # pragma: no cover - defensive
-                log.exception("GIFT index book mark failed")
         except Exception as exc:  # pragma: no cover - network
             log.warning("Execution quote refresh failed: %s", exc)
         try:
@@ -510,6 +483,34 @@ class BookSquareOffRequest(BaseModel):
     )
     confirm: bool = Field(
         default=False, description="Must be true; this closes real positions in LIVE."
+    )
+    reason: str = Field(
+        default="MANUAL",
+        max_length=200,
+        pattern=r"^[\w \-.:/@()\[\]]*$",
+        description="Audit label",
+    )
+
+
+class BookManualOrderRequest(BaseModel):
+    """Place a manual BUY or SELL for one book.
+
+    Manual entries go through the same path as a signal, so they inherit the
+    market-hours gate, the margin and lot checks, the duplicate-entry guard and
+    the initial stop. They are not a bypass: the operator is choosing the
+    direction, not skipping the risk rules.
+    """
+
+    strategy_id: str = Field(
+        ..., min_length=1, max_length=64, description="The book to trade"
+    )
+    action: str = Field(..., description="BUY or SELL")
+    qty_lots: int = Field(
+        default=1, ge=1, le=50, description="Lots to trade; capped by MAX_OPEN_LOTS"
+    )
+    confirm: bool = Field(
+        default=False,
+        description="Must be true; this places a real order in LIVE.",
     )
     reason: str = Field(
         default="MANUAL",
@@ -809,71 +810,6 @@ def api_logs(
     return payload
 
 
-@app.get("/api/mirror", tags=["analytics"])
-def api_mirror() -> dict[str, Any]:
-    """Shadow paper book: sync state and the live-vs-paper comparison.
-
-    The mirror never places an order, so this endpoint is read-only and reports
-    a disabled mirror rather than failing when ``PAPER_MIRROR`` is off.
-    """
-    return _mirror_status()
-
-
-def _mirror_status() -> dict[str, Any]:
-    """Mirror status that can never break ``/api/status``."""
-    try:
-        return get_mirror().status()
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("Mirror status unavailable: %s", exc)
-        return {
-            "enabled": False,
-            "configured": False,
-            "reason": f"status unavailable: {exc}",
-        }
-
-
-def _gift_book_status() -> dict[str, Any]:
-    """Index-book status that can never break ``/api/status``.
-
-    Every strategy's book, keyed by strategy id, plus an aggregate. One book per
-    strategy means a single status object would report one book and hide the
-    rest; ``books`` is the per-strategy view and the top-level numbers are the
-    sum across them.
-    """
-    try:
-        from gift_book import gift_books
-
-        books = {}
-        for book in gift_books():
-            try:
-                books[book.strategy_id] = book.status()
-            except Exception as exc:  # pragma: no cover - defensive
-                books[book.strategy_id] = {"enabled": False, "reason": str(exc)}
-        if not books:
-            return {"enabled": False, "configured": False, "books": {}}
-        enabled = {k: v for k, v in books.items() if v.get("enabled")}
-        if not enabled:
-            return {"enabled": False, "configured": False, "books": books}
-        return {
-            "enabled": True,
-            "configured": True,
-            "books": books,
-            "symbol": next(iter(enabled.values())).get("symbol"),
-            "net_pnl": round(sum(float(v.get("net_pnl") or 0.0) for v in enabled.values()), 2),
-            "unrealized_pnl": round(
-                sum(float(v.get("unrealized_pnl") or 0.0) for v in enabled.values()), 2
-            ),
-            "equity": round(sum(float(v.get("equity") or 0.0) for v in enabled.values()), 2),
-            "trades": sum(int(v.get("trades") or 0) for v in enabled.values()),
-            "realized_today": round(
-                sum(float(v.get("realized_today") or 0.0) for v in enabled.values()), 2
-            ),
-        }
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("GIFT index book status unavailable: %s", exc)
-        return {"enabled": False, "configured": False, "reason": f"status unavailable: {exc}"}
-
-
 def _lifecycle_alert(kind: str, detail: str, severity: str = "info") -> None:
     """Send a start/stop notice. Never raises, never blocks startup.
 
@@ -976,8 +912,6 @@ def api_status() -> dict[str, Any]:
         "engine": get_engine().status(),
         "watchdog": get_watchdog().state.to_dict(),
         "alerts": {"alerting": notifier.status()},
-        "mirror": _mirror_status(),
-        "gift_book": _gift_book_status(),
         "strategy_config": strategy_summary(),
         "market": market,
         "symbol": {
@@ -1444,474 +1378,6 @@ def api_orders(
     return {"orders": rows, "count": len(rows)}
 
 
-# ---------------------------------------------------------------------------
-# GIFT Nifty index book
-#
-# Separate endpoints rather than a flag on the futures ones: the two books live in
-# different databases, and GIFT Nifty is a non-tradeable index, so its rows can
-# never be returned alongside a real contract's.
-# ---------------------------------------------------------------------------
-def _gift_books_for(strategy_id: Optional[str] = None) -> list[Any]:
-    """The index books an endpoint should report on.
-
-    ``strategy_id`` narrows to one book; omitting it reports every configured
-    strategy's book. There is one book per strategy, so a single-book default
-    would show one strategy's GIFT leg and silently hide the rest - which reads
-    as "the other strategies never traded the index".
-
-    A deployment with no strategy configured for the index leg still gets the
-    default book, so a pre-multi-strategy ``.env`` returns exactly what it did.
-    """
-    if strategy_id:
-        return [get_gift_book(strategy_id)]
-    books = gift_books()
-    return books or [get_gift_book()]
-
-
-def _tag_gift(rows: list[dict[str, Any]], book: Any) -> list[dict[str, Any]]:
-    """Stamp each row with the strategy whose book it came from.
-
-    Without it an aggregate row cannot be traced back to a strategy, and with
-    two books on one index the operator cannot tell which leg is which.
-    """
-    return [{**row, "strategy_id": book.strategy_id, "venue": "GIFT"} for row in rows]
-
-
-@app.get("/api/gift/positions", tags=["gift"])
-def api_gift_positions(
-    status: str = Query("all", pattern="^(all|open|closed)$"),
-    limit: int = Query(200, ge=1, le=2000),
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """GIFT Nifty index-book positions (paper only - the index cannot be traded)."""
-    books = _gift_books_for(strategy_id)
-    rows: list[dict[str, Any]] = []
-    for book in books:
-        book_rows = book.positions(status=status, limit=limit)
-        # Priced off the index's own mark, never the futures map: the two books
-        # hold different instruments and must not be valued as one position.
-        mark = book.mark_price()
-        rows.extend(_tag_gift(_enrich_positions(book_rows, {book.symbol: mark} if mark else {}), book))
-    positions = sorted(rows, key=lambda r: r.get("entry_time") or "", reverse=True)[:limit]
-    return {
-        "positions": positions,
-        "count": len(positions),
-        "open_count": sum(1 for p in positions if p["status"] == "OPEN"),
-        "enabled": any(book.enabled for book in books),
-        "symbol": books[0].symbol if books else None,
-        "books": [book.strategy_id for book in books],
-        "tradeable": False,
-    }
-
-
-@app.get("/api/gift/trades", tags=["gift"])
-def api_gift_trades(
-    limit: int = Query(500, ge=1, le=5000),
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """Settled round trips in the GIFT Nifty index book."""
-    rows: list[dict[str, Any]] = []
-    books = _gift_books_for(strategy_id)
-    for book in books:
-        rows.extend(_tag_gift(book.trades(limit=limit), book))
-    rows = sorted(rows, key=lambda r: r.get("exit_time") or "", reverse=True)[:limit]
-    return {
-        "trades": rows,
-        "count": len(rows),
-        "books": [book.strategy_id for book in books],
-        "tradeable": False,
-    }
-
-
-@app.get("/api/gift/orders", tags=["gift"])
-def api_gift_orders(
-    limit: int = Query(500, ge=1, le=5000),
-    search: Optional[str] = Query(None, description="Case-insensitive substring filter"),
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """Order log for the GIFT Nifty index book."""
-    rows: list[dict[str, Any]] = []
-    books = _gift_books_for(strategy_id)
-    for book in books:
-        rows.extend(_tag_gift(book.orders(limit=limit), book))
-    if search:
-        needle = search.strip().lower()
-        rows = [r for r in rows if needle in " ".join(str(v) for v in r.values()).lower()]
-    rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)[:limit]
-    return {
-        "orders": rows,
-        "count": len(rows),
-        "books": [book.strategy_id for book in books],
-        "tradeable": False,
-    }
-
-
-@app.get("/api/gift/signals", tags=["gift"])
-def api_gift_signals(
-    limit: int = Query(100, ge=1, le=1000),
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """Signal audit trail for the GIFT Nifty index book.
-
-    A separate endpoint for the same reason as the other ``/api/gift/*`` routes:
-    the index book keeps its own database, so its decisions cannot be read out of
-    the futures ``signals`` table without reporting the wrong book.
-    """
-    rows: list[dict[str, Any]] = []
-    books = _gift_books_for(strategy_id)
-    for book in books:
-        if not book.enabled:
-            continue
-        rows.extend(_tag_gift(book.signals(limit=limit), book))
-    rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)[:limit]
-    return {
-        "signals": rows,
-        "count": len(rows),
-        "enabled": any(book.enabled for book in books),
-        "books": [book.strategy_id for book in books],
-        "tradeable": False,
-    }
-
-
-@app.get("/api/gift/summary", tags=["gift"])
-def api_gift_summary(
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """Index-book health and metrics, including why it is off when it is."""
-    books = _gift_books_for(strategy_id)
-    enabled = [book for book in books if book.enabled]
-    if not enabled:
-        return {
-            "enabled": False,
-            "configured": bool(settings.gift_book),
-            "symbol": books[0].symbol if books else None,
-            "books": [book.strategy_id for book in books],
-            "tradeable": False,
-            "reason": "GIFT_BOOK is off",
-        }
-    summaries = {book.strategy_id: book.summary() for book in enabled}
-    if len(summaries) == 1:
-        return {**next(iter(summaries.values())), "configured": True}
-    return {
-        "enabled": True,
-        "configured": True,
-        "books": summaries,
-        "tradeable": False,
-    }
-
-
-@app.get("/api/gift/analytics", tags=["gift"])
-def api_gift_analytics(
-    limit: int = Query(5000, ge=1, le=20000),
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """Post-close statistics for the index book.
-
-    A separate endpoint rather than a ``venue`` parameter on ``/api/analytics``:
-    the two books are different databases, and a query parameter that silently
-    switched ledgers would make a wrong number look like a real one.
-
-    With more than one book the result is *merged* into the same shape a single
-    book returns, with the per-strategy figures alongside under ``books``. The
-    Performance tab reads ``days`` and ``summary`` off the top level, so leaving
-    them undefined for a multi-book deployment would blank the calendar - a
-    consolidation that silently removes the page it was meant to enrich.
-    """
-    books = _gift_books_for(strategy_id)
-    enabled = [book for book in books if book.enabled]
-    if not enabled:
-        return {"enabled": False, "reason": "GIFT_BOOK is off", "tradeable": False}
-    per_book = {book.strategy_id: book.analytics(limit=limit) for book in enabled}
-    if len(per_book) == 1:
-        return {"enabled": True, "tradeable": False, **next(iter(per_book.values()))}
-    return {
-        "enabled": True,
-        "tradeable": False,
-        **_merge_analytics(list(per_book.values())),
-        "books": per_book,
-    }
-
-
-def _merge_analytics(reports: list[dict[str, Any]]) -> dict[str, Any]:
-    """Fold several books' analytics into one report of the same shape.
-
-    Sums where the figure is additive (trades, P&L, points, fees) and recomputes
-    where it is not: a win rate is wins over trades across the whole set, and a
-    profit factor is total gross win over total gross loss. Averaging the
-    per-book ratios would let a book with two trades outweigh one with two
-    hundred.
-
-    The shape matches a single book's report because the Performance tab reads
-    ``days`` and ``summary`` off the top level - returning only a per-book map
-    would blank the calendar, which is the page this consolidation is meant to
-    enrich.
-    """
-    def _s(report: dict[str, Any], key: str) -> float:
-        return float((report.get("summary") or {}).get(key) or 0.0)
-
-    def _bucket(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        out = {
-            key: sum(float(row.get(key) or 0.0) for row in rows)
-            for key in ("trades", "wins", "losses", "net_pnl", "gross_pnl", "fees", "points")
-        }
-        for key in ("trades", "wins", "losses"):
-            out[key] = int(out[key])
-        out["win_rate"] = (out["wins"] / out["trades"] * 100.0) if out["trades"] else 0.0
-        return out
-
-    summary = _bucket([
-        # The summary carries no per-row fields _bucket reads beyond these, so
-        # passing it straight through is what makes the merged figures add up.
-        dict(report.get("summary") or {})
-        for report in reports
-    ])
-    gross_win = sum(_s(r, "gross_win") for r in reports)
-    gross_loss = abs(sum(_s(r, "gross_loss") for r in reports))
-    trades = summary["trades"]
-    summary.update({
-        "gross_win": gross_win,
-        "gross_loss": -gross_loss,
-        "profit_factor": (
-            (gross_win / gross_loss) if gross_loss > 0
-            else (float("inf") if gross_win > 0 else 0.0)
-        ),
-        "largest_win": max((_s(r, "largest_win") for r in reports), default=0.0),
-        "largest_loss": min((_s(r, "largest_loss") for r in reports), default=0.0),
-        "avg_win": (gross_win / summary["wins"]) if summary["wins"] else 0.0,
-        "avg_loss": (-gross_loss / summary["losses"]) if summary["losses"] else 0.0,
-        "expectancy": (summary["net_pnl"] / trades) if trades else 0.0,
-        "avg_points": (summary["points"] / trades) if trades else 0.0,
-        "breakeven": trades - summary["wins"] - summary["losses"],
-        # The longest single hold across the books: there is no meaningful
-        # average of two books' average holds, and the longest is the one that
-        # tells an operator how much capital sat in one trade.
-        "avg_hold_minutes": max((_s(r, "avg_hold_minutes") for r in reports), default=0.0),
-    })
-
-    # Daily buckets keyed by date and summed, not concatenated: two books trading
-    # the same day is one day carrying both books' trades.
-    days: dict[str, list[dict[str, Any]]] = {}
-    for report in reports:
-        for day in report.get("days") or []:
-            days.setdefault(str(day.get("date")), []).append(day)
-    running = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    ordered_days = []
-    for date in sorted(days):
-        bucket = {"date": date, **_bucket(days[date])}
-        running += bucket["net_pnl"]
-        peak = max(peak, running)
-        max_dd = min(max_dd, running - peak)
-        bucket["cumulative"] = running
-        bucket["drawdown"] = running - peak
-        ordered_days.append(bucket)
-
-    def _merged(field: str, key_name: str) -> list[dict[str, Any]]:
-        grouped: dict[Any, list[dict[str, Any]]] = {}
-        for report in reports:
-            for row in report.get(field) or []:
-                grouped.setdefault(row.get(key_name), []).append(row)
-        out = [{key_name: key, **_bucket(rows)} for key, rows in grouped.items()]
-        return sorted(out, key=lambda row: str(row.get(key_name) or ""))
-
-    by_direction = {
-        side: _bucket([
-            (report.get("by_direction") or {}).get(side) or {}
-            for report in reports
-        ])
-        for side in ("LONG", "SHORT")
-    }
-
-    return {
-        "mode": PAPER,
-        "summary": summary,
-        "streaks": {
-            # "Current" is a per-book fact and there is no honest single answer
-            # for a set, so it is reported as none while the maxima are kept.
-            "current_kind": "none",
-            "current_run": 0,
-            "max_win": max(
-                (int((r.get("streaks") or {}).get("max_win") or 0) for r in reports),
-                default=0,
-            ),
-            "max_loss": max(
-                (int((r.get("streaks") or {}).get("max_loss") or 0) for r in reports),
-                default=0,
-            ),
-        },
-        "days": ordered_days,
-        "by_weekday": _merged("by_weekday", "weekday"),
-        "by_hour": _merged("by_hour", "hour"),
-        "by_exit_reason": _merged("by_exit_reason", "reason"),
-        "by_direction": by_direction,
-        "max_drawdown": max_dd,
-        "max_drawdown_pct": (max_dd / peak * 100.0) if peak > 0 else 0.0,
-    }
-
-@app.get("/api/gift/portfolio", tags=["gift"])
-def api_gift_portfolio(
-    strategy_id: Optional[str] = Query(None, description="One strategy's book, or all"),
-) -> dict[str, Any]:
-    """Index-book account metrics, in the same shape as ``/api/portfolio``.
-
-    The Performance tab's headline tiles are fed from here when the index venue
-    is selected, so the two venues are compared on identical arithmetic.
-
-    Aggregated across strategies when none is named: each book has its own
-    virtual balance, so the totals are sums rather than one book's numbers
-    presented as the venue's.
-    """
-    books = _gift_books_for(strategy_id)
-    enabled = [book for book in books if book.enabled]
-    if not enabled:
-        return {"enabled": False, "reason": "GIFT_BOOK is off", "tradeable": False}
-    metrics_rows = [(book, book.summary().get("metrics") or {}) for book in enabled]
-
-    def _total(key: str) -> float:
-        return round(sum(float(metrics.get(key) or 0.0) for _, metrics in metrics_rows), 2)
-
-    initial = _total("initial_balance")
-    equity = _total("equity")
-    realized_total = _total("realized_total")
-    unrealized = _total("unrealized_pnl")
-    return {
-        "enabled": True,
-        "tradeable": False,
-        "mode": PAPER,
-        "currency": "INR",
-        "symbol": enabled[0].symbol,
-        "books": [book.strategy_id for book in enabled],
-        "initial_balance": initial,
-        "balance": _total("balance"),
-        "equity": equity,
-        "unrealized_pnl": unrealized,
-        "realized_today": _total("realized_today"),
-        "realized_total": realized_total,
-        "total_pnl": round(realized_total + unrealized, 2),
-        "total_return_pct": (
-            round((realized_total + unrealized) / initial * 100.0, 2) if initial else 0.0
-        ),
-        "max_drawdown_pct": max(
-            (round(float(m.get("max_drawdown_pct") or 0.0), 2) for _, m in metrics_rows),
-            default=0.0,
-        ),
-        "total_trades": sum(int(m.get("total_trades") or 0) for _, m in metrics_rows),
-        "win_rate": (
-            round(
-                sum(float(m.get("win_rate") or 0.0) * int(m.get("total_trades") or 0)
-                    for _, m in metrics_rows)
-                / max(1, sum(int(m.get("total_trades") or 0) for _, m in metrics_rows)),
-                2,
-            )
-        ),
-        "profit_factor": (
-            None
-            if any(m.get("profit_factor") == float("inf") for _, m in metrics_rows)
-            else round(
-                sum(float(m.get("profit_factor") or 0.0) for _, m in metrics_rows)
-                / max(1, len(metrics_rows)),
-                2,
-            )
-        ),
-        "open_position_count": sum(len(book.open_positions()) for book in enabled),
-    }
-
-
-@app.get("/api/venues", tags=["gift"])
-def api_venues(limit: int = Query(2000, ge=2, le=20000)) -> dict[str, Any]:
-    """Futures venue beside the GIFT Nifty index venue, on the same signals.
-
-    Only meaningful when ``GIFT_BOOK`` is on; otherwise the index side reports
-    itself disabled rather than returning an empty book that looks like a losing
-    strategy. The index side is aggregated across every strategy's book, because
-    there is one book per strategy and each keeps its own ledger file.
-    """
-    books = [book for book in gift_books() if book.enabled]
-    futures_mode = get_execution_mode()
-    futures_metrics = db.get_performance_metrics(
-        open_positions=db.get_open_positions(mode=futures_mode),
-        prices=get_order_manager().price_map(),
-        mode=futures_mode,
-    )
-    index_metrics = None
-    if books:
-        # Summed from each book's own summary, not recomputed against the main
-        # ledger: the index books are separate database files, so reading their
-        # positions through the futures path would value them on the wrong
-        # prices and report a P&L that belongs to neither venue.
-        summaries = [book.summary().get("metrics") or {} for book in books]
-        index_metrics = {
-            "realized_total": sum(float(m.get("realized_total") or 0.0) for m in summaries),
-            "realized_today": sum(float(m.get("realized_today") or 0.0) for m in summaries),
-            "unrealized_pnl": sum(float(m.get("unrealized_pnl") or 0.0) for m in summaries),
-            "equity": sum(float(m.get("equity") or 0.0) for m in summaries),
-            "total_trades": sum(int(m.get("total_trades") or 0) for m in summaries),
-            "win_rate": (
-                round(
-                    sum(float(m.get("win_rate") or 0.0) * int(m.get("total_trades") or 0)
-                        for m in summaries)
-                    / max(1, sum(int(m.get("total_trades") or 0) for m in summaries)),
-                    2,
-                )
-            ),
-            "profit_factor": (
-                None
-                if any(m.get("profit_factor") == float("inf") for m in summaries)
-                else round(
-                    sum(float(m.get("profit_factor") or 0.0) for m in summaries)
-                    / max(1, len(summaries)),
-                    2,
-                )
-            ),
-        }
-
-    def _view(metrics: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        if not metrics:
-            return None
-        return {
-            "net_pnl": round(float(metrics.get("realized_total") or 0.0), 2),
-            "realized_today": round(float(metrics.get("realized_today") or 0.0), 2),
-            "unrealized_pnl": round(float(metrics.get("unrealized_pnl") or 0.0), 2),
-            "equity": round(float(metrics.get("equity") or 0.0), 2),
-            "trades": int(metrics.get("total_trades") or 0),
-            "win_rate": metrics.get("win_rate"),
-            "profit_factor": metrics.get("profit_factor"),
-        }
-
-    futures_view = _view(futures_metrics)
-    index_view = _view(index_metrics)
-    # One index venue across strategies, so the labels come from whichever book
-    # is enabled rather than from a single book that may not exist.
-    index_symbol = books[0].symbol if books else None
-    index_units = books[0].units if books else 0
-    return {
-        "signal_source": GIFT_KEY,
-        "futures": {
-            "label": "Nifty future",
-            "mode": futures_mode,
-            "symbol": get_order_manager().current_symbol(),
-            "tradeable": True,
-            "metrics": futures_view,
-        },
-        "gift_index": {
-            "label": "GIFT Nifty index",
-            "mode": PAPER,
-            "symbol": index_symbol,
-            "tradeable": False,
-            "enabled": bool(books),
-            "books": [book.strategy_id for book in books],
-            "units": index_units,
-            "metrics": index_view,
-        },
-        "net_pnl_gap": (
-            round((index_view or {}).get("net_pnl", 0.0) - (futures_view or {}).get("net_pnl", 0.0), 2)
-            if index_view and futures_view
-            else None
-        ),
-    }
-
-
 @app.get("/api/equity", tags=["analytics"])
 def api_equity(limit: int = Query(2000, ge=2, le=20000)) -> dict[str, Any]:
     """Cumulative equity curve, oldest first, with realised-PnL fallback."""
@@ -2227,6 +1693,59 @@ def api_book_square_off(request: BookSquareOffRequest) -> dict[str, Any]:
     return payload
 
 
+@app.post("/api/books/manual-order", tags=["control"])
+def api_book_manual_order(request: BookManualOrderRequest) -> dict[str, Any]:
+    """Place a manual BUY or SELL for one book.
+
+    Routed through ``process_signal`` rather than a separate execution path, so
+    a manual entry inherits every guard an automated one has: the NSE session
+    gate, the pause switch, the duplicate-entry check, the lot and margin
+    limits, the rollover rules and the book's own initial stop. The operator
+    chooses the direction; the risk rules are not optional.
+
+    The signal id is derived from the request so a double-click cannot open two
+    positions - the second call is rejected as a duplicate of the first.
+    """
+    run = _find_run(request.strategy_id)
+    action = request.action.strip().upper()
+    if action not in (BUY, SELL):
+        raise HTTPException(status_code=400, detail=f"action must be one of {[BUY, SELL]}")
+    if not request.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Manual {action} requires confirm=true - it places a real order in LIVE.",
+        )
+
+    mode = run.mode()
+    manager = get_order_manager()
+    payload: dict[str, Any] = {
+        "action": action,
+        "qty_lots": request.qty_lots,
+        "strategy": run.id,
+        "source": "MANUAL",
+        "signal_detail": f"Manual {action} from the dashboard ({request.reason})",
+        # A manual order is not a bar signal, so it carries no bar timestamp and
+        # must not be aged out by the staleness check.
+        "max_age_seconds": 0,
+        # The book's own stop rules, so a manual entry is protected exactly like
+        # an automated one. Without this the position would run unprotected.
+        "stop_rules": run.stop_rules.to_dict() if run.stop_rules else None,
+    }
+    if not payload["stop_rules"]:
+        payload.pop("stop_rules")
+
+    result = manager.process_signal(
+        payload, source="MANUAL", strategy_id=run.id, mode=mode
+    )
+    body = result.to_dict()
+    body.update({"strategy_id": run.id, "mode": mode, "paused": manager.book_paused(run.id)})
+    log.warning(
+        "Manual %s %s (%s): ok=%s %s",
+        action, run.id, mode, result.ok, result.reason,
+    )
+    return body
+
+
 @app.post("/api/risk/clear", tags=["control"])
 def api_risk_clear() -> dict[str, Any]:
     """Dismiss the reported stop-out notice.
@@ -2257,30 +1776,7 @@ def api_panic(request: PanicRequest) -> dict[str, Any]:
     payload = result.to_dict()
     payload["paused"] = manager.paused
 
-    # The index book is a separate database, so the futures square-off above
-    # cannot reach it. An emergency stop that leaves index positions open is the
-    # one state it must never leave behind, so every book is flattened too.
-    index_books: dict[str, Any] = {}
-    try:
-        from gift_book import gift_books
-
-        for book in gift_books():
-            try:
-                closed = book.flatten(request.reason or "PANIC")
-                if closed is not None:
-                    index_books[book.strategy_id] = closed
-            except Exception as exc:  # pragma: no cover - defensive
-                log.exception("Could not flatten the index book for %s", book.strategy_id)
-                index_books[book.strategy_id] = {"error": str(exc)}
-    except Exception as exc:  # pragma: no cover - defensive
-        log.exception("Could not enumerate the index books for PANIC")
-        index_books = {"error": str(exc)}
-    payload["index_books"] = index_books
-
-    log.warning(
-        "PANIC via API: ok=%s %s; index books flattened: %s",
-        result.ok, result.reason, sorted(index_books) or "none",
-    )
+    log.warning("PANIC via API: ok=%s %s", result.ok, result.reason)
     return payload
 
 
@@ -2330,20 +1826,12 @@ def api_strategies() -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - defensive
         accounts = {"error": str(exc)}
 
-    # Per-leg score, so a two-leg strategy can be read as two positions. The
-    # book-level figure above is the sum; this is what each venue actually did.
-    try:
-        legs = _leg_performance(book_modes)
-    except Exception as exc:  # pragma: no cover - defensive
-        legs = {"error": str(exc)}
-
     return {
         "ok": True,
         "configured": [cfg.to_dict() for cfg in strategy_configs()],
         "runs": runs,
         "portfolio": exposure,
         "performance": performance,
-        "leg_performance": legs,
         "accounts": accounts,
     }
 
@@ -2486,76 +1974,6 @@ def _strategy_performance(modes: Any) -> dict[str, dict[str, Any]]:
         )
         entry.pop("gross_win", None)
         entry.pop("gross_loss", None)
-    return out
-
-
-def _leg_performance(modes: Any) -> dict[str, dict[str, dict[str, Any]]]:
-    """Closed-trade stats per *execution leg*, keyed by strategy id then venue.
-
-    A two-leg strategy is two positions, and each leg fills, marks and exits on
-    its own. Reporting one P&L for the pair hides the half that is working and
-    the half that is not - which is the whole reason the legs are tracked
-    separately in the first place.
-
-    The venue is derived from the trade's own symbol rather than from the
-    strategy's configured legs: a leg that never filled has no trades, and
-    inventing a zero row for it would claim a result it never had. The UI draws
-    the configured legs and fills them from here, so an absent key means "no
-    closed trades on this leg", which is exactly what it should say.
-
-    The index book keeps its own database, so its trades are read from there -
-    the futures ledger cannot see them.
-    """
-    import database as db
-
-    out: dict[str, dict[str, dict[str, Any]]] = {}
-
-    def _add(strategy_id: str, venue: str, row: dict[str, Any]) -> None:
-        book = out.setdefault(strategy_id, {})
-        entry = book.setdefault(venue, {
-            "trades": 0, "wins": 0, "net_pnl": 0.0,
-            "gross_win": 0.0, "gross_loss": 0.0, "last_exit": None,
-        })
-        net = float(row.get("net_pnl") or 0.0)
-        entry["trades"] += 1
-        entry["net_pnl"] += net
-        if net > 0:
-            entry["wins"] += 1
-            entry["gross_win"] += net
-        elif net < 0:
-            entry["gross_loss"] += -net
-        if entry["last_exit"] is None:
-            entry["last_exit"] = row.get("exit_time")
-
-    for row in db.get_trades(limit=5000):
-        key = row.get("strategy_id") or db.DEFAULT_STRATEGY_ID
-        if str(row.get("mode") or "") != _book_mode(modes, key):
-            continue
-        _add(key, "futures", row)
-
-    # The index legs live in their own ledger, one file per strategy.
-    try:
-        from gift_book import gift_books
-
-        for book in gift_books():
-            if not book.enabled:
-                continue
-            for row in book.trades(limit=5000):
-                _add(book.strategy_id, "gift", row)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("Could not read the index legs' trades: %s", exc)
-
-    for book in out.values():
-        for entry in book.values():
-            n = entry["trades"]
-            entry["win_rate"] = round(100.0 * entry["wins"] / n, 1) if n else 0.0
-            entry["net_pnl"] = round(entry["net_pnl"], 2)
-            entry["profit_factor"] = (
-                round(entry["gross_win"] / entry["gross_loss"], 2)
-                if entry["gross_loss"] > 0 else None
-            )
-            entry.pop("gross_win", None)
-            entry.pop("gross_loss", None)
     return out
 
 

@@ -25,11 +25,12 @@ The trading view. Top to bottom:
 
   | Section | What it shows |
   |---|---|
-  | **Head** | Name, venue tag (`GIFT` / `NIFTY`, shown only when the name does not already say it), series, interval, lots, exit rule, entry filters, and a running/warming/error pill |
+  | **Head** | Name, signal-series tag (`GIFT` / `NIFTY`, shown only when the name does not already say it), interval, exit rule, and a running/paused/error pill, with the book's **LIVE/PAPER** toggle, **Pause/Resume**, **Square off** and manual **Buy**/**Sell** controls |
   | **Signal** | The verdict as a filled chip — green for a long book, red for a short one — with the band's left rail and border carrying the same direction so two bands compare by colour before either is read |
   | **Indicators & rule checks** | One row per indicator. Each states its level, its own direction, the distance price must travel to flip it, and whether it agrees with the verdict. A gap under a quarter of the bar's own range turns amber. The close the verdict used sits above the rows |
   | **Account** | That book's own equity, net P&L, trade count, win rate and profit factor |
   | **Position** | What that book currently holds, or `Flat` |
+  | **Stop** | The initial and current trailing stop, from the open position's own row |
 
   Indicators and rule checks share one table because they are the same two
   numbers read two ways. A single `2 of 2 confirmed` count hides *which*
@@ -41,8 +42,6 @@ The trading view. Top to bottom:
   Every figure comes from that book's own ledger and its own verdict. The close
   in particular is the one *that run* computed — measuring a book's
   distance-to-flip against another book's price would be quietly wrong.
-- **Shadow paper book** — shown only when `PAPER_MIRROR=1` and LIVE is armed:
-  live vs paper P&L and the model's error between them.
 - **Alerting** — channel, target, whether it is armed, alerts sent, last alert
   kind and watchdog health, with a **Send test alert** button. A channel that is
   silently misconfigured looks exactly like a quiet market, so it is testable on
@@ -50,7 +49,7 @@ The trading view. Top to bottom:
 
 There is no aggregate portfolio panel. Each band carries its own account, so a
 page-level total repeated equity and P&L without answering anything a band did
-not; the Performance tab carries the venue-scoped totals.
+not; the Performance tab carries the per-book totals.
 
 There is no session loss cap panel, because there is no session loss cap — see
 [Configuration](./configuration.md).
@@ -60,33 +59,19 @@ There is no session loss cap panel, because there is no session loss cap — see
 Searchable, mode-filtered order book plus the engine signal trail — placed,
 held, deferred, and **why**. CSV export.
 
-A **venue** selector scopes the whole tab to one book: *Nifty future* or *GIFT
-Nifty index*. The two books live in different databases, so this is a real scope
-switch rather than a filter — the index book's rows can never appear under the
-futures heading. The mode filter is disabled for the index book, which has no
-LIVE path at all, and the CSV filename names the venue so two exports are
-distinguishable.
-
-The **signal trail follows the same selector**: the index venue reads
-`/api/gift/signals` from its own ledger, so a book that traded always shows the
-decisions behind those fills. When the selected book is empty but the other one
-has rows, the empty state names the other book and its row count instead of
-reading as "the bot did nothing".
+Both strategies execute on the NIFTY future, so there is one ledger and no venue
+selector. A **book** filter scopes the tab to one strategy, and the signal trail
+follows the same filter, so a book that traded always shows the decisions behind
+those fills.
 
 ### Performance & trades
 
 Headline stats, a P&L calendar (green/red day cells with trade count and win
 rate, holiday cells for NSE closures), and the trade ledger.
 
-The same **venue** selector scopes the tab, including the headline tiles and the
-calendar: the index venue reads `/api/gift/analytics` and `/api/gift/portfolio`
-instead of the futures endpoints. When `GIFT_BOOK` is off the tab says so rather
-than showing an empty calendar, which would read as "no trades" instead of "this
-book is not running".
-
-The futures venue reuses the portfolio payload the 1.5 s poll already fetched,
-cached in the page, so opening the tab or switching back to it never blanks the
-tiles while waiting for the next poll.
+The headline tiles reuse the portfolio payload the 1.5 s poll already fetched,
+cached in the page, so opening the tab never blanks the tiles while waiting for
+the next poll.
 
 ### Logs
 

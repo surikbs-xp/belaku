@@ -130,7 +130,7 @@ The **same rule runs in both books and both modes.** The GIFT index book is
 settled first and outside the session gate, because it prices an index that trades
 ~20 hours and it is the venue comparison the index book exists to make; only the
 futures leg waits for the session. See
-[Execution](/execution#two-books-one-signal-stream).
+[Execution](/execution#two-strategies-one-instrument).
 
 ## Why the dashboard is a poll, not a websocket
 

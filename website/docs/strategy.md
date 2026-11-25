@@ -105,12 +105,12 @@ bar it boots into has `previous_signal == signal`, so it is not a transition. An
 entry owed from *before* the restart is the exception — it was latched by a bar
 this bot did observe, so it is a real signal rather than a boot-time guess.
 
-The rule is applied to **both books and both modes**. The Nifty futures book runs
-it inside the NSE session (PAPER and LIVE alike), and the [GIFT Nifty index
-book](/execution#two-books-one-signal-stream) runs the same rule on every closed
-bar whatever the session, because it prices an index that trades ~20 hours. See
-[Execution](/execution#two-books-one-signal-stream) for where the two venues
-deliberately differ.
+The rule is applied to **both books and both modes**, and both run it inside the
+NSE session only. GIFT NIFTY quotes outside it, but the GIFT 15m strategy must
+not generate or execute a trade outside the permitted session, and neither may
+the NIFTY 60m strategy. See
+[Execution](/execution#two-strategies-one-instrument) for how the two books
+differ.
 
 ## SuperTrend
 
