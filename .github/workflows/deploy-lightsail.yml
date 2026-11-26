@@ -212,6 +212,13 @@ jobs:
           if [ -n "${BELAKU_EXTRA_ENV:-}" ]; then
             printf '%s\n' "$BELAKU_EXTRA_ENV" >> "$ENV_FILE"
           fi
+          # Print the KEY NAMES only, never the values. A stray STRATEGY_<n>_*
+          # key left behind in BELAKU_EXTRA_ENV silently adds a strategy book -
+          # the bot then shows a band nobody configured, and there is no other
+          # way to see it: the secret is masked in the log and the container's
+          # environment is not readable from outside.
+          echo "Runtime environment keys:"
+          sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/  \1/p' "$ENV_FILE" | sort
           echo "ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"
 
       - name: Build deployment spec
