@@ -8903,6 +8903,35 @@ def _gift_rules():
     )
 
 
+def _pin_two_books(monkeypatch) -> None:
+    """Pin the engine's strategy list to the two books these tests exercise.
+
+    The books come from ``STRATEGY_1_*``/``STRATEGY_2_*`` in ``bot/.env``, which
+    is gitignored - so a developer's checkout has them and CI does not. Without
+    this the engine builds the single legacy book from the flat keys, every
+    ``gift-15m`` lookup 404s, and the suite passes locally while failing on every
+    push. Pinning the list makes the test measure the engine rather than whatever
+    the machine happens to have configured.
+    """
+    monkeypatch.setattr(
+        engine, "strategy_configs",
+        lambda: [
+            config.StrategyConfig(
+                index=1, id="gift-15m", source="gift", interval="15minute",
+                exit="flat", lots=1, enabled=True, name="GIFT NIFTY 15m",
+                stop_loss=50, trail_points=5, trail_after=50,
+                trail_points_after=30,
+            ),
+            config.StrategyConfig(
+                index=2, id="nifty-60m", source="nifty", interval="60minute",
+                exit="flip", lots=1, enabled=True, name="NIFTY 60m",
+                stop_loss=200, trail_points=100, trail_after=200,
+                trail_points_after=100,
+            ),
+        ],
+    )
+
+
 def _nifty_rules():
     import stops
 
@@ -9086,6 +9115,7 @@ def test_the_engine_closes_only_the_breaching_books_position(monkeypatch, tmp_pa
     Both books hold a long in the same future. The GIFT book's stop is hit; the
     NIFTY book's position must survive untouched.
     """
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     gift_id = db.open_position(
         "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
@@ -9115,6 +9145,7 @@ def test_the_engine_closes_only_the_breaching_books_position(monkeypatch, tmp_pa
 
 def test_a_stop_out_does_not_need_the_pause_switch(monkeypatch, tmp_path) -> None:
     """Pausing blocks entries; it must never disarm a protective stop."""
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     db.open_position(
         "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
@@ -9153,6 +9184,7 @@ def test_a_book_without_stop_rules_is_left_alone(monkeypatch, tmp_path) -> None:
 
 def test_the_stop_advances_on_every_mark_and_persists(monkeypatch, tmp_path) -> None:
     """The trail is written to the ledger, so a restart resumes it."""
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     position_id = db.open_position(
         "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
@@ -9217,6 +9249,7 @@ def test_switching_a_book_to_paper_is_refused_while_it_holds_a_live_position(
 
     from engine import get_engine
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     eng = get_engine()
     run = next(r for r in eng.runs if r.id == "gift-15m")
@@ -9239,6 +9272,7 @@ def test_switching_a_book_to_paper_is_refused_while_it_holds_a_live_position(
 def test_arming_a_book_live_requires_confirmation(monkeypatch, tmp_path) -> None:
     from fastapi.testclient import TestClient
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     response = TestClient(bot_app.app, base_url="http://localhost").post(
         "/api/books/mode",
@@ -9252,6 +9286,7 @@ def test_square_off_closes_only_the_named_book(monkeypatch, tmp_path) -> None:
     """Squaring off one book must never touch the other's leg in the same contract."""
     from fastapi.testclient import TestClient
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     db.open_position(
         "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
@@ -9291,6 +9326,7 @@ def test_a_manual_order_requires_confirmation(monkeypatch, tmp_path) -> None:
     """A stray click must not place an order."""
     from fastapi.testclient import TestClient
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     response = TestClient(bot_app.app, base_url="http://localhost").post(
         "/api/books/manual-order",
@@ -9303,6 +9339,7 @@ def test_a_manual_order_requires_confirmation(monkeypatch, tmp_path) -> None:
 def test_a_manual_order_rejects_an_unknown_action(monkeypatch, tmp_path) -> None:
     from fastapi.testclient import TestClient
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     response = TestClient(bot_app.app, base_url="http://localhost").post(
         "/api/books/manual-order",
@@ -9316,6 +9353,7 @@ def test_a_manual_order_is_refused_outside_market_hours(monkeypatch, tmp_path) -
     """Manual entries obey the same NSE session gate as a signal."""
     from fastapi.testclient import TestClient
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "is_market_open", lambda: False)
     monkeypatch.setattr(
@@ -9338,6 +9376,7 @@ def test_a_manual_order_is_refused_while_the_book_is_paused(monkeypatch, tmp_pat
     """Pause blocks manual entries too - it is the same entry path."""
     from fastapi.testclient import TestClient
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
     monkeypatch.setattr(
@@ -9367,6 +9406,7 @@ def test_a_manual_order_carries_the_books_own_stop_rules(monkeypatch, tmp_path) 
 
     from engine import get_engine
 
+    _pin_two_books(monkeypatch)
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
     monkeypatch.setattr(
