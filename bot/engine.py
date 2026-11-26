@@ -298,6 +298,19 @@ class StrategyEngine:
                     lots=getattr(settings, "default_lots", 1),
                 )
             )
+        # Say which books were built, and from what. Without this the only way to
+        # find out why a deployment shows three bands is to read the container's
+        # environment - and the books come from STRATEGY_<n>_* keys that are easy
+        # to leave behind in a secret. One line at startup answers it.
+        log.info(
+            "Strategy books (%d): %s",
+            len(runs),
+            ", ".join(
+                f"{run.id} [{type(run.source).__name__} "
+                f"{getattr(run.source, 'interval', None) or 'default'}]"
+                for run in runs
+            ) or "none",
+        )
         return runs
 
     def _build_source(self, cfg: Any):

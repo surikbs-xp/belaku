@@ -11151,3 +11151,54 @@ def test_order_type_accepts_market_and_limit(monkeypatch) -> None:
             ),
         )
         assert not any("ORDER_TYPE" in w for w in config.validate())
+
+
+def test_duplicate_strategy_ids_are_reported(monkeypatch) -> None:
+    """Two books sharing an id share one ledger, one account and one position.
+
+    Nothing downstream can tell them apart, so a stop-out on one would close the
+    other. The engine would happily build both and the dashboard would show two
+    bands with the same name, which is why this is refused loudly rather than
+    left to be discovered from a wrong P&L.
+    """
+    import config
+
+    monkeypatch.setattr(
+        config, "strategy_configs",
+        lambda: [
+            config.StrategyConfig(index=1, id="dup", source="gift", interval="15minute"),
+            config.StrategyConfig(index=2, id="dup", source="nifty", interval="60minute"),
+        ],
+    )
+    monkeypatch.setattr(
+        config, "settings",
+        SimpleNamespace(
+            order_type="MARKET", protective_stops=True, is_live_configured=True,
+            execution_mode="PAPER", access_token="t",
+        ),
+    )
+
+    warnings = config.validate()
+
+    assert any("Duplicate strategy id" in w for w in warnings)
+
+
+def test_distinct_strategy_ids_are_not_reported(monkeypatch) -> None:
+    import config
+
+    monkeypatch.setattr(
+        config, "strategy_configs",
+        lambda: [
+            config.StrategyConfig(index=1, id="gift-15m", source="gift", interval="15minute"),
+            config.StrategyConfig(index=2, id="nifty-60m", source="nifty", interval="60minute"),
+        ],
+    )
+    monkeypatch.setattr(
+        config, "settings",
+        SimpleNamespace(
+            order_type="MARKET", protective_stops=True, is_live_configured=True,
+            execution_mode="PAPER", access_token="t",
+        ),
+    )
+
+    assert not any("Duplicate" in w for w in config.validate())

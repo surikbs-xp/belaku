@@ -357,6 +357,21 @@ def validate() -> list[str]:
             "PROTECTIVE_STOPS is off: LIVE positions will have no exchange-held stop "
             "and are protected only while this process is running."
         )
+    # Two books sharing an id share one ledger, one account and one set of
+    # positions. The engine would build both, the dashboard would show two bands
+    # with the same name, and every scoped query would return both books' rows -
+    # so a stop-out on one would close the other. Nothing downstream can tell
+    # them apart, which makes this a configuration error worth refusing loudly.
+    try:
+        ids = [cfg.id for cfg in strategy_configs() if cfg.enabled]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            warnings.append(
+                f"Duplicate strategy id(s) {', '.join(duplicates)}: each book needs its "
+                "own STRATEGY_<n>_ID, or they share one ledger and one position."
+            )
+    except Exception:  # pragma: no cover - defensive
+        pass
     return warnings
 
 
