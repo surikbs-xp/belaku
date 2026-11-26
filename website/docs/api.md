@@ -56,6 +56,7 @@ wrong number look like a real one.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/orders?limit=&search=&mode=` | Order book |
+| `GET` | `/api/orders/pending?mode=` | Orders the broker has not finished with. These block new entries, so they are surfaced separately from the execution log. |
 | `GET` | `/api/signals?limit=` | Engine signal audit trail, including refusals |
 
 ## Journal
@@ -90,10 +91,11 @@ no longer shows them. Kept because they are still served.
 | `POST` | `/api/panic` | `{"confirm":true,"reason":str}` | Square off every book and pause |
 | `POST` | `/api/stop-all` | `{"confirm":true,"reason":str}` | Emergency halt: block new entries in every book, close nothing. Latches across restarts. |
 | `POST` | `/api/stop-all/clear` | — | Lift the STOP ALL latch |
-| `POST` | `/api/orders/reconcile` | — | Resolve unresolved orders against the Zerodha order book now |
+| `POST` | `/api/orders/reconcile?mode=` | — | Resolve unresolved orders against the Zerodha order book now, and cross-check the trade book. `mode` defaults to the process mode; the dashboard passes the mode it is showing. |
 | `POST` | `/api/books/mode` | `{"strategy_id":str,"mode":"PAPER\|LIVE","confirm":bool}` | Switch one book's mode |
 | `POST` | `/api/books/pause` | `{"strategy_id":str,"paused":bool,"reason":str}` | Pause or resume one book |
 | `POST` | `/api/books/square-off` | `{"strategy_id":str,"confirm":true,"reason":str}` | Square off one book, then pause it |
+| `POST` | `/api/books/stop` | `{"strategy_id":str,"stop":float,"confirm":true}` or `{"strategy_id":str,"distance":float,"confirm":true}` | Move one book's stop, by price or by points from the live mark. Tightening only; a looser level is refused. |
 | `POST` | `/api/books/manual-order` | `{"strategy_id":str,"action":"BUY\|SELL","qty_lots":int,"confirm":true}` | Place a manual entry for one book |
 
 The per-book endpoints are what the two strategy panels use. Each is scoped to

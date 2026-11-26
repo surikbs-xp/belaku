@@ -638,7 +638,63 @@ class OrderManager:
                 mode, summary["filled"], summary["closed"],
                 summary["still_open"], summary["unknown"],
             )
+        # The order book says what was *ordered*; the trade book says what
+        # actually *executed*, one row per fill. A partially filled order appears
+        # there as several rows, which is the only way to see the real average
+        # price and the real quantity when an order filled across levels. Checked
+        # after the order pass so a fill it just booked is not reported as a
+        # discrepancy.
+        summary["trade_book"] = self._verify_against_trade_book(mode)
         return summary
+
+    def _verify_against_trade_book(self, mode: str) -> dict[str, Any]:
+        """Compare today's broker fills against the ledger's recorded orders.
+
+        A read-only cross-check, not a repair. The order reconcile above already
+        books fills it can attribute to a local order; this catches the case it
+        cannot - a fill at the broker with no local order row at all, which means
+        something traded that this bot did not record. That is either a manual
+        trade in the same account or a lost acknowledgement, and both are worth
+        reporting rather than silently ignoring.
+
+        Never raises: a cross-check that throws must not fail the reconcile that
+        called it.
+        """
+        result: dict[str, Any] = {"checked": 0, "unmatched": [], "errors": []}
+        try:
+            fills = self.client.trades(force=True)
+        except Exception as exc:
+            result["errors"].append(f"Could not read the Zerodha trade book: {exc}")
+            return result
+        if not fills:
+            return result
+        try:
+            known = {
+                str(row.get("exchange_order_id"))
+                for row in db.get_orders(limit=5000)
+                if row.get("exchange_order_id")
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            result["errors"].append(f"Could not read the local order ledger: {exc}")
+            return result
+        for fill in fills:
+            result["checked"] += 1
+            order_id = str(fill.get("order_id") or "")
+            if order_id and order_id not in known:
+                result["unmatched"].append({
+                    "order_id": order_id,
+                    "symbol": fill.get("tradingsymbol"),
+                    "side": fill.get("transaction_type"),
+                    "quantity": fill.get("quantity"),
+                    "price": fill.get("average_price"),
+                })
+        if result["unmatched"]:
+            log.error(
+                "Trade book (%s): %d fill(s) at the broker have no local order row - "
+                "either a manual trade in this account or a lost acknowledgement: %s",
+                mode, len(result["unmatched"]), result["unmatched"][:5],
+            )
+        return result
 
     def _book_reconciled_fill(
         self,
@@ -698,6 +754,273 @@ class OrderManager:
             "Reconciled a late fill: %s %s %d @ %.2f -> position %s",
             side, row["symbol"], filled, float(price), position_id,
         )
+
+    # -- exchange-held protective stops ----------------------------------
+    def _protection_enabled(self, mode: str) -> bool:
+        """Whether a broker-side stop should exist for a position in ``mode``.
+
+        PAPER has no exchange to hold one, and the setting exists so an account
+        that cannot accept SL-M orders can still run - but a LIVE position with
+        this off is unprotected at the broker, which the readiness report says
+        plainly rather than leaving to be discovered.
+        """
+        return bool(getattr(settings, "protective_stops", True)) and mode == LIVE
+
+    def place_protective_stop(
+        self, position: dict[str, Any], stop: Optional[float] = None
+    ) -> dict[str, Any]:
+        """Put an exchange-held SL-M behind ``position`` at its current stop.
+
+        Called immediately after an entry fills, and again by the reconcile pass
+        for any position that has none. The level defaults to the position's own
+        ``trailing_stop`` so the exchange protects exactly what the engine would
+        have acted on - a different number here would mean two stops disagreeing
+        about where the trade ends.
+
+        Returns the broker's acknowledgement with ``ok`` added. A failure is not
+        fatal to the trade: the engine's software stop is still watching, and
+        refusing to hold a position because its backstop could not be placed
+        would be worse than holding it with one layer of protection. It is
+        logged at error level and surfaced on the dashboard instead.
+        """
+        mode = str(position.get("mode") or get_execution_mode()).upper()
+        level = stop if stop is not None else position.get("trailing_stop")
+        if level is None:
+            return {
+                "ok": False,
+                "status": "SKIPPED",
+                "message": "Position has no stop level to protect",
+            }
+        if not self._protection_enabled(mode):
+            return {
+                "ok": False,
+                "status": "SKIPPED",
+                "message": f"Protective stops are not used in {mode}",
+            }
+        ack = self.client.place_protective_stop(
+            symbol=position["symbol"],
+            position_key=int(position["position_key"]),
+            quantity=int(position["quantity"]),
+            trigger_price=float(level),
+            product=settings.product,
+            mode=mode,
+        )
+        status = str(ack.get("status") or "").upper().replace(" ", "_")
+        # TRIGGER_PENDING is the success case: the order is resting at the
+        # exchange. Anything else means the position has no backstop.
+        ok = status in {"TRIGGER_PENDING", "OPEN", "COMPLETE"}
+        db.set_position_protective_order(
+            int(position["id"]),
+            ack.get("order_id") if ok else None,
+            float(level) if ok else None,
+            status,
+        )
+        if ok:
+            log.info(
+                "Protective SL-M %s resting for %s at %.2f (%s %s)",
+                ack.get("order_id"), position["symbol"], float(level),
+                "SELL" if int(position["position_key"]) > 0 else "BUY",
+                int(position["quantity"]),
+            )
+        else:
+            log.error(
+                "NO BROKER-SIDE STOP for %s: SL-M placement failed (%s). "
+                "The software stop is the only protection on this position.",
+                position["symbol"], ack.get("message") or status,
+            )
+        return {**ack, "ok": ok, "trigger_price": float(level)}
+
+    def move_protective_stop(
+        self, position: dict[str, Any], stop: float
+    ) -> dict[str, Any]:
+        """Move a resting SL-M to ``stop``, or place one if it is missing.
+
+        Zerodha has no native trailing stop, so this is what a trail actually is
+        on the broker side: a modify per step. When the modify fails the ledger
+        keeps the tighter level and the exchange keeps the older one - the
+        position is still protected, just not as tightly as the dashboard says.
+        That gap is recorded in ``protective_stop`` so it is visible, and the
+        next reconcile retries it.
+        """
+        mode = str(position.get("mode") or get_execution_mode()).upper()
+        if not self._protection_enabled(mode):
+            return {"ok": False, "status": "SKIPPED", "message": "Not a LIVE position"}
+        order_id = position.get("protective_order_id")
+        if not order_id:
+            # Nothing resting to move, so this is a placement rather than a
+            # modify. Happens when the original placement failed.
+            return self.place_protective_stop(position, stop)
+        ack = self.client.modify_protective_stop(
+            str(order_id), float(stop),
+            quantity=int(position["quantity"]),
+            mode=mode,
+        )
+        status = str(ack.get("status") or "").upper().replace(" ", "_")
+        ok = status in {"TRIGGER_PENDING", "OPEN", "COMPLETE"}
+        if ok:
+            db.set_position_protective_order(
+                int(position["id"]), str(order_id), float(stop), status
+            )
+        else:
+            # Leave the recorded order id in place: the old trigger is still
+            # resting and still protecting, so forgetting it would lose the only
+            # handle on an order that can still fire.
+            db.set_position_protective_order(
+                int(position["id"]), str(order_id),
+                position.get("protective_stop"), status,
+            )
+            log.error(
+                "Protective SL-M for %s could not move to %.2f (%s); the exchange "
+                "still holds %.2f. Software stop remains at %.2f.",
+                position["symbol"], float(stop), ack.get("message") or status,
+                float(position.get("protective_stop") or 0.0),
+                float(position.get("trailing_stop") or 0.0),
+            )
+        return {**ack, "ok": ok}
+
+    def cancel_protective_stop(
+        self, position: dict[str, Any], *, reason: str = "EXIT"
+    ) -> dict[str, Any]:
+        """Remove a position's resting SL-M before the bot closes it itself.
+
+        This is part of every exit, not an optimisation. An SL-M left resting
+        while the bot closes the position becomes an order that opens a *new*
+        position in the opposite direction once the exit fills: the stop fires
+        against a flat book and sells into a short. So an exit that cannot
+        cancel its stop must not proceed - the caller checks ``ok``.
+        """
+        mode = str(position.get("mode") or get_execution_mode()).upper()
+        order_id = position.get("protective_order_id")
+        if not order_id:
+            return {"ok": True, "status": "NONE", "message": "No protective order to cancel"}
+        if mode != LIVE:
+            db.set_position_protective_order(int(position["id"]), None, None, "CANCELLED")
+            return {"ok": True, "status": "CANCELLED", "message": "Paper position"}
+        ack = self.client.cancel_protective_stop(str(order_id), mode=mode)
+        status = str(ack.get("status") or "").upper().replace(" ", "_")
+        # CANCELLED is the goal. COMPLETE means it already fired, which is not a
+        # failure of the cancel but does mean the position may already be closed
+        # by the stop - the caller re-reads the position either way.
+        ok = status in {"CANCELLED", "COMPLETE"}
+        if ok:
+            db.set_position_protective_order(int(position["id"]), None, None, status)
+        else:
+            log.error(
+                "Could not cancel protective SL-M %s for %s (%s); refusing to exit "
+                "into a live stop that would reverse the position",
+                order_id, position["symbol"], ack.get("message") or status,
+            )
+        return {**ack, "ok": ok}
+
+    def reconcile_protective_stops(self, mode: Optional[str] = None) -> dict[str, Any]:
+        """Make every open LIVE position's broker-side stop match its ledger stop.
+
+        Runs at startup and on the mark cadence. Three cases, and each is decided
+        by reading the broker rather than assuming:
+
+        * **no stop at all** - place one at the ledger level. This is the case
+          that matters after a crash: the position survived, the order did not.
+        * **stop resting at the wrong level** - the trail moved but the modify
+          failed, so move it. Only ever tightens, matching the engine's rule.
+        * **stop already fired** - the exchange closed the position while the bot
+          was not looking. Reported so the ledger can be settled from the broker
+          rather than left believing it is still open.
+
+        Never raises: a reconcile that throws would leave positions unprotected
+        with no explanation.
+        """
+        mode = mode or get_execution_mode()
+        summary: dict[str, Any] = {
+            "mode": mode, "checked": 0, "placed": 0, "moved": 0,
+            "already_ok": 0, "failed": 0, "errors": [],
+        }
+        if not self._protection_enabled(mode):
+            return summary
+        try:
+            positions = db.get_open_positions(mode=mode)
+        except Exception as exc:  # pragma: no cover - defensive
+            summary["errors"].append(f"Could not read open positions: {exc}")
+            return summary
+        if not positions:
+            return summary
+
+        # One read of the broker's book for the whole pass rather than one per
+        # position: the order book is a single API call and a per-position read
+        # would multiply the rate-limit cost by the number of open trades.
+        try:
+            broker_orders = {
+                str(row.get("order_id")): row
+                for row in self.client.order_book(force=True)
+                if row.get("order_id")
+            }
+        except Exception as exc:
+            summary["errors"].append(f"Could not read the Zerodha order book: {exc}")
+            return summary
+
+        for position in positions:
+            summary["checked"] += 1
+            order_id = position.get("protective_order_id")
+            ledger_stop = position.get("trailing_stop")
+            if ledger_stop is None:
+                continue
+            broker = broker_orders.get(str(order_id)) if order_id else None
+            if order_id and broker is None:
+                # The order is gone from today's book. It either fired or was
+                # cancelled by hand; either way it is not protecting anything, so
+                # the position needs a fresh one. Whether it *fired* is settled by
+                # the position reconcile, not guessed here.
+                summary["errors"].append(
+                    f"{position['symbol']}: protective order {order_id} is not in the "
+                    "Zerodha book; re-placing"
+                )
+                broker = None
+            if broker is not None:
+                status = str(broker.get("status") or "").upper().replace(" ", "_")
+                if status in {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED"}:
+                    summary["errors"].append(
+                        f"{position['symbol']}: protective order {order_id} is {status}; "
+                        "the position may already be closed at the broker"
+                    )
+                    db.set_position_protective_order(
+                        int(position["id"]), None, None, status
+                    )
+                    continue
+                resting = broker.get("trigger_price")
+                try:
+                    resting_level = float(resting) if resting not in (None, "", 0) else None
+                except (TypeError, ValueError):
+                    resting_level = None
+                key = int(position["position_key"])
+                # Only tighten. A resting trigger that is already at or beyond
+                # the ledger level is protecting at least as well, and moving it
+                # back would loosen a stop.
+                if resting_level is not None and (float(ledger_stop) - resting_level) * key <= 0:
+                    summary["already_ok"] += 1
+                    if position.get("protective_stop") != resting_level:
+                        db.set_position_protective_order(
+                            int(position["id"]), str(order_id), resting_level, status
+                        )
+                    continue
+                moved = self.move_protective_stop(position, float(ledger_stop))
+                if moved.get("ok"):
+                    summary["moved"] += 1
+                else:
+                    summary["failed"] += 1
+                continue
+            placed = self.place_protective_stop(position, float(ledger_stop))
+            if placed.get("ok"):
+                summary["placed"] += 1
+            else:
+                summary["failed"] += 1
+
+        if summary["placed"] or summary["moved"] or summary["failed"]:
+            log.warning(
+                "Protective stop reconcile (%s): %d checked, %d placed, %d moved, "
+                "%d already ok, %d failed",
+                mode, summary["checked"], summary["placed"], summary["moved"],
+                summary["already_ok"], summary["failed"],
+            )
+        return summary
 
     # -- emergency STOP ALL ----------------------------------------------
     STOP_ALL_KEY = "emergency_stop_all"
@@ -1262,6 +1585,25 @@ class OrderManager:
         )
         if order_id:
             order_ids.append(str(order_id))
+        # Put the exchange-held stop behind the position immediately. This is the
+        # one step that keeps the trade protected when this process is not
+        # running, so it happens before anything else can fail - and a failure is
+        # reported rather than swallowed, because a LIVE position with no
+        # broker-side stop is the state the whole protective-stop feature exists
+        # to prevent.
+        protection: Optional[dict[str, Any]] = None
+        if initial_stop is not None and self._protection_enabled(mode):
+            protection = self.place_protective_stop(
+                {
+                    "id": position_id,
+                    "symbol": symbol,
+                    "position_key": position_key,
+                    "quantity": filled_quantity,
+                    "mode": mode,
+                    "trailing_stop": initial_stop,
+                },
+                initial_stop,
+            )
         if mode == PAPER:
             self._mark_equity()
 
@@ -1286,6 +1628,14 @@ class OrderManager:
                 f"Opened {filled_lots:g} lot(s) "
                 f"{'LONG' if signed_quantity > 0 else 'SHORT'} @ {fill_price:.2f}"
             )
+        # A LIVE entry whose broker-side stop could not be placed is only
+        # software-protected. Say so in the summary the operator reads, not just
+        # in the log: the difference matters exactly when the process dies.
+        if protection is not None and not protection.get("ok"):
+            summary += (
+                f" - WARNING: no exchange-held stop ({protection.get('message') or protection.get('status')}); "
+                "only the software stop protects this position"
+            )
         return ExecutionResult(
             not pending_fill, action, mode, symbol, quantity=filled_quantity, price=fill_price,
             reason=summary,
@@ -1301,6 +1651,10 @@ class OrderManager:
                 # Broker round-trip for this order, in milliseconds. Covers
                 # submission, acknowledgement and fill for a market order.
                 "submit_ms": submit_ms,
+                # The exchange-held stop behind this position, if one was placed.
+                "protective_order_id": (protection or {}).get("order_id"),
+                "protective_stop": (protection or {}).get("trigger_price"),
+                "protective_ok": (protection or {}).get("ok"),
             },
         )
 
@@ -1407,6 +1761,20 @@ class OrderManager:
         for pos in positions:
             mark = mark_price or self.client.get_ltp(pos["symbol"]) or pos["last_price"] or pos["entry_price"]
             side = SELL if pos["position_key"] == 1 else BUY
+            # Remove the exchange-held stop before closing. An SL-M left resting
+            # while the bot exits becomes an order that opens a *new* position in
+            # the opposite direction once the exit fills: the stop fires against a
+            # flat book and sells into a short. So an exit that cannot cancel its
+            # stop does not proceed - the position stays open and protected, which
+            # is the safe failure.
+            cancelled = self.cancel_protective_stop(pos, reason=reason)
+            if not cancelled.get("ok"):
+                failures.append(
+                    f"{pos['symbol']}: could not cancel the protective stop "
+                    f"({cancelled.get('message') or cancelled.get('status')}); "
+                    "exit refused so the stop cannot reverse the position"
+                )
+                continue
             fill = apply_slippage(float(mark), side)
             ack = self.client.place_order(
                 symbol=pos["symbol"], transaction_type=side, quantity=pos["quantity"],

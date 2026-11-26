@@ -654,6 +654,27 @@ class StrategyEngine:
             db.update_position_stops(
                 position["id"], stop=state.current, best_price=state.best_price
             )
+            # Keep the exchange-held stop in step with the trail. Zerodha has no
+            # native trailing stop, so a trail is a modify per step - and if that
+            # modify fails the position is still protected, just at the older
+            # level. The ledger keeps the tighter number, ``protective_stop``
+            # records what the exchange actually holds, and the next reconcile
+            # retries. Only a *tightened* level is pushed: re-issuing an unchanged
+            # trigger would be a broker round-trip per mark for no gain.
+            previous = position.get("trailing_stop")
+            if (
+                state.current is not None
+                and (previous is None or (float(state.current) - float(previous)) * position_key > 0)
+            ):
+                try:
+                    get_order_manager().move_protective_stop(
+                        {**position, "trailing_stop": state.current}, float(state.current)
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    log.exception(
+                        "Could not move the protective stop for position %s",
+                        position.get("id"),
+                    )
             return None
 
         book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID

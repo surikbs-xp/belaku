@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv, dotenv_values
 
@@ -72,6 +72,23 @@ def _env_float(name: str, default: float) -> float:
 def _env_bool(name: str, default: bool) -> bool:
     raw = _env(name, "true" if default else "false").lower()
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int_optional(name: str, default: Optional[int] = None) -> Optional[int]:
+    """An int setting where empty means "unset" rather than zero.
+
+    ``_env_int`` cannot express this: it falls back to the default on a bad
+    value, so an operator who deliberately blanks the variable would silently
+    get the default back. Here an empty string is a real answer - "leave the
+    parameter off" - which is what ``MARKET_PROTECTION`` needs.
+    """
+    raw = _env(name, "" if default is None else str(default))
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def _env_path(name: str, default: str) -> str:
@@ -145,6 +162,18 @@ class Settings:
     tick_size: float = _env_float("TICK_SIZE", 0.05)
     product: str = _env("PRODUCT", "NRML")
     order_type: str = _env("ORDER_TYPE", "MARKET")
+    # Zerodha's market-protection band, in ticks. A MARKET order without one can
+    # fill far from the touch in a thin book, and the exchange rejects an order
+    # whose protection band is too wide. -1 lets Kite choose; empty leaves the
+    # parameter off entirely so the broker's own default applies.
+    market_protection: Optional[int] = _env_int_optional("MARKET_PROTECTION", -1)
+    # Whether to place an exchange-held SL-M behind every LIVE position. This is
+    # the difference between a stop that survives the bot dying and one that does
+    # not: the engine's stop is a software check on a mark loop, so a crash, a
+    # kill or an API outage leaves the position with no stop at all. On by
+    # default; turning it off is only reasonable for a broker account that cannot
+    # accept SL-M orders.
+    protective_stops: bool = _env_bool("PROTECTIVE_STOPS", True)
 
     # --- Risk / pricing ---------------------------------------------------
     lot_margin: float = _env_float("LOT_MARGIN", 150_000.0)
@@ -313,6 +342,21 @@ def validate() -> list[str]:
         )
     if mode == LIVE and not settings.is_live_configured:
         warnings.append("EXECUTION_MODE=LIVE but Kite credentials are incomplete.")
+    # ORDER_TYPE is used for entries *and* exits, and the client only forwards a
+    # price for LIMIT. An SL or SL-M here would send an order with no trigger
+    # price - which the exchange rejects - and the protective stop is placed
+    # separately as its own SL-M, so there is no reason to configure one here.
+    order_type = str(settings.order_type or "").upper()
+    if order_type not in {"MARKET", "LIMIT"}:
+        warnings.append(
+            f"ORDER_TYPE={settings.order_type!r} is not supported for entries and exits; "
+            "use MARKET or LIMIT. Protective stops are placed as their own SL-M."
+        )
+    if not getattr(settings, "protective_stops", True) and mode == LIVE:
+        warnings.append(
+            "PROTECTIVE_STOPS is off: LIVE positions will have no exchange-held stop "
+            "and are protected only while this process is running."
+        )
     return warnings
 
 

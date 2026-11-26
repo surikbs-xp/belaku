@@ -35,6 +35,8 @@ const ENDPOINTS = {
   panic:     '/api/panic',
   stopAll:   '/api/stop-all',
   stopAllClear: '/api/stop-all/clear',
+  reconcile: '/api/orders/reconcile',
+  pending:   '/api/orders/pending',
 };
 
 /** The one book the dashboard reads. Both strategies execute on the NIFTY
@@ -56,6 +58,9 @@ const state = {
   signals: [],
   trades: [],
   positions: [],
+  // Orders the broker has not finished with. They block new entries, so the
+  // dashboard shows them separately from the execution log.
+  pending: [],
   // Last futures portfolio payload. The Performance tab's futures venue needs
   // it, but the tab can be opened (or the venue switched) between two fast
   // polls, so the tiles read this cache instead of blanking to "—".
@@ -269,11 +274,33 @@ async function api(url, options) {
 
 /* ── Confirm dialog ────────────────────────────────────────────────── */
 
-function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
+/**
+ * Ask the operator to confirm an action.
+ *
+ * ``body`` is HTML so a caller can emphasise the consequence. The optional
+ * ``strategyId``/``action``/``mode`` triple renders a fact block, which is what
+ * makes a real-money confirmation unambiguous: the operator sees which book,
+ * which action and which mode before pressing the button. ``warn`` adds a red
+ * line for the irreversible cases.
+ */
+function confirmDialog(opts) {
+  const { title, body, okLabel = 'Confirm', danger = true } = opts;
+  const { strategyId, action, mode, warn } = opts;
   return new Promise((resolve) => {
     const modal = $('modal');
     $('modal-title').textContent = title;
     $('modal-body').innerHTML = body;
+
+    const facts = $('modal-facts');
+    facts.classList.toggle('hidden', !strategyId);
+    setText('modal-fact-strategy', strategyId || '—');
+    setText('modal-fact-action', action || '—');
+    setText('modal-fact-mode', mode || '—');
+
+    const warnEl = $('modal-warn');
+    warnEl.textContent = warn || '';
+    warnEl.classList.toggle('hidden', !warn);
+
     const ok = $('modal-ok');
     ok.textContent = okLabel;
     ok.className = `btn ${danger ? 'btn-danger' : 'btn-neutral'}`;
@@ -293,6 +320,7 @@ function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
     $('modal-cancel').addEventListener('click', onCancel);
     document.addEventListener('keydown', onKey);
     modal.classList.remove('hidden');
+    ok.focus();
   });
 }
 
@@ -1130,17 +1158,93 @@ function renderExitReason(reason) {
  * bot writes a row, so they are fetched on LEDGER_MS rather than every poll.
  */
 async function loadLedger() {
-  const [orders, trades, signals] = await Promise.all([
+  // The pending strip follows the mode filter, not the process mode: an operator
+  // looking at LIVE orders wants to know which LIVE orders are stuck, and the
+  // server's default would answer for PAPER while the table showed LIVE.
+  const mode = $('orders-mode') ? $('orders-mode').value : '';
+  const pendingUrl = mode ? `${ENDPOINTS.pending}?mode=${mode}` : ENDPOINTS.pending;
+  const [orders, trades, signals, pending] = await Promise.all([
     api(ENDPOINTS.orders),
     api(ENDPOINTS.trades),
     api(ENDPOINTS.signals),
+    api(pendingUrl).catch(() => ({ orders: [], count: 0 })),
   ]);
   state.orders = orders.orders || [];
   state.signals = signals.signals || [];
   state.trades = trades.trades || [];
+  state.pending = pending.orders || [];
   renderOrders();
+  renderPending();
   renderSignals();
   renderTrades();
+}
+
+/**
+ * Unresolved orders, and the fact that they block new entries.
+ *
+ * Hidden entirely when there are none: a permanent empty table is noise, and the
+ * absence of the strip is itself the signal that nothing is stuck.
+ */
+function renderPending() {
+  const strip = $('pending-strip');
+  const rows = state.pending || [];
+  strip.classList.toggle('hidden', !rows.length);
+  if (!rows.length) return;
+  setText('pending-strip-note',
+    `${rows.length} order${rows.length === 1 ? '' : 's'} - new entries are blocked until these resolve`);
+  $('pending-body').innerHTML = rows.map((o) => {
+    const action = String(o.transaction_type || '').toUpperCase();
+    const tag = action === 'BUY' ? 'tag-buy' : 'tag-sell';
+    return `
+      <tr>
+        <td class="font-mono text-slate-400">${escapeHtml((o.ts || '').replace('T', ' '))}</td>
+        <td class="text-slate-300">${escapeHtml(bookLabel(o.strategy_id))}</td>
+        <td class="font-mono">${escapeHtml(o.symbol)}</td>
+        <td><span class="tag ${tag}">${escapeHtml(action)}</span></td>
+        <td class="num">${o.quantity}</td>
+        <td><span class="tag tag-warn">${escapeHtml(String(o.status || '').toUpperCase())}</span></td>
+        <td class="font-mono text-slate-500">${escapeHtml(o.exchange_order_id || '—')}</td>
+        <td class="max-w-[22rem] truncate text-slate-400" title="${escapeHtml(o.message || '')}">${escapeHtml(o.message || '')}</td>
+      </tr>`;
+  }).join('');
+}
+
+/**
+ * Resolve unresolved orders against the broker now.
+ *
+ * The same pass the bot runs on its own clock, exposed so an operator can clear
+ * a stuck block without restarting - and so the readiness report can be re-run
+ * straight after a manual fix.
+ */
+async function reconcileOrders() {
+  const button = $('btn-orders-reconcile');
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = 'Reconciling…';
+  try {
+    // Reconcile the mode being viewed, not the process mode: an operator looking
+    // at LIVE orders means the LIVE ones.
+    const mode = $('orders-mode') ? $('orders-mode').value : '';
+    const url = mode ? `${ENDPOINTS.reconcile}?mode=${mode}` : ENDPOINTS.reconcile;
+    const result = await api(url, { method: 'POST' });
+    const parts = [];
+    if (result.filled) parts.push(`${result.filled} filled`);
+    if (result.closed) parts.push(`${result.closed} closed`);
+    if (result.still_open) parts.push(`${result.still_open} still open`);
+    if (result.unknown) parts.push(`${result.unknown} unknown`);
+    const unmatched = (result.trade_book || {}).unmatched || [];
+    if (unmatched.length) parts.push(`${unmatched.length} unmatched fill(s)`);
+    toast(
+      parts.length ? `Reconciled: ${parts.join(', ')}` : 'Nothing to reconcile',
+      (result.errors || []).length || unmatched.length ? 'warn' : 'ok',
+    );
+    await loadLedger();
+  } catch (error) {
+    toast(`Reconcile failed: ${error.message}`, 'err');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Reconcile';
+  }
 }
 
 /**
@@ -1248,7 +1352,7 @@ function renderDashPositions() {
           <thead>
             <tr>
               <th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
-              <th class="num">LTP</th><th class="num">Points</th>
+              <th class="num">LTP</th><th class="num">Stop</th><th class="num">Points</th>
               <th class="num">P&amp;L</th><th>Opened</th>
             </tr>
           </thead>
@@ -1265,6 +1369,7 @@ function renderDashPositions() {
                   ${cell('Qty', row.quantity)}
                   ${cell('Entry', level(entry))}
                   ${cell('LTP', level(mark))}
+                  ${cell('Stop', level(num(row.stop_price)))} 
                   ${cell('Points', signedPoints(points), points === null ? '' : (points >= 0 ? 'pos' : 'neg'))}
                   ${cell('P&L', signedInr(legPnl), pnlClass(legPnl))}
                   <td class="text-slate-400" data-label="Opened">${escapeHtml(istClock(row.entry_time) || '—')}</td>
@@ -1979,9 +2084,15 @@ async function toggleBookMode(event) {
   const current = button.dataset.bookModeCurrent;
   const target = current === 'LIVE' ? 'PAPER' : 'LIVE';
   if (target === 'LIVE') {
-    const ok = window.confirm(
-      `Switch ${strategyId} to LIVE? Real orders will be placed on the NIFTY future.`,
-    );
+    const ok = await confirmDialog({
+      title: 'Arm LIVE trading?',
+      body: `Switch ${strategyId} to LIVE. From the next signal this book places real orders on the NIFTY future.`,
+      strategyId,
+      action: 'PAPER → LIVE',
+      mode: 'LIVE',
+      warn: 'Real money. The book keeps its own stop and risk limits, but fills are final.',
+      okLabel: 'Arm LIVE',
+    });
     if (!ok) return;
   }
   button.disabled = true;
@@ -2008,9 +2119,17 @@ async function squareOffBook(event) {
   const button = event.target.closest('[data-book-square-off]');
   if (!button || button.disabled) return;
   const strategyId = button.dataset.bookSquareOff;
-  const ok = window.confirm(
-    `Square off ${strategyId}? This closes its open position and pauses it.`,
-  );
+  const mode = button.dataset.bookSquareOffMode || 'PAPER';
+  const ok = await confirmDialog({
+    title: 'Square off this book?',
+    body: `Close ${strategyId}'s open position at market and pause the book. The other book's leg in the same contract is left alone.`,
+    strategyId,
+    action: 'Square off + pause',
+    mode,
+    warn: mode === 'LIVE' ? 'This sends a real market order.' : '',
+    okLabel: 'Square off',
+    danger: mode === 'LIVE',
+  });
   if (!ok) return;
   button.disabled = true;
   try {
@@ -2043,10 +2162,16 @@ async function manualBookOrder(event) {
   const strategyId = button.dataset.bookManual;
   const action = button.dataset.bookManualAction;
   const mode = button.dataset.bookManualMode || 'PAPER';
-  const ok = window.confirm(
-    `Place a manual ${action} for ${strategyId} in ${mode}?`
-      + (mode === 'LIVE' ? ' This is a real order.' : ''),
-  );
+  const ok = await confirmDialog({
+    title: `Manual ${action}?`,
+    body: `Place a manual ${action} for ${strategyId}. It goes through the same risk checks as a signal, and the book's initial stop is applied on fill.`,
+    strategyId,
+    action: `Manual ${action}`,
+    mode,
+    warn: mode === 'LIVE' ? 'This is a real order.' : '',
+    okLabel: `Send ${action}`,
+    danger: mode === 'LIVE',
+  });
   if (!ok) return;
   button.disabled = true;
   try {
@@ -2068,6 +2193,220 @@ async function manualBookOrder(event) {
 }
 
 /**
+ * Move one book's protective stop.
+ *
+ * The engine's trail only ever tightens, so the dialog states the direction and
+ * the server refuses a looser level. The operator is asked for a price rather
+ * than a distance because the level is what the engine stores and what the
+ * position card shows - a distance would have to be converted, and a conversion
+ * is a place for the two to disagree.
+ */
+/**
+ * Open the stop editor for one book.
+ *
+ * A dedicated form rather than ``window.prompt``: the operator needs to see the
+ * entry, the live price, the current level and the resulting level *as they
+ * type*, and a prompt can show none of that. It also removes the "type d40 for
+ * points" syntax, which was a parser disguised as a text field.
+ */
+function editBookStop(event) {
+  const button = event.target.closest('[data-book-stopedit]');
+  if (!button || button.disabled) return;
+  const parse = (raw) => {
+    const n = Number(raw);
+    return raw !== '' && raw !== undefined && Number.isFinite(n) ? n : null;
+  };
+  openStopEditor({
+    strategyId: button.dataset.bookStopedit,
+    side: button.dataset.bookSlSide || '',
+    mode: button.dataset.bookSlMode || 'PAPER',
+    entry: parse(button.dataset.bookSlEntry),
+    current: parse(button.dataset.bookSlCurrent),
+    mark: parse(button.dataset.bookSlMark),
+    distance: parse(button.dataset.bookSlGap),
+  });
+}
+
+/** The stop editor's live state, while it is open. */
+const slState = {
+  open: false,
+  strategyId: '',
+  side: '',
+  mode: 'PAPER',
+  entry: null,
+  current: null,
+  mark: null,
+  byPoints: false,
+};
+
+function openStopEditor(opts) {
+  // A plain parameter rather than a destructured one: the static analyser that
+  // guards against undefined names cannot see names bound by destructuring, so
+  // a destructured signature reads as a call to an undefined function.
+  const { strategyId, side, mode, entry, current, mark, distance } = opts;
+  const isLong = side === 'LONG';
+  Object.assign(slState, {
+    open: true, strategyId, side, mode, entry, current, mark, byPoints: false,
+  });
+
+  setText('sl-title', `Modify stop-loss · ${strategyId}`);
+  setText('sl-sub', `${side} position. The stop may only move ${isLong ? 'up' : 'down'} - never back.`);
+  setText('sl-entry', entry === null ? '—' : level(entry));
+  setText('sl-mark', mark === null ? '—' : level(mark));
+  setText('sl-current', current === null ? '—' : level(current));
+  setText('sl-room', distance === null ? '—' : `${Math.abs(distance).toFixed(1)} pts`);
+
+  // Default to the current level so a small nudge is one edit, not a retype.
+  const input = $('sl-input');
+  input.value = current === null ? '' : current.toFixed(2);
+  input.min = '0';
+  input.step = '0.05';
+
+  setStopMode(false);
+  // Validate the seeded value immediately. Opening with "—" and a disabled
+  // button made the dialog look broken until the operator typed something,
+  // even though the field already held a valid level.
+  updateStopPreview();
+  $('sl-modal').classList.remove('hidden');
+  input.focus();
+  input.select();
+}
+
+function closeStopEditor() {
+  slState.open = false;
+  $('sl-modal').classList.add('hidden');
+}
+
+/** Switch between entering a price and entering a distance in points. */
+function setStopMode(byPoints) {
+  slState.byPoints = byPoints;
+  const priceBtn = $('sl-mode-price');
+  const pointsBtn = $('sl-mode-points');
+  priceBtn.classList.toggle('is-active', !byPoints);
+  pointsBtn.classList.toggle('is-active', byPoints);
+  priceBtn.setAttribute('aria-selected', String(!byPoints));
+  pointsBtn.setAttribute('aria-selected', String(byPoints));
+
+  setText('sl-input-label', byPoints ? 'Distance from the live price' : 'New stop price');
+  setText('sl-input-unit', byPoints ? 'points' : 'price');
+  const input = $('sl-input');
+  input.step = byPoints ? '1' : '0.05';
+  // Seed the field with the value that means "no change", so switching modes
+  // does not leave a number that reads as a different level.
+  if (byPoints) {
+    input.value = slState.distance === null || slState.distance === undefined
+      ? ''
+      : Math.abs(slState.distance).toFixed(1);
+  } else {
+    input.value = slState.current === null ? '' : slState.current.toFixed(2);
+  }
+  updateStopPreview();
+  input.focus();
+  input.select();
+}
+
+/** Resolve the typed value to a price and validate it, live. */
+function updateStopPreview() {
+  const isLong = slState.side === 'LONG';
+  const raw = $('sl-input').value.trim();
+  const value = Number(raw);
+  const error = $('sl-error');
+  const apply = $('sl-apply');
+  const preview = $('sl-preview');
+  const note = $('sl-preview-note');
+
+  const fail = (message) => {
+    error.textContent = message;
+    error.classList.remove('hidden');
+    preview.textContent = '—';
+    note.textContent = '';
+    apply.disabled = true;
+  };
+
+  if (!raw || !Number.isFinite(value) || value <= 0) {
+    fail(slState.byPoints ? 'Enter a distance in points.' : 'Enter a stop price.');
+    return;
+  }
+
+  let resolved;
+  if (slState.byPoints) {
+    if (slState.mark === null) {
+      fail('No live price to measure from. Use "By price" instead.');
+      return;
+    }
+    resolved = Math.round((slState.mark - (isLong ? 1 : -1) * value) * 100) / 100;
+  } else {
+    resolved = Math.round(value * 100) / 100;
+  }
+
+  // The engine's own invariant: a stop may tighten, never widen.
+  if (slState.current !== null) {
+    const tightens = (resolved - slState.current) * (isLong ? 1 : -1);
+    if (tightens < 0) {
+      fail(
+        `That would widen the stop. A ${isLong ? 'long' : 'short'} stop may only move `
+          + `${isLong ? 'up' : 'down'} from ${level(slState.current)}.`,
+      );
+      return;
+    }
+    if (tightens === 0) {
+      // Not an error: the field is seeded with the current level so a small
+      // nudge is one edit. Say what to do rather than flagging red on open.
+      error.classList.add('hidden');
+      preview.textContent = level(resolved);
+      note.textContent = 'unchanged - enter a new level';
+      apply.disabled = true;
+      return;
+    }
+  }
+
+  error.classList.add('hidden');
+  preview.textContent = level(resolved);
+  const moved = slState.current === null ? null : (resolved - slState.current) * (isLong ? 1 : -1);
+  note.textContent = moved === null
+    ? 'first stop on this position'
+    : `tightens by ${moved.toFixed(1)} pts`;
+  apply.disabled = false;
+  apply.dataset.resolved = String(resolved);
+}
+
+/** Apply the stop the editor has resolved. */
+async function applyStopEditor() {
+  const apply = $('sl-apply');
+  if (apply.disabled || !slState.open) return;
+  const resolved = Number(apply.dataset.resolved);
+  if (!Number.isFinite(resolved)) return;
+
+  apply.disabled = true;
+  apply.textContent = 'Moving…';
+  try {
+    const result = await api('/api/books/stop', {
+      method: 'POST',
+      body: JSON.stringify({
+        strategy_id: slState.strategyId,
+        stop: resolved,
+        confirm: true,
+        reason: 'MANUAL_SL',
+      }),
+    });
+    closeStopEditor();
+    toast(
+      `${slState.strategyId}: stop ${result.previous_stop === null ? 'set' : 'moved'} to ${result.stop.toFixed(2)}`,
+      'ok',
+    );
+    await poll();
+  } catch (error) {
+    const box = $('sl-error');
+    box.textContent = error.message;
+    box.classList.remove('hidden');
+    apply.disabled = false;
+  } finally {
+    apply.textContent = 'Move stop';
+  }
+}
+
+/**
+ * The five summary figures at the top of the dashboard./**
  * The five summary figures at the top of the dashboard.
  *
  * Everything here is derived from payloads the page already fetches, so this
@@ -2144,6 +2483,67 @@ function syncBookFilter(runs) {
   }
 }
 
+/**
+ * The group's shared facts, stated once above its tiles.
+ *
+ * Both books trade the same contract, so the instrument, the venue and the
+ * combined exposure are properties of the *group*, not of either tile. Repeating
+ * them in both tiles made two strategies on one instrument read as two unrelated
+ * things; stating them once here is what makes the pair legible as one position
+ * at the broker.
+ *
+ * The figures are summed across books but never across modes: a LIVE leg and a
+ * PAPER leg are different money, and adding them would produce a number that is
+ * true of neither.
+ */
+function renderGroupSummary(books, perf, accounts) {
+  if (!books.length) return '';
+  const modes = new Set(books.map((r) => (accounts[r.id] || {}).mode || r.mode || 'PAPER'));
+  const mixed = modes.size > 1;
+  const modeLabel = mixed ? 'MIXED' : [...modes][0];
+
+  let netPnl = 0;
+  let openUnits = 0;
+  let trades = 0;
+  let havePnl = false;
+  for (const run of books) {
+    const book = perf[run.id] || {};
+    const pnl = num(book.net_pnl);
+    if (pnl !== null) { netPnl += pnl; havePnl = true; }
+    trades += Number(book.trades) || 0;
+    openUnits += Number((run.state || {}).open_units) || 0;
+  }
+
+  const positionText = openUnits === 0
+    ? 'Flat'
+    : `${openUnits > 0 ? 'Long' : 'Short'} ${Math.abs(openUnits)}`;
+  const pnlClass = netPnl > 0 ? 'pos' : netPnl < 0 ? 'neg' : '';
+
+  return `
+    <div class="book-group-summary">
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Venue</span>
+        <span class="book-group-summary-value">NIFTY futures</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Mode</span>
+        <span class="book-group-summary-value">${escapeHtml(modeLabel)}</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Net position</span>
+        <span class="book-group-summary-value">${escapeHtml(positionText)}</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Combined P&amp;L</span>
+        <span class="book-group-summary-value ${pnlClass}">${havePnl ? signedInr(netPnl) : '—'}</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Trades</span>
+        <span class="book-group-summary-value">${trades}</span>
+      </span>
+    </div>`;
+}
+
 function renderStrategies(payload) {
   const host = $('book-bands');
   if (!host) return;
@@ -2190,6 +2590,7 @@ function renderStrategies(payload) {
           </div>
           <span class="book-group-count">${books.length} book${books.length === 1 ? '' : 's'}</span>
         </div>
+        ${renderGroupSummary(books, perf, accounts)}
         <div class="book-group-tiles">
           ${body}
         </div>
@@ -2322,13 +2723,80 @@ function renderBookBand(run, perf, accounts, columnKey) {
   const openRow = (state.positions || []).find(
     (p) => p.status === 'OPEN' && (p.strategy_id || '') === run.id,
   );
-  const stopLevel = openRow ? num(openRow.trailing_stop) : null;
+  // The API publishes the stop as ``stop_price`` / ``initial_stop_price`` (the
+  // enriched names), not the raw ledger columns ``trailing_stop`` /
+  // ``initial_sl_price``. Reading the raw names returned undefined for every
+  // position, so the tile showed "—" and the Edit button never appeared - the
+  // feature was there but unreachable.
+  const stopLevel = openRow ? num(openRow.stop_price) : null;
+  const initialStop = openRow ? num(openRow.initial_stop_price) : null;
+  // Points between the live mark and the stop: how much room is left before the
+  // position is out. This is the number a trader watches, so it is shown beside
+  // the level rather than left to be worked out from two prices.
+  const stopDistance = openRow ? num(openRow.stop_distance_points) : null;
   const stopText = stopLevel === null
     ? (run.stop_loss ? '—' : 'off')
     : level(stopLevel);
+  const stopDistanceText = stopDistance === null
+    ? ''
+    : `${stopDistance >= 0 ? '' : '+'}${Math.abs(stopDistance).toFixed(1)} pts`;
   const stopTitle = stopLevel === null
     ? (run.stop_loss ? 'No open position to protect' : 'Stops are disabled for this book')
-    : `Initial ${level(openRow.initial_sl_price)} · now ${level(stopLevel)}`;
+    : `Initial ${initialStop === null ? '—' : level(initialStop)} · now ${level(stopLevel)}`
+      + (stopDistance === null ? '' : ` · ${stopDistance.toFixed(1)} pts from the mark`);
+
+  // Whether the exchange is holding a stop, not just whether the engine is
+  // watching one. The two are different facts and only the first survives this
+  // process dying, so a LIVE position with no resting SL-M is called out rather
+  // than shown as protected.
+  const protection = openRow ? String(openRow.protection || '') : '';
+  const protectiveStop = openRow ? num(openRow.protective_stop) : null;
+  const protectionBadge = (() => {
+    if (!openRow) return '';
+    if (protection === 'PAPER') return '';
+    if (protection === 'PROTECTED') {
+      return `<span class="book-protect is-ok" title="${escapeHtml(
+        `Zerodha is holding an SL-M at ${protectiveStop === null ? '—' : level(protectiveStop)}. `
+        + 'It fires even if this bot stops running.')}">SL-M</span>`;
+    }
+    if (protection === 'LAGGING') {
+      return `<span class="book-protect is-warn" title="${escapeHtml(
+        `The exchange is still holding ${protectiveStop === null ? 'an older level' : level(protectiveStop)} `
+        + `while the engine has moved to ${stopLevel === null ? '—' : level(stopLevel)}. `
+        + 'The position is protected, just not as tightly as shown. The next reconcile retries.')}">SL-M lag</span>`;
+    }
+    if (protection === 'STALE') {
+      return `<span class="book-protect is-bad" title="${escapeHtml(
+        `The protective order is ${openRow.protective_status || 'not resting'}. `
+        + 'It is not protecting this position.')}">SL-M ${escapeHtml(String(openRow.protective_status || 'stale'))}</span>`;
+    }
+    return `<span class="book-protect is-bad" title="${escapeHtml(
+      'No exchange-held stop on this LIVE position. Only the software stop protects it, '
+      + 'so a crash or an API outage would leave it unprotected.')}">NO SL-M</span>`;
+  })();
+
+  // The stop editor, built outside the tile template. A nested template literal
+  // here is unreadable and the static analyser that guards against undefined
+  // names cannot parse it, so the markup is assembled first.
+  // The control is always rendered, disabled when there is nothing to protect.
+  // Hiding it on a flat book made the feature undiscoverable: an operator
+  // looking for "where do I move the stop" found no control at all and
+  // concluded it did not exist. A disabled button with a reason answers that
+  // question instead of raising it.
+  const stopEditButton = openRow
+    ? '<button class="book-stop-edit" type="button"'
+      + ` data-book-stopedit="${escapeHtml(run.id)}"`
+      + ` data-book-sl-current="${escapeHtml(stopLevel === null ? '' : stopLevel)}"`
+      + ` data-book-sl-entry="${escapeHtml(openRow.entry_price)}"`
+      + ` data-book-sl-side="${escapeHtml(openRow.side || '')}"`
+      + ` data-book-sl-mode="${escapeHtml(bookMode)}"`
+      + ` data-book-sl-gap="${escapeHtml(stopDistance === null ? '' : stopDistance)}"`
+      + ` data-book-sl-mark="${escapeHtml(openRow.mark_price === undefined ? '' : openRow.mark_price)}"`
+      + ` title="${escapeHtml('Move the stop for ' + (run.name || run.id) + '. It may only tighten, never widen.')}"`
+      + ' aria-label="Modify stop-loss">Edit</button>'
+    : '<button class="book-stop-edit is-disabled" type="button" disabled'
+      + ` title="${escapeHtml('No open position on ' + (run.name || run.id) + ' to protect. The stop becomes editable once a trade is on.')}"`
+      + ' aria-label="Modify stop-loss (no open position)">Edit</button>';
 
   const detail = err || st.last_detail || 'no evaluation yet';
   const counts = signal === 'BEAR' ? `${sellN}/${total} short`
@@ -2383,6 +2851,7 @@ function renderBookBand(run, perf, accounts, columnKey) {
             class="book-square-off"
             type="button"
             data-book-square-off="${escapeHtml(run.id)}"
+            data-book-square-off-mode="${escapeHtml(bookMode)}"
             title="${escapeHtml(`Square off ${run.name || run.id} and pause it. Never touches the other book.`)}"
           >Square off</button>
           <span class="book-manual" role="group" aria-label="Manual orders">
@@ -2426,9 +2895,14 @@ function renderBookBand(run, perf, accounts, columnKey) {
           <span class="book-band-foot-label">Position</span>
           <span class="book-band-foot-value ${open === 0 ? 'is-flat' : ''}">${escapeHtml(positionText)}</span>
         </span>
-        <span class="book-band-foot-item" title="${escapeHtml(stopTitle)}">
+        <span class="book-band-foot-item book-band-stop${openRow ? ' is-editable' : ''}"
+          title="${escapeHtml(stopTitle)}">
           <span class="book-band-foot-label">Stop</span>
           <span class="book-band-foot-value">${escapeHtml(stopText)}</span>
+          ${stopDistanceText ? `<span class="book-band-stop-distance" title="${escapeHtml(
+            'Points between the live mark and the stop - how much room is left before the position is out')}">${escapeHtml(stopDistanceText)}</span>` : ''}
+          ${protectionBadge}
+          ${stopEditButton}
         </span>
         <span class="book-band-foot-item">
           <span class="book-band-foot-label">P&amp;L</span>
@@ -2788,10 +3262,30 @@ function init() {
   $('btn-risk-clear').addEventListener('click', clearRiskBreach);
 
   $('btn-orders-csv').addEventListener('click', exportCsv);
+  $('btn-orders-reconcile').addEventListener('click', reconcileOrders);
   $('book-bands').addEventListener('click', toggleBookPause);
   $('book-bands').addEventListener('click', toggleBookMode);
   $('book-bands').addEventListener('click', squareOffBook);
   $('book-bands').addEventListener('click', manualBookOrder);
+  $('book-bands').addEventListener('click', editBookStop);
+
+  // Stop editor wiring. The preview updates on every keystroke so the operator
+  // sees the resulting level before committing, and Enter applies it.
+  $('sl-mode-price').addEventListener('click', () => setStopMode(false));
+  $('sl-mode-points').addEventListener('click', () => setStopMode(true));
+  $('sl-input').addEventListener('input', updateStopPreview);
+  $('sl-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); applyStopEditor(); }
+    if (event.key === 'Escape') { event.preventDefault(); closeStopEditor(); }
+  });
+  $('sl-apply').addEventListener('click', applyStopEditor);
+  $('sl-cancel').addEventListener('click', closeStopEditor);
+  $('sl-modal').addEventListener('click', (event) => {
+    if (event.target === $('sl-modal')) closeStopEditor();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && slState.open) closeStopEditor();
+  });
   $('btn-alerts-test').addEventListener('click', sendTestAlert);
   $('btn-alert-toggle').addEventListener('click', toggleAlerting);
 
@@ -2843,7 +3337,12 @@ function init() {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(renderOrders, 120);
   });
-  $('orders-mode').addEventListener('change', renderOrders);
+  $('orders-mode').addEventListener('change', () => {
+    renderOrders();
+    // The pending strip is mode-scoped too, so it has to be refetched rather
+    // than re-rendered from the previous mode's rows.
+    loadLedger().catch((error) => toast(`Ledger: ${error.message}`, 'err'));
+  });
   // The book filter narrows both the order book and the signal trail, so both
   // are repainted: leaving the signal trail showing every book's decisions while
   // the order book showed one book's would make the two panels disagree.

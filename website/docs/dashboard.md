@@ -30,7 +30,7 @@ The trading view. Top to bottom:
   | **Indicators & rule checks** | One row per indicator. Each states its level, its own direction, the distance price must travel to flip it, and whether it agrees with the verdict. A gap under a quarter of the bar's own range turns amber. The close the verdict used sits above the rows |
   | **Account** | That book's own equity, net P&L, trade count, win rate and profit factor |
   | **Position** | What that book currently holds, or `Flat` |
-  | **Stop** | The initial and current trailing stop, from the open position's own row |
+  | **Stop** | The initial and current trailing stop, from the open position's own row. When a position is open an **Edit** button moves the level, by price or by points from the live mark (`d40` = 40 points away). It may only tighten, never widen, matching the engine's own trail. The points between the mark and the stop are shown beside the level. A LIVE position also carries an **SL-M** badge for the exchange-held stop behind it — `SL-M` when it rests at the ledger's level, `SL-M lag` when the exchange still holds an older one, `NO SL-M` when there is none and only the software stop protects the position |
 
   Indicators and rule checks share one table because they are the same two
   numbers read two ways. A single `2 of 2 confirmed` count hides *which*
@@ -63,6 +63,20 @@ Both strategies execute on the NIFTY future, so there is one ledger and no venue
 selector. A **book** filter scopes the tab to one strategy, and the signal trail
 follows the same filter, so a book that traded always shows the decisions behind
 those fills.
+
+**Unresolved orders** get their own amber strip above the order book. They block
+new entries — an order whose outcome is unknown could still fill, so stacking a
+second one on top would double the exposure — and burying them in the execution
+log left an operator staring at "Unresolved order" with no way to find the order
+that caused it. The strip follows the mode filter, so viewing LIVE shows the LIVE
+ones.
+
+**Reconcile** resolves them against the Zerodha order book immediately, without a
+restart, and cross-checks the trade book for fills with no local order row. It
+targets the mode being viewed, not the process mode: an operator looking at LIVE
+orders who presses Reconcile means the LIVE ones. An order the broker does not
+know about is left unresolved and reported rather than assumed dead — it may be a
+submission whose acknowledgement was lost.
 
 ### Performance & trades
 

@@ -68,7 +68,9 @@ your machine, anyone who can send a request can panic the account.
 | `RECONCILE_INTERVAL_SECONDS` | `60` | How often the mark loop reconciles unresolved orders against the Zerodha order book. `0` disables the periodic pass. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
-| `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT` |
+| `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT`. Not `SL`/`SL-M`: the protective stop is placed as its own SL-M, and an entry order type of `SL-M` would be sent with no trigger price. |
+| `PROTECTIVE_STOPS` | `true` | Place an exchange-held SL-M behind every LIVE position. See [Protective stops](#protective-stops). |
+| `MARKET_PROTECTION` | `-1` | Zerodha's market-protection band in ticks. `-1` lets Kite choose; empty omits the parameter. |
 | `SLIPPAGE_TICKS` | `1.0` | Adverse-tick fallback for a paper fill with no order-book depth |
 | `TICK_SIZE` | `0.05` | Nifty futures tick |
 | `LOT_MARGIN` | `150000` | **Estimate** used when Kite's margin API is unavailable |

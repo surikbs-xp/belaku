@@ -1617,7 +1617,25 @@ def test_live_position_mismatch_blocks_reconciliation(monkeypatch, tmp_path) -> 
         mode = LIVE
 
         def positions(self, force=False):
-            return []
+            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
 
         def nifty_future_instruments(self):
             return [{"tradingsymbol": "NIFTY26NOV_FUT"}]
@@ -3512,6 +3530,9 @@ def _rollover_manager(monkeypatch, tmp_path, *, lot_size=65, now=None):
             return 1_000_000.0
 
         def data_source(self):
+            return "kite"
+
+        def data_source(self):
             return "test"
 
         def auth_status(self):
@@ -3588,6 +3609,9 @@ def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER):
 
         def available_cash(self):
             return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
 
         def required_margin(self, *args, **kwargs):
             return None
@@ -5731,6 +5755,9 @@ def test_a_paper_entry_books_the_future_price_not_the_signal_close(
             return 1_000_000.0
 
         def data_source(self):
+            return "kite"
+
+        def data_source(self):
             return "test"
 
         def auth_status(self):
@@ -5791,6 +5818,9 @@ def test_a_paper_entry_fails_closed_without_a_future_quote(monkeypatch, tmp_path
 
         def available_cash(self):
             return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
 
         def data_source(self):
             return "CACHE"
@@ -5916,6 +5946,9 @@ def test_paper_entry_fills_at_the_book_touch_when_depth_present(monkeypatch, tmp
             return 1_000_000.0
 
         def data_source(self):
+            return "kite"
+
+        def data_source(self):
             return "test"
 
         def auth_status(self):
@@ -5965,6 +5998,9 @@ def test_paper_entry_keeps_old_behaviour_without_depth(monkeypatch, tmp_path) ->
 
         def available_cash(self):
             return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
 
         def data_source(self):
             return "test"
@@ -9756,6 +9792,21 @@ def test_a_stop_out_is_attempted_even_when_reconciliation_fails(monkeypatch, tmp
         def nifty_future_instruments(self):
             return [{"tradingsymbol": "NIFTY26DECFUT"}]
 
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
+
         def get_ltp(self, symbol, max_age=None):
             return 90.0
 
@@ -9784,10 +9835,27 @@ def test_a_routine_exit_is_still_blocked_by_a_reconciliation_failure(monkeypatch
         mode = LIVE
 
         def positions(self, force=False):
+            # The broker is flat while the ledger holds 65: the mismatch this
+            # test needs in order to prove a routine exit is refused.
             return []
 
         def nifty_future_instruments(self):
             return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
 
     result = OrderManager(FakeClient()).square_off(
         "MANUAL", mode=LIVE, strategy_id="gift-15m"
@@ -10173,86 +10241,873 @@ def test_repeated_bar_close_events_do_not_re_evaluate_the_same_bar() -> None:
         engine_module.get_feed = original_get
 
 
-def test_a_stale_mark_does_not_trigger_a_false_stop_out(monkeypatch, tmp_path) -> None:
-    """A stale price must not be treated as a live mark.
+# ---------------------------------------------------------------------------
+# Manual stop-loss modification
+# ---------------------------------------------------------------------------
+def test_a_stop_can_be_tightened_but_never_widened(monkeypatch, tmp_path) -> None:
+    """The engine's trail only tightens, so an override must obey the same rule.
 
-    ``get_ltp`` falls back to the last cached price when the quote endpoint
-    fails. Evaluating a stop against a price from minutes ago would report "not
-    breached" for a position that may already be through it - an unprotected
-    position the bot believes is protected. The check skips a stale mark instead,
-    and the watchdog raises a stale-quote alert.
+    Accepting a looser level would show the operator a stop that is not actually
+    protecting the position - the engine would re-tighten it on the next mark.
     """
     use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
-    symbol = "NIFTY26DECFUT"
-    db.open_position(
-        symbol, 65, 20_000.0, mode=LIVE, strategy_id="gift-15m",
-        sl_price=19_950.0, initial_sl_price=19_950.0,
-        trailing_stop=19_950.0, best_price=20_000.0,
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
+        sl_price=25_830.0, initial_sl_price=25_750.0,
+        trailing_stop=25_830.0, best_price=25_860.0,
     )
+
+    # Towards the market: accepted.
+    result = db.set_position_stop(position_id, 25_880.0)
+    assert result["stop"] == 25_880.0
+    assert result["previous_stop"] == 25_830.0
+    assert result["initial_stop"] == 25_750.0
+    assert result["side"] == "LONG"
+
+    # Away from the market: refused, and the stored level is unchanged.
+    with pytest.raises(ValueError, match="widen"):
+        db.set_position_stop(position_id, 25_800.0)
+    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_880.0
+
+
+def test_a_short_stop_only_moves_down(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    # A negative quantity opens a short, so the stop sits above the entry.
+    position_id = db.open_position(
+        "NIFTY26DECFUT", -65, 26_000.0, mode=PAPER, strategy_id="nifty-60m",
+        sl_price=26_200.0, initial_sl_price=26_200.0,
+        trailing_stop=26_200.0, best_price=26_000.0,
+    )
+
+    result = db.set_position_stop(position_id, 26_100.0)
+    assert result["stop"] == 26_100.0
+    assert result["side"] == "SHORT"
+
+    with pytest.raises(ValueError, match="widen"):
+        db.set_position_stop(position_id, 26_150.0)
+
+
+def test_a_stop_cannot_be_set_on_a_closed_position(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    position_id = db.open_position("NIFTY26DECFUT", 65, 25_800.0, mode=PAPER)
+    db.close_position(position_id, 25_900.0)
+
+    with pytest.raises(ValueError, match="not open"):
+        db.set_position_stop(position_id, 25_850.0)
+
+
+def test_the_stop_endpoint_requires_confirmation_and_an_open_position(
+    monkeypatch, tmp_path
+) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
+
+    class FakeRun:
+        id = "gift-15m"
+
+        def mode(self):
+            return PAPER
+
+    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
+
+    # No position: refused with a clear reason rather than a silent no-op.
+    with pytest.raises(bot_app.HTTPException) as excinfo:
+        bot_app.api_book_stop(
+            bot_app.BookStopRequest(strategy_id="gift-15m", stop=25_800.0, confirm=True)
+        )
+    assert excinfo.value.status_code == 409
+    assert "no open position" in excinfo.value.detail.lower()
+
+    # With a position but no confirmation: refused.
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
+        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
+    )
+    with pytest.raises(bot_app.HTTPException) as excinfo:
+        bot_app.api_book_stop(
+            bot_app.BookStopRequest(strategy_id="gift-15m", stop=25_880.0)
+        )
+    assert excinfo.value.status_code == 400
+
+
+def test_the_stop_endpoint_moves_the_level_the_engine_reads(monkeypatch, tmp_path) -> None:
+    """The override must be a real change, not a display-only annotation."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
+
+    class FakeRun:
+        id = "gift-15m"
+
+        def mode(self):
+            return PAPER
+
+    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
+        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
+    )
+
+    payload = bot_app.api_book_stop(
+        bot_app.BookStopRequest(strategy_id="gift-15m", stop=25_880.0, confirm=True)
+    )
+
+    assert payload["ok"] is True
+    assert payload["stop"] == 25_880.0
+    assert payload["previous_stop"] == 25_830.0
+    # The ledger row the engine's stop check reads now carries the new level.
+    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_880.0
+
+
+def test_the_tile_reads_the_stop_field_the_api_actually_publishes() -> None:
+    """The tile must read ``stop_price``, not the raw ledger column.
+
+    ``_enrich_positions`` publishes the stop as ``stop_price`` /
+    ``initial_stop_price``. The tile read ``trailing_stop`` / ``initial_sl_price``
+    - the raw column names - so it got ``undefined`` for every position: the
+    stop showed "—" and the Edit button never rendered, leaving the manual
+    stop-loss feature present in the code but unreachable in the UI.
+    """
+    from pathlib import Path
+
+    app_js = (
+        Path(__file__).resolve().parent.parent / "bot" / "web" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "openRow.stop_price" in app_js, (
+        "the tile must read the enriched stop_price field"
+    )
+    assert "openRow.initial_stop_price" in app_js
+    # The raw column names must not be read off an API row anywhere.
+    assert "openRow.trailing_stop" not in app_js
+    assert "openRow.initial_sl_price" not in app_js
+
+
+def test_the_stop_editor_is_always_rendered_but_disabled_when_flat() -> None:
+    """The control must be discoverable even with nothing to protect.
+
+    It used to be omitted entirely on a flat book, which made the feature
+    undiscoverable: an operator looking for "where do I move the stop" found no
+    control and concluded it did not exist. It is now always rendered, disabled
+    with a reason, and becomes active once a position is open.
+    """
+    from pathlib import Path
+
+    app_js = (
+        Path(__file__).resolve().parent.parent / "bot" / "web" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "const stopEditButton = openRow" in app_js
+    # The flat branch renders a disabled button rather than an empty string.
+    assert "is-disabled" in app_js
+    assert "disabled" in app_js
+    assert "data-book-stopedit" in app_js
+    assert "editBookStop" in app_js
+
+
+def test_a_stop_can_be_set_by_distance_from_the_mark(monkeypatch, tmp_path) -> None:
+    """A distance is resolved against the live mark, not the entry.
+
+    "40 points away" means 40 from where the market is now, which is the number
+    the operator is looking at. The mark comes from the same price map the stop
+    check uses, so the level this produces is the level the engine will test.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
+
+    class FakeRun:
+        id = "gift-15m"
+
+        def mode(self):
+            return PAPER
+
+    class FakeClient:
+        def get_ltp(self, symbol, max_age=None):
+            return 25_937.0
+
+    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
+    monkeypatch.setattr(
+        bot_app, "get_order_manager", lambda: OrderManager(FakeClient())
+    )
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
+        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
+    )
+
+    payload = bot_app.api_book_stop(
+        bot_app.BookStopRequest(strategy_id="gift-15m", distance=40, confirm=True)
+    )
+
+    # A long's stop sits below the mark: 25,937 - 40 = 25,897.
+    assert payload["stop"] == 25_897.0
+    assert payload["mark"] == 25_937.0
+    assert payload["distance"] == 40
+    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_897.0
+
+
+def test_a_distance_that_would_widen_the_stop_is_refused(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
+
+    class FakeRun:
+        id = "gift-15m"
+
+        def mode(self):
+            return PAPER
+
+    class FakeClient:
+        def get_ltp(self, symbol, max_age=None):
+            return 25_937.0
+
+    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
+    monkeypatch.setattr(
+        bot_app, "get_order_manager", lambda: OrderManager(FakeClient())
+    )
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
+        sl_price=25_900.0, initial_sl_price=25_750.0, trailing_stop=25_900.0,
+    )
+
+    # 200 points from the mark is 25,737 - far below the 25,900 in force.
+    with pytest.raises(bot_app.HTTPException) as excinfo:
+        bot_app.api_book_stop(
+            bot_app.BookStopRequest(strategy_id="gift-15m", distance=200, confirm=True)
+        )
+    assert excinfo.value.status_code == 409
+    assert "widen" in excinfo.value.detail
+    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_900.0
+
+
+def test_a_stop_request_must_supply_exactly_one_of_price_or_distance(
+    monkeypatch, tmp_path
+) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
+
+    class FakeRun:
+        id = "gift-15m"
+
+        def mode(self):
+            return PAPER
+
+    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
+        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
+    )
+
+    with pytest.raises(bot_app.HTTPException) as excinfo:
+        bot_app.api_book_stop(
+            bot_app.BookStopRequest(strategy_id="gift-15m", confirm=True)
+        )
+    assert excinfo.value.status_code == 400
+    assert "either" in excinfo.value.detail.lower()
+
+    with pytest.raises(bot_app.HTTPException) as excinfo:
+        bot_app.api_book_stop(
+            bot_app.BookStopRequest(
+                strategy_id="gift-15m", stop=25_900.0, distance=40, confirm=True
+            )
+        )
+    assert excinfo.value.status_code == 400
+    assert "not both" in excinfo.value.detail.lower()
+
+
+def test_the_tile_shows_the_distance_from_the_mark() -> None:
+    """The distance is the number a trader watches, so it is shown, not implied."""
+    from pathlib import Path
+
+    app_js = (
+        Path(__file__).resolve().parent.parent / "bot" / "web" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "openRow.stop_distance_points" in app_js
+    assert "book-band-stop-distance" in app_js
+    # The editor offers a points mode as well as a price mode, and resolves the
+    # distance against the live mark rather than the entry.
+    assert "setStopMode" in app_js
+    assert "sl-mode-points" in app_js
+    assert "slState.mark" in app_js
+
+
+def test_no_native_browser_dialogs_remain() -> None:
+    """Confirmations are in-page dialogs, not ``window.confirm``.
+
+    A native box cannot show which book, which action and which mode is about to
+    be acted on, and it blocks the event loop that is streaming prices into the
+    page. The stop editor had the same problem with ``window.prompt``: it forced
+    the operator to type a level blind, with no sight of the entry, the live
+    price or the resulting stop.
+    """
+    import re
+    from pathlib import Path
+
+    web = Path(__file__).resolve().parent.parent / "bot" / "web"
+    src = (web / "app.js").read_text(encoding="utf-8")
+
+    # Strip comments and string literals so the prose that explains *why* the
+    # native dialogs are gone does not read as a call to one.
+    code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    code = re.sub(r"//[^\n]*", "", code)
+    code = re.sub(r"`(?:\\.|[^`\\])*`", "``", code)
+    code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
+    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
+
+    for banned in ("window.confirm", "window.prompt", "window.alert"):
+        assert banned not in code, f"{banned} is still called from app.js"
+
+    # The shared dialog carries the fact block that makes a real-money
+    # confirmation unambiguous.
+    assert "function confirmDialog" in src
+    assert "modal-fact-strategy" in src
+    assert "modal-fact-action" in src
+    assert "modal-fact-mode" in src
+
+    html = (web / "index.html").read_text(encoding="utf-8")
+    for element in ("modal-facts", "modal-warn", "modal-fact-strategy"):
+        assert f'id="{element}"' in html, f"#{element} is missing from index.html"
+
+
+# ---------------------------------------------------------------------------
+# Exchange-held protective stops
+#
+# The engine's stop is a software check on a mark loop. If the process dies, the
+# container is killed or the API is unreachable, nothing evaluates it and the
+# position sits at the exchange with no stop at all. These tests cover the SL-M
+# that closes that gap.
+# ---------------------------------------------------------------------------
+
+def _live_manager(monkeypatch, tmp_path, client):
+    """An OrderManager in LIVE with a stub client, on a fresh ledger."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    monkeypatch.setattr(
+        order_manager, "settings",
+        SimpleNamespace(
+            protective_stops=True, product="NRML", order_type="MARKET",
+            tick_size=0.05, slippage_ticks=1.0, lot_size=65, max_open_lots=4,
+            default_lots=1, lot_margin=150_000.0, virtual_balance=1_000_000.0,
+            db_path=str(tmp_path / "test.db"),
+        ),
+    )
+    return OrderManager(client)
+
+
+def test_protective_stop_is_placed_after_a_live_entry(monkeypatch, tmp_path) -> None:
+    """A LIVE entry must leave an SL-M resting at the exchange, not just a row."""
+    placed: list[dict] = []
 
     class FakeClient:
         mode = LIVE
-        age = 999.0
-
-        def get_ltp(self, symbol, max_age=None):
-            return 19_000.0
-
-        def price_age(self, symbol):
-            return self.age
-
-        def instrument_for_symbol(self, s):
-            return {"tradingsymbol": symbol, "instrument_type": "FUT", "lot_size": 65}
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": symbol}]
-
-        def front_month_symbol(self, now=None):
-            return symbol
-
-        def session_status(self, max_age=30):
-            return {"valid": True}
 
         def positions(self, force=False):
-            return [{"tradingsymbol": symbol, "quantity": 65}]
+            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
 
-        def net_position(self, s, force=False):
-            return 65
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_800.0
+
+        def place_order(self, **kwargs):
+            return {
+                "order_id": "entry-1", "status": "COMPLETE",
+                "average_price": 25_800.0, "filled_quantity": 65,
+            }
+
+        def place_protective_stop(self, **kwargs):
+            placed.append(kwargs)
+            return {"order_id": "slm-1", "status": "TRIGGER_PENDING", "mode": LIVE}
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    payload = {
+        "stop_rules": {
+            "enabled": True, "initial_points": 50.0, "trail_points": 5.0,
+            "trail_after": 50.0, "trail_points_after": 30.0,
+        },
+    }
+    result = manager._execute_directional(
+        payload, "BUY", "NIFTY26DECFUT", LIVE, "SIGNAL", strategy_id=db.DEFAULT_STRATEGY_ID
+    )
+
+    assert result.ok, result.reason
+    assert len(placed) == 1
+    # A long is protected by a SELL stop, 50 points below the fill.
+    assert placed[0]["position_key"] == 1
+    assert placed[0]["trigger_price"] == 25_750.0
+    assert placed[0]["quantity"] == 65
+    position = db.get_open_positions(mode=LIVE)[0]
+    assert position["protective_order_id"] == "slm-1"
+    assert position["protective_stop"] == 25_750.0
+    assert position["protective_status"] == "TRIGGER_PENDING"
+
+
+def test_a_short_is_protected_by_a_buy_stop(monkeypatch, tmp_path) -> None:
+    """The side is derived from the position, never passed in.
+
+    A caller that got it backwards would place a stop that doubles the position
+    instead of closing it - the worst possible failure for this order.
+    """
+    placed: list[dict] = []
+
+    class FakeClient:
+        mode = LIVE
+
+        def positions(self, force=False):
+            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_800.0
+
+        def place_order(self, **kwargs):
+            return {
+                "order_id": "entry-1", "status": "COMPLETE",
+                "average_price": 25_800.0, "filled_quantity": 65,
+            }
+
+        def place_protective_stop(self, **kwargs):
+            placed.append(kwargs)
+            return {"order_id": "slm-1", "status": "TRIGGER_PENDING", "mode": LIVE}
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    payload = {"stop_rules": {"enabled": True, "initial_points": 200.0}}
+    result = manager._execute_directional(
+        payload, "SELL", "NIFTY26DECFUT", LIVE, "SIGNAL", strategy_id=db.DEFAULT_STRATEGY_ID
+    )
+
+    assert result.ok, result.reason
+    assert placed[0]["position_key"] == -1
+    # A short's stop sits above the fill.
+    assert placed[0]["trigger_price"] == 26_000.0
+
+
+def test_a_failed_protective_stop_is_reported_not_swallowed(monkeypatch, tmp_path) -> None:
+    """The trade still opens, but the operator is told it is only software-protected."""
+    class FakeClient:
+        mode = LIVE
+
+        def positions(self, force=False):
+            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_800.0
+
+        def place_order(self, **kwargs):
+            return {
+                "order_id": "entry-1", "status": "COMPLETE",
+                "average_price": 25_800.0, "filled_quantity": 65,
+            }
+
+        def place_protective_stop(self, **kwargs):
+            return {"order_id": None, "status": "REJECTED", "message": "trigger on wrong side"}
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    payload = {"stop_rules": {"enabled": True, "initial_points": 50.0}}
+    result = manager._execute_directional(
+        payload, "BUY", "NIFTY26DECFUT", LIVE, "SIGNAL", strategy_id=db.DEFAULT_STRATEGY_ID
+    )
+
+    assert result.ok
+    assert "no exchange-held stop" in result.reason.lower()
+    assert result.details["protective_ok"] is False
+    position = db.get_open_positions(mode=LIVE)[0]
+    assert position["protective_order_id"] is None
+
+
+def test_exit_cancels_the_protective_stop_first(monkeypatch, tmp_path) -> None:
+    """An SL-M left resting while the bot exits would reverse the position.
+
+    The stop fires against a flat book and opens a new position in the opposite
+    direction, so cancelling is part of the exit rather than an optimisation.
+    """
+    calls: list[str] = []
+
+    class FakeClient:
+        mode = LIVE
+
+        def positions(self, force=False):
+            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_900.0
+
+        def cancel_protective_stop(self, order_id, mode=None):
+            calls.append(f"cancel:{order_id}")
+            return {"order_id": order_id, "status": "CANCELLED", "mode": LIVE}
+
+        def place_order(self, **kwargs):
+            calls.append("exit")
+            return {
+                "order_id": "exit-1", "status": "COMPLETE",
+                "average_price": 25_900.0, "filled_quantity": 65,
+            }
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        initial_sl_price=25_750.0, strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+
+    result = manager.square_off("MANUAL", mode=LIVE, strategy_id=db.DEFAULT_STRATEGY_ID)
+
+    assert result.ok, result.reason
+    # The cancel must come before the exit, or the stop can fire into it.
+    assert calls == ["cancel:slm-1", "exit"]
+    assert db.get_open_positions(mode=LIVE) == []
+
+
+def test_an_exit_is_refused_when_the_stop_cannot_be_cancelled(monkeypatch, tmp_path) -> None:
+    """A live stop that cannot be removed must not be exited into.
+
+    Leaving the position open and protected is the safe failure; closing it while
+    an SL-M still rests would let the stop reverse the book.
+    """
+    class FakeClient:
+        mode = LIVE
+
+        def positions(self, force=False):
+            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def instrument_for_symbol(self, symbol):
+            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
+
+        def front_month_symbol(self, now=None):
+            return "NIFTY26DECFUT"
+
+        def required_margin(self, *args, **kwargs):
+            return 150_000.0
+
+        def available_cash(self):
+            return 1_000_000.0
+
+        def data_source(self):
+            return "kite"
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_900.0
+
+        def cancel_protective_stop(self, order_id, mode=None):
+            return {"order_id": order_id, "status": "OPEN", "message": "cancel rejected"}
+
+        def place_order(self, **kwargs):
+            raise AssertionError("must not exit while the protective stop is still live")
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+
+    result = manager.square_off("MANUAL", mode=LIVE, strategy_id=db.DEFAULT_STRATEGY_ID)
+
+    assert not result.ok
+    assert "could not cancel the protective stop" in result.reason.lower()
+    assert len(db.get_open_positions(mode=LIVE)) == 1
+
+
+def test_the_trail_moves_the_exchange_stop(monkeypatch, tmp_path) -> None:
+    """Zerodha has no native trailing stop, so a trail is a modify per step."""
+    moved: list[float] = []
+
+    class FakeClient:
+        mode = LIVE
+
+        def modify_protective_stop(self, order_id, trigger_price, quantity=None, mode=None):
+            moved.append(trigger_price)
+            return {"order_id": order_id, "status": "TRIGGER_PENDING", "trigger_price": trigger_price}
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+    position = db.get_open_positions(mode=LIVE)[0]
+
+    result = manager.move_protective_stop(position, 25_820.0)
+
+    assert result["ok"]
+    assert moved == [25_820.0]
+    assert db.get_open_positions(mode=LIVE)[0]["protective_stop"] == 25_820.0
+
+
+def test_a_failed_trail_modify_keeps_the_old_level_recorded(monkeypatch, tmp_path) -> None:
+    """The exchange still holds the older trigger, and that gap must stay visible.
+
+    Reporting the tighter level would show a stop the exchange is not holding.
+    """
+    class FakeClient:
+        mode = LIVE
+
+        def modify_protective_stop(self, order_id, trigger_price, quantity=None, mode=None):
+            return {"order_id": order_id, "status": "REJECTED", "message": "rate limited"}
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+    position = db.get_open_positions(mode=LIVE)[0]
+
+    result = manager.move_protective_stop(position, 25_820.0)
+
+    assert not result["ok"]
+    stored = db.get_open_positions(mode=LIVE)[0]
+    # The order id survives - it is the only handle on an order that can still
+    # fire - and the level stays at what the exchange actually holds.
+    assert stored["protective_order_id"] == "slm-1"
+    assert stored["protective_stop"] == 25_750.0
+
+
+def test_restart_replaces_a_missing_protective_stop(monkeypatch, tmp_path) -> None:
+    """A position that survived a crash must get its stop back."""
+    placed: list[float] = []
+
+    class FakeClient:
+        mode = LIVE
 
         def order_book(self, force=False):
             return []
 
-        def available_cash(self):
-            return 5_000_000.0
+        def place_protective_stop(self, **kwargs):
+            placed.append(kwargs["trigger_price"])
+            return {"order_id": "slm-new", "status": "TRIGGER_PENDING", "mode": LIVE}
 
-        def required_margin(self, *a, **k):
-            return 150_000.0
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
 
-        def data_source(self):
-            return "fake"
+    summary = manager.reconcile_protective_stops(LIVE)
 
-        def auth_status(self):
-            return {"authenticated": True}
+    assert summary["placed"] == 1
+    assert placed == [25_750.0]
+    assert db.get_open_positions(mode=LIVE)[0]["protective_order_id"] == "slm-new"
 
-        def place_order(self, symbol, transaction_type, quantity, price=None, **kw):
-            return {"order_id": "O1", "status": "COMPLETE",
-                    "filled_quantity": quantity, "average_price": 19_950.0,
-                    "depth": None, "message": "ok"}
 
-    client = FakeClient()
-    manager = OrderManager(client)
-    order_manager._manager = manager
-    engine._engine = None
-    eng = engine.get_engine()
-    book = next(r for r in eng.runs if r.id == "gift-15m")
-    book.stop_rules = __import__("stops").StopRules(50, 5, 50, 30)
+def test_restart_does_not_duplicate_a_healthy_stop(monkeypatch, tmp_path) -> None:
+    """A resting stop at the right level is left alone, not re-placed."""
+    class FakeClient:
+        mode = LIVE
 
-    # Stale: the deep breach must NOT close the position.
-    reports = eng.check_stops({symbol: 19_000.0})
-    assert reports == []
-    assert len(db.get_open_positions(mode=LIVE)) == 1
+        def order_book(self, force=False):
+            return [{
+                "order_id": "slm-1", "status": "TRIGGER_PENDING",
+                "trigger_price": 25_750.0,
+            }]
 
-    # Fresh: the same breach closes it.
-    client.age = 0.0
-    reports = eng.check_stops({symbol: 19_950.0})
-    assert len(db.get_open_positions(mode=LIVE)) == 0
+        def place_protective_stop(self, **kwargs):
+            raise AssertionError("a healthy stop must not be re-placed")
+
+        def modify_protective_stop(self, *args, **kwargs):
+            raise AssertionError("a healthy stop must not be modified")
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+
+    summary = manager.reconcile_protective_stops(LIVE)
+
+    assert summary["already_ok"] == 1
+    assert summary["placed"] == 0
+    assert summary["moved"] == 0
+
+
+def test_restart_tightens_a_lagging_stop(monkeypatch, tmp_path) -> None:
+    """A trail that moved in the ledger but not at the broker is caught here."""
+    moved: list[float] = []
+
+    class FakeClient:
+        mode = LIVE
+
+        def order_book(self, force=False):
+            return [{
+                "order_id": "slm-1", "status": "TRIGGER_PENDING",
+                "trigger_price": 25_750.0,
+            }]
+
+        def modify_protective_stop(self, order_id, trigger_price, quantity=None, mode=None):
+            moved.append(trigger_price)
+            return {"order_id": order_id, "status": "TRIGGER_PENDING"}
+
+    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_820.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+
+    summary = manager.reconcile_protective_stops(LIVE)
+
+    assert summary["moved"] == 1
+    assert moved == [25_820.0]
+
+
+def test_paper_positions_get_no_broker_stop(monkeypatch, tmp_path) -> None:
+    """There is no exchange to hold one, and a paper stop must not hit the API."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+
+    class FakeClient:
+        mode = PAPER
+
+        def place_protective_stop(self, **kwargs):
+            raise AssertionError("paper mode must not place a broker-side stop")
+
+    manager = OrderManager(FakeClient())
+    db.open_position("TEST", 65, 100.0, mode=PAPER, trailing_stop=95.0)
+
+    summary = manager.reconcile_protective_stops(PAPER)
+
+    assert summary["checked"] == 0
+    assert summary["placed"] == 0
+
+
+def test_readiness_blocks_on_an_unprotected_live_position(monkeypatch, tmp_path) -> None:
+    """Arming LIVE with an unprotected position is the state the gate must refuse."""
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+
+    unprotected = db.positions_needing_protection(LIVE)
+
+    assert len(unprotected) == 1
+    assert unprotected[0]["symbol"] == "NIFTY26DECFUT"
+
+
+def test_a_resting_stop_is_not_reported_as_needing_protection(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
+
+    assert db.positions_needing_protection(LIVE) == []
+
+
+def test_a_rejected_stop_is_reported_as_needing_protection(monkeypatch, tmp_path) -> None:
+    """A recorded order id is not proof of protection; its status decides."""
+    use_test_database(monkeypatch, tmp_path)
+    position_id = db.open_position(
+        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
+        strategy_id=db.DEFAULT_STRATEGY_ID,
+    )
+    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "REJECTED")
+
+    assert len(db.positions_needing_protection(LIVE)) == 1
+
+
+def test_order_type_rejects_a_stop_order(monkeypatch) -> None:
+    """ORDER_TYPE is used for entries and exits, and only LIMIT forwards a price.
+
+    An SL or SL-M here would send an order with no trigger price, which the
+    exchange rejects - and the protective stop is placed separately as its own
+    SL-M, so there is no reason to configure one.
+    """
+    import config
+
+    monkeypatch.setattr(
+        config, "settings",
+        SimpleNamespace(
+            order_type="SL-M", protective_stops=True, is_live_configured=True,
+            execution_mode="PAPER", access_token="t",
+        ),
+    )
+    warnings = config.validate()
+
+    assert any("ORDER_TYPE" in w for w in warnings)
+
+
+def test_order_type_accepts_market_and_limit(monkeypatch) -> None:
+    import config
+
+    for value in ("MARKET", "LIMIT"):
+        monkeypatch.setattr(
+            config, "settings",
+            SimpleNamespace(
+                order_type=value, protective_stops=True, is_live_configured=True,
+                execution_mode="PAPER", access_token="t",
+            ),
+        )
+        assert not any("ORDER_TYPE" in w for w in config.validate())

@@ -390,6 +390,80 @@ any benefit from existing positions. When the API cannot answer, the check falls
 back to the static `LOT_MARGIN` estimate and **reports it as an estimate** rather
 than silently treating a guess as fact.
 
+## Protective stops
+
+The engine's stop is a **software check on a mark loop**. It is evaluated against
+the live futures price every few seconds, which is what makes a trailing stop
+possible at all — but it only runs while this process is alive. If the bot
+crashes, the container is killed, or the Zerodha API is unreachable, nothing
+evaluates it and the position sits at the exchange with **no stop at all**.
+
+So every LIVE position is also backed by an **exchange-held SL-M**: a stop order
+that lives at Zerodha and fires whether or not this process is running.
+
+| | Software stop | Exchange-held SL-M |
+|---|---|---|
+| Where it lives | This process | Zerodha |
+| Survives a crash | No | Yes |
+| Trails | Yes | Only when re-issued |
+| Evaluated against | The mark loop's price | The exchange's own feed |
+
+Both are kept. The software stop is what trails; the SL-M is what survives.
+
+### The lifecycle
+
+1. **On entry** — the SL-M is placed immediately after the fill, at the same
+   level the engine would have acted on. A long is protected by a SELL stop, a
+   short by a BUY stop; the side is derived from the position, never passed in,
+   because a caller that got it backwards would place a stop that *doubles* the
+   position instead of closing it.
+2. **As the trail moves** — Zerodha has no native trailing stop, so a trail is a
+   `modify_order` per step. Only a *tightened* level is pushed; re-issuing an
+   unchanged trigger would be a broker round-trip per mark for no gain.
+3. **Before every exit** — the SL-M is cancelled first. An SL-M left resting
+   while the bot closes the position becomes an order that opens a **new**
+   position in the opposite direction once the exit fills: the stop fires against
+   a flat book and sells into a short. An exit that cannot cancel its stop is
+   refused, leaving the position open and protected.
+4. **On restart and on the reconcile cadence** — every open LIVE position is
+   checked against the broker's book. A missing stop is re-placed, a lagging one
+   is tightened, and one that already fired is reported so the ledger can be
+   settled from the broker rather than left believing it is still open.
+
+### When a step fails
+
+A failed placement does **not** block the trade. The software stop is still
+watching, and refusing to hold a position because its backstop could not be
+placed would be worse than holding it with one layer of protection. It is logged
+at error level, surfaced on the dashboard as `NO SL-M`, and retried on the next
+reconcile.
+
+A failed *modify* is different: the exchange keeps the older trigger, so the
+position is still protected — just not as tightly as the dashboard's stop says.
+The ledger keeps the tighter level, `protective_stop` records what the exchange
+actually holds, and the tile shows `SL-M lag` until the next reconcile closes the
+gap. Collapsing the two into one column would hide exactly the discrepancy an
+operator most needs to see.
+
+### What the dashboard shows
+
+| Badge | Meaning |
+|---|---|
+| `SL-M` | A stop is resting at the exchange at the ledger's level |
+| `SL-M lag` | Resting, but at an older level — protected, not as tightly |
+| `SL-M <status>` | The order is not resting (rejected, cancelled, expired) |
+| `NO SL-M` | No exchange-held stop: only the software stop protects this position |
+
+PAPER positions show no badge: there is no exchange to hold one.
+
+### Readiness
+
+`GET /api/live/readiness` includes a `protective_stops` check that **blocks**
+arming LIVE while any open LIVE position has no resting SL-M. With
+`PROTECTIVE_STOPS=false` the check is reported as non-blocking rather than
+omitted, so an operator who turned the feature off sees that LIVE positions are
+software-protected only.
+
 ## Panic
 
 `POST /api/panic` with `{"confirm": true}` squares off and pauses. It reports
