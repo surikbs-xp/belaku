@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv, dotenv_values
 
@@ -72,6 +72,23 @@ def _env_float(name: str, default: float) -> float:
 def _env_bool(name: str, default: bool) -> bool:
     raw = _env(name, "true" if default else "false").lower()
     return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int_optional(name: str, default: Optional[int] = None) -> Optional[int]:
+    """An int setting where empty means "unset" rather than zero.
+
+    ``_env_int`` cannot express this: it falls back to the default on a bad
+    value, so an operator who deliberately blanks the variable would silently
+    get the default back. Here an empty string is a real answer - "leave the
+    parameter off" - which is what ``MARKET_PROTECTION`` needs.
+    """
+    raw = _env(name, "" if default is None else str(default))
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def _env_path(name: str, default: str) -> str:
@@ -145,14 +162,29 @@ class Settings:
     tick_size: float = _env_float("TICK_SIZE", 0.05)
     product: str = _env("PRODUCT", "NRML")
     order_type: str = _env("ORDER_TYPE", "MARKET")
+    # Zerodha's market-protection band, in ticks. A MARKET order without one can
+    # fill far from the touch in a thin book, and the exchange rejects an order
+    # whose protection band is too wide. -1 lets Kite choose; empty leaves the
+    # parameter off entirely so the broker's own default applies.
+    market_protection: Optional[int] = _env_int_optional("MARKET_PROTECTION", -1)
+    # Whether to place an exchange-held SL-M behind every LIVE position. This is
+    # the difference between a stop that survives the bot dying and one that does
+    # not: the engine's stop is a software check on a mark loop, so a crash, a
+    # kill or an API outage leaves the position with no stop at all. On by
+    # default; turning it off is only reasonable for a broker account that cannot
+    # accept SL-M orders.
+    protective_stops: bool = _env_bool("PROTECTIVE_STOPS", True)
 
     # --- Risk / pricing ---------------------------------------------------
     lot_margin: float = _env_float("LOT_MARGIN", 150_000.0)
     # Stop opening new trades once the day's realised loss reaches this many
-    # rupees. 0 disables the check. This is the only risk limit the bot has:
-    # the strategy's own signal is the exit, so there is no per-trade stop to
-    # cap a single loss. Open positions are left alone - flattening them here
-    # would turn a bad day into a realised one at the worst possible moment.
+    # rupees. 0 disables the check. This is a portfolio-level circuit breaker,
+    # not a per-trade stop: the strategy's own signal plus each book's
+    # protective stop are the exits, and this only refuses *new* entries. Open
+    # positions are left alone - flattening them here would turn a bad day into
+    # a realised one at the worst possible moment, and they already carry their
+    # own stop.
+    max_daily_loss: float = _env_float("MAX_DAILY_LOSS", 0.0)
 
     # --- Alerting ---------------------------------------------------------
     # Where alerts go. Empty disables sending; alerts are still logged and shown
@@ -179,35 +211,15 @@ class Settings:
     # distinguishable from a quiet market.
     alert_on_lifecycle: bool = _env_bool("ALERT_ON_LIFECYCLE", True)
 
-    # --- GIFT Nifty index book --------------------------------------------
-    # GIFT Nifty is a non-tradeable index on Kite, so it cannot be bought in LIVE
-    # mode at all. This runs the same signals through a separate paper book on the
-    # index level, which is the only way to see whether trading the index would
-    # have beaten trading the future. Off by default.
-    gift_book: bool = _env_bool("GIFT_BOOK", False)
-    # Own SQLite file, so the index ledger can never touch the futures ledger.
-    gift_book_db_path: str = _env_path("GIFT_BOOK_DB_PATH", str(BASE_DIR / "gift_book.db"))
-    # Units per position. Defaults to one NIFTY_LOT_SIZE, so the two books carry
-    # the same notional exposure and their P&L is directly comparable.
-    gift_book_units: int = _env_int("GIFT_BOOK_UNITS", 0)
-    gift_book_balance: float = _env_float("GIFT_BOOK_BALANCE", 200_000.0)
-
-    # --- Shadow paper book ------------------------------------------------
-    # While EXECUTION_MODE=LIVE, mirror every live position into a paper book
-    # kept in its own database, so the fill the model would have given can be
-    # compared against the fill the broker actually gave. Off by default: it
-    # doubles the order bookkeeping and is only useful while trading live.
-    paper_mirror: bool = _env_bool("PAPER_MIRROR", False)
-    # Separate SQLite file, so the shadow book can never touch the live ledger
-    # and can be deleted without losing trade history.
-    paper_mirror_db_path: str = _env_path(
-        "PAPER_MIRROR_DB_PATH", str(BASE_DIR / "paper_mirror.db")
-    )
-    # Paper balance the shadow book starts with, when the file is created.
-    paper_mirror_balance: float = _env_float("PAPER_MIRROR_BALANCE", 200_000.0)
-
     # How often the watchdog checks trading health, in seconds.
     watchdog_interval_seconds: float = _env_float("WATCHDOG_INTERVAL_SECONDS", 30.0)
+    # How often the mark loop reconciles unresolved orders against the Zerodha
+    # order book. A late fill must be discovered while the bot is idle, not only
+    # when it next tries to trade - otherwise a position can exist at the broker
+    # that the ledger does not know about, and its protective stop is never
+    # applied. 0 disables the periodic pass (startup and pre-order reconciliation
+    # still run).
+    reconcile_interval_seconds: float = _env_float("RECONCILE_INTERVAL_SECONDS", 60.0)
     instrument_refresh_seconds: int = _env_int("INSTRUMENT_REFRESH_SECONDS", 3600)
     quote_poll_seconds: int = _env_int("QUOTE_POLL_SECONDS", 5)
     http_timeout_seconds: float = _env_float("HTTP_TIMEOUT_SECONDS", 4.0)
@@ -330,6 +342,21 @@ def validate() -> list[str]:
         )
     if mode == LIVE and not settings.is_live_configured:
         warnings.append("EXECUTION_MODE=LIVE but Kite credentials are incomplete.")
+    # ORDER_TYPE is used for entries *and* exits, and the client only forwards a
+    # price for LIMIT. An SL or SL-M here would send an order with no trigger
+    # price - which the exchange rejects - and the protective stop is placed
+    # separately as its own SL-M, so there is no reason to configure one here.
+    order_type = str(settings.order_type or "").upper()
+    if order_type not in {"MARKET", "LIMIT"}:
+        warnings.append(
+            f"ORDER_TYPE={settings.order_type!r} is not supported for entries and exits; "
+            "use MARKET or LIMIT. Protective stops are placed as their own SL-M."
+        )
+    if not getattr(settings, "protective_stops", True) and mode == LIVE:
+        warnings.append(
+            "PROTECTIVE_STOPS is off: LIVE positions will have no exchange-held stop "
+            "and are protected only while this process is running."
+        )
     return warnings
 
 
@@ -369,30 +396,28 @@ class StrategyConfig:
     # in paper, which is the safe direction: an unset flag must never be what
     # puts real money on a signal the operator has not thought about.
     live: bool = False
-    # Which execution legs this strategy places orders on. A signal is generated
-    # from one series; executing it is a separate decision, and the two are not
-    # always the same instrument. ``gift`` is the *paper* index book - GIFT Nifty
-    # is quote-only on Kite, so a leg there can never reach a broker.
-    #
-    # Parsed from ``STRATEGY_<n>_LEGS=gift,futures``. An empty tuple means "not
-    # configured", and ``resolved_legs`` then answers with what that source did
-    # before this setting existed, so an .env written earlier trades exactly as
-    # before.
-    legs: tuple[str, ...] = ()
+    # Protective stop, in index points, measured on the *futures* execution
+    # price. ``stop_loss`` is the initial distance from the fill; the trail
+    # activates at ``trail_after`` points of open profit and then follows the
+    # best price at ``trail_points`` (or ``trail_points_after`` once the wider
+    # band is reached). Zero disables the corresponding piece, so a book with
+    # ``stop_loss=0`` keeps the signal-only exit it had before.
+    stop_loss: float = 0.0
+    trail_points: float = 0.0
+    trail_after: float = 0.0
+    trail_points_after: float = 0.0
 
     @property
-    def resolved_legs(self) -> tuple[str, ...]:
-        """The legs to trade, with the historical default applied.
+    def stop_rules(self) -> Any:
+        """This book's stop configuration, as the ``stops`` module reads it."""
+        import stops
 
-        Source-dependent, because the two sources did not behave alike: a
-        GIFT-sourced strategy has always settled the paper index book *and*
-        placed the futures order, while a NIFTY-sourced one never had an index
-        leg to settle. One shared default would silently switch off an existing
-        deployment's GIFT book on upgrade.
-        """
-        if self.legs:
-            return tuple(self.legs)
-        return ("gift", "futures") if self.source.strip().lower().startswith("gift") else ("futures",)
+        return stops.StopRules(
+            initial_points=self.stop_loss,
+            trail_points=self.trail_points,
+            trail_after=self.trail_after,
+            trail_points_after=self.trail_points_after,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -407,7 +432,10 @@ class StrategyConfig:
             "filter_adx": self.filter_adx,
             "filter_ma": self.filter_ma,
             "live": self.live,
-            "legs": list(self.resolved_legs),
+            "stop_loss": self.stop_loss,
+            "trail_points": self.trail_points,
+            "trail_after": self.trail_after,
+            "trail_points_after": self.trail_points_after,
         }
 
     def strategy_params(self) -> dict[str, Any]:
@@ -472,45 +500,13 @@ def strategy_configs() -> list[StrategyConfig]:
                 filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
                 filter_ma=_env_int(prefix + "FILTER_MA", 0),
                 live=_env_bool(prefix + "LIVE", False),
-                legs=_parse_legs(_env(prefix + "LEGS", "")),
+                stop_loss=_env_float(prefix + "STOP_LOSS", 0.0),
+                trail_points=_env_float(prefix + "TRAIL_POINTS", 0.0),
+                trail_after=_env_float(prefix + "TRAIL_AFTER", 0.0),
+                trail_points_after=_env_float(prefix + "TRAIL_POINTS_AFTER", 0.0),
             )
         )
     return out
-
-
-# The instruments a strategy may execute on. `futures` is the NFO Nifty future,
-# the only leg that can reach a broker for real money; `gift` is the paper index
-# book, which exists to compare the venue against the future.
-VALID_LEGS = ("futures", "gift")
-
-
-def _parse_legs(raw: str) -> tuple[str, ...]:
-    """Parse ``STRATEGY_<n>_LEGS`` into execution legs.
-
-    An unknown name raises rather than silently dropping the leg: a typo in the
-    leg list would otherwise trade one instrument fewer than the operator asked
-    for, which looks like a strategy that simply never fires.
-
-    Unset returns an empty tuple rather than a guess: the historical default
-    depends on the signal source, and ``StrategyConfig.resolved_legs`` is the one
-    place that knows it.
-    """
-    names = [part.strip().lower() for part in (raw or "").split(",") if part.strip()]
-    if not names:
-        # Unset, not "futures": StrategyConfig.resolved_legs owns the historical
-        # default, and it depends on the source.
-        return ()
-    unknown = [n for n in names if n not in VALID_LEGS]
-    if unknown:
-        raise ValueError(
-            f"Unknown execution leg(s) {unknown}; expected any of {list(VALID_LEGS)}"
-        )
-    # Deduplicated but ordered, so a repeated leg cannot double the size.
-    seen: list[str] = []
-    for name in names:
-        if name not in seen:
-            seen.append(name)
-    return tuple(seen)
 
 
 def enabled_strategies() -> list[StrategyConfig]:

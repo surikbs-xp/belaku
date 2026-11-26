@@ -34,8 +34,6 @@ def defaults(port: int) -> dict[str, str]:
         "WEBHOOK_HOST": "0.0.0.0",
         "WEBHOOK_PORT": str(port),
         "DB_PATH": "/data/paper_trading.db",
-        "GIFT_BOOK_DB_PATH": "/data/gift_book.db",
-        "PAPER_MIRROR_DB_PATH": "/data/paper_mirror.db",
         "LOG_FILE": "/data/bot.log",
         "HOLIDAY_CACHE_PATH": "/data/nse_holidays.json",
         # Paper unless the operator says otherwise. Arming LIVE is a deliberate

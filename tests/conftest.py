@@ -101,6 +101,38 @@ def offline_market_calendar(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def reset_engine_singleton():
+    """Drop the process-wide engine between tests.
+
+    ``engine.get_engine`` caches one instance, and a per-strategy mode switch
+    writes to it. Without this, a test that arms a book leaves the next test
+    reading that book as live - a leak that only shows up in a full run, never
+    when the test is run alone.
+    """
+    import engine
+
+    engine._engine = None
+    yield
+    engine._engine = None
+
+
+@pytest.fixture(autouse=True)
+def reset_order_manager_singleton():
+    """Drop the process-wide order manager between tests.
+
+    ``order_manager.get_order_manager`` caches one instance and holds the
+    per-book pause map on it. A test that pauses a book left the next test
+    reading it as paused, so a manual entry was refused for the wrong reason -
+    a leak that only shows up in a full run, never when the test is run alone.
+    """
+    import order_manager
+
+    order_manager._manager = None
+    yield
+    order_manager._manager = None
+
+
+@pytest.fixture(autouse=True)
 def isolate_environment(monkeypatch):
     """Keep call-time environment reads clean for every test.
 

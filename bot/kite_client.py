@@ -371,6 +371,11 @@ class KiteClient:
         self._instruments: list[dict[str, Any]] = []
         self._instruments_fetched_at = 0.0
         self._last_prices: dict[str, float] = {}
+        # When each symbol's cached price was last confirmed by the broker. The
+        # stop check needs this: a price that is hours old must not be treated as
+        # a live mark, or a position whose feed has died reads as "not breached"
+        # and is silently left unprotected.
+        self._price_at: dict[str, float] = {}
         self._last_quote_at: Optional[datetime] = None
         self._auth_error: Optional[str] = None
         self._session_cache: Optional[dict[str, Any]] = None
@@ -660,6 +665,7 @@ class KiteClient:
             return None
         price = float(payload["last_price"])
         self._last_prices[symbol] = price
+        self._price_at[symbol] = time.time()
         self._last_quote_at = datetime.now(IST)
         ohlc = payload.get("ohlc", {}) or {}
         # Depth is optional and, when present, drives the paper fill model. It is
@@ -738,6 +744,18 @@ class KiteClient:
     def remember_tick(self, symbol: str, price: float) -> None:
         """Cache the last known price for ``symbol``."""
         self._last_prices[symbol] = float(price)
+        self._price_at[symbol] = time.time()
+
+    def price_age(self, symbol: str) -> Optional[float]:
+        """Seconds since ``symbol``'s cached price was last confirmed, or None.
+
+        ``None`` means no price has ever been seen for the symbol. A large value
+        means the cached price is stale and must not be used as a live mark.
+        """
+        stamp = self._price_at.get(symbol)
+        if stamp is None:
+            return None
+        return max(0.0, time.time() - stamp)
 
     @property
     def last_quote_at(self) -> Optional[datetime]:
@@ -885,6 +903,14 @@ class KiteClient:
                 price=price if order_type.upper() == "LIMIT" else None,
                 validity=self.kite.VALIDITY_DAY,
                 tag=tag[:20],
+                # A market order with no protection band can fill far from the
+                # touch in a thin book. Zerodha's own default is used when the
+                # setting is unset, so this only overrides when configured.
+                market_protection=(
+                    int(settings.market_protection)
+                    if settings.market_protection is not None
+                    else None
+                ),
             )
         except NetworkException as exc:
             log.error("Order submission outcome is uncertain for %s: %s", symbol, exc)
@@ -972,6 +998,353 @@ class KiteClient:
                 else "Order status is unresolved after cancellation"
             )
         return last
+
+    def order_book(self, force: bool = False) -> list[dict[str, Any]]:
+        """Every order the broker knows about today, newest first.
+
+        This is the authority for "did my order actually fill?". The local
+        ``orders`` table records what the bot *sent*; only this says what the
+        exchange *did*. Reconciliation compares the two, so a timeout, a
+        partial fill or a rejection that arrived after the bot stopped polling
+        is discovered rather than assumed.
+
+        ``force`` reads the broker even in PAPER, for the same reason
+        :meth:`positions` does: the readiness gate and the startup reconcile run
+        before the mode switch.
+
+        Raises rather than returning an empty list when the broker cannot be
+        read. An empty list means "no orders today", which is a very different
+        fact from "I could not ask", and treating the second as the first is how
+        a bot concludes it is flat when it is not.
+        """
+        if self.is_paper and not force:
+            return []
+        if not self.sdk_ready:
+            raise RuntimeError(self._auth_error or "KiteConnect is not initialised")
+        rows = self.kite.orders() or []
+        return sorted(
+            rows,
+            key=lambda row: str(row.get("order_timestamp") or ""),
+            reverse=True,
+        )
+
+    def order_status(self, order_id: str, force: bool = False) -> Optional[dict[str, Any]]:
+        """The broker's latest state for one order, or ``None`` if unreadable.
+
+        ``None`` is deliberately distinct from a status: a failed read must not
+        be mistaken for "still open" or for "cancelled". The caller decides, and
+        the safe decision on ``None`` is to leave the order unresolved.
+        """
+        if not order_id:
+            return None
+        try:
+            history = self.kite.order_history(order_id)
+        except Exception as exc:
+            log.warning("Order history read failed for %s: %s", order_id, exc)
+            return None
+        if not history:
+            return None
+        latest = dict(history[-1])
+        latest["status"] = str(latest.get("status") or "").upper().replace(" ", "_")
+        return latest
+
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        quantity: Optional[int] = None,
+        price: Optional[float] = None,
+        order_type: Optional[str] = None,
+        trigger_price: Optional[float] = None,
+        mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Modify a pending order. PAPER returns a simulated acknowledgement.
+
+        Only the fields supplied are changed, so a caller can move a price
+        without restating the quantity. A modification is verified by reading
+        the order back: Kite accepts a modify request and can still reject it
+        asynchronously, so the acknowledgement alone is not proof.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": order_id,
+                "status": "COMPLETE",
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated modify (paper mode)",
+            }
+        kwargs: dict[str, Any] = {"variety": self.kite.VARIETY_REGULAR, "order_id": order_id}
+        if quantity is not None:
+            kwargs["quantity"] = int(quantity)
+        if price is not None:
+            kwargs["price"] = float(price)
+        if order_type is not None:
+            kwargs["order_type"] = getattr(self.kite, f"ORDER_TYPE_{order_type.upper()}")
+        if trigger_price is not None:
+            kwargs["trigger_price"] = float(trigger_price)
+        try:
+            self.kite.modify_order(**kwargs)
+        except Exception as exc:
+            log.error("Order modify failed for %s: %s", order_id, exc)
+            return {"order_id": order_id, "status": "REJECTED", "mode": LIVE,
+                    "mocked": False, "message": str(exc)}
+        verified = self.order_status(order_id, force=True) or {}
+        return {
+            "order_id": order_id,
+            "status": verified.get("status") or "OPEN",
+            "average_price": verified.get("average_price"),
+            "filled_quantity": int(verified.get("filled_quantity") or 0),
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Modify accepted",
+        }
+
+    def place_protective_stop(
+        self,
+        symbol: str,
+        position_key: int,
+        quantity: int,
+        trigger_price: float,
+        *,
+        product: str = "NRML",
+        tag: str = "niftysl",
+        mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Place an exchange-held SL-M that closes ``quantity`` at ``trigger_price``.
+
+        This is the order that keeps protecting a position when the bot is not
+        running. The engine's own stop is a software check on a mark loop: if the
+        process dies, the container is killed or the API is unreachable, nothing
+        evaluates it and the position sits at the exchange with no stop at all.
+        An SL-M lives at Zerodha, so it fires whether or not this process is alive.
+
+        The side is the *opposite* of the position: a long is protected by a SELL
+        stop, a short by a BUY stop. ``position_key`` is +1 for long and -1 for
+        short, so the side is derived rather than passed - a caller that got it
+        backwards would place a stop that doubles the position instead of closing
+        it, which is the worst possible failure for this order.
+
+        Returns the broker's acknowledgement. ``status`` is the broker's own, and
+        ``TRIGGER_PENDING`` is the success case: the order is resting at the
+        exchange waiting for the trigger.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": f"PAPER-SL-{random.randint(100000, 999999)}",
+                "status": "TRIGGER_PENDING",
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated protective stop (paper mode)",
+            }
+        side = "SELL" if int(position_key) > 0 else "BUY"
+        try:
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NFO,
+                tradingsymbol=symbol,
+                transaction_type=getattr(self.kite, f"TRANSACTION_TYPE_{side}"),
+                quantity=int(quantity),
+                product=getattr(self.kite, f"PRODUCT_{product.upper()}"),
+                order_type=self.kite.ORDER_TYPE_SLM,
+                trigger_price=float(trigger_price),
+                validity=self.kite.VALIDITY_DAY,
+                tag=tag[:20],
+            )
+        except Exception as exc:
+            log.error(
+                "Protective SL-M placement FAILED for %s (%s %s @ trigger %.2f): %s",
+                symbol, side, quantity, trigger_price, exc,
+            )
+            return {
+                "order_id": None,
+                "status": "REJECTED",
+                "mode": LIVE,
+                "mocked": False,
+                "message": str(exc),
+            }
+        # Read it back: an SL-M can be accepted and then rejected by the exchange
+        # (a trigger on the wrong side of the market, for instance), and an
+        # acknowledgement alone is not proof that the position is protected.
+        verified = self.order_status(order_id, force=True) or {}
+        status = str(verified.get("status") or "TRIGGER_PENDING").upper().replace(" ", "_")
+        if status in {"REJECTED", "CANCELLED"}:
+            log.error(
+                "Protective SL-M for %s was %s: %s",
+                symbol, status, verified.get("status_message") or "no reason given",
+            )
+        return {
+            "order_id": str(order_id),
+            "status": status,
+            "trigger_price": float(trigger_price),
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Protective stop placed",
+        }
+
+    def modify_protective_stop(
+        self,
+        order_id: str,
+        trigger_price: float,
+        *,
+        quantity: Optional[int] = None,
+        mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Move a resting SL-M's trigger, and confirm the exchange took it.
+
+        Zerodha has no native trailing stop, so a trail is a sequence of these.
+        The read-back matters more here than anywhere else: a modify that the
+        exchange rejects leaves the *old* trigger protecting the position, and
+        reporting success would let the engine believe it had tightened a stop
+        that is still sitting where it was.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": order_id,
+                "status": "TRIGGER_PENDING",
+                "trigger_price": float(trigger_price),
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated protective stop modify (paper mode)",
+            }
+        kwargs: dict[str, Any] = {
+            "variety": self.kite.VARIETY_REGULAR,
+            "order_id": order_id,
+            "trigger_price": float(trigger_price),
+        }
+        if quantity is not None:
+            kwargs["quantity"] = int(quantity)
+        try:
+            self.kite.modify_order(**kwargs)
+        except Exception as exc:
+            log.error(
+                "Protective SL-M modify FAILED for %s -> trigger %.2f: %s",
+                order_id, trigger_price, exc,
+            )
+            return {
+                "order_id": order_id,
+                "status": "REJECTED",
+                "mode": LIVE,
+                "mocked": False,
+                "message": str(exc),
+            }
+        verified = self.order_status(order_id, force=True) or {}
+        status = str(verified.get("status") or "TRIGGER_PENDING").upper().replace(" ", "_")
+        return {
+            "order_id": order_id,
+            "status": status,
+            "trigger_price": float(trigger_price),
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Protective stop moved",
+        }
+
+    def cancel_protective_stop(
+        self, order_id: str, mode: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Cancel a resting SL-M before an exit, and confirm it is gone.
+
+        Every exit must do this first. An SL-M left resting while the bot closes
+        the position itself becomes an order that opens a *new* position in the
+        opposite direction once the exit fills - the stop would fire against a
+        flat book and sell into a short. Cancelling is therefore part of the exit,
+        not an optimisation.
+
+        A cancel that fails is reported as ``OPEN`` rather than as success, so the
+        caller can refuse to exit into a live stop.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": order_id,
+                "status": "CANCELLED",
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated protective stop cancel (paper mode)",
+            }
+        try:
+            self.kite.cancel_order(
+                variety=self.kite.VARIETY_REGULAR, order_id=order_id
+            )
+        except Exception as exc:
+            log.error("Protective SL-M cancel FAILED for %s: %s", order_id, exc)
+            return {
+                "order_id": order_id,
+                "status": "OPEN",
+                "mode": LIVE,
+                "mocked": False,
+                "message": f"Cancel failed: {exc}",
+            }
+        verified = self.order_status(order_id, force=True) or {}
+        status = str(verified.get("status") or "CANCELLED").upper().replace(" ", "_")
+        return {
+            "order_id": order_id,
+            "status": status,
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Protective stop cancelled",
+        }
+
+    def trades(self, force: bool = False) -> list[dict[str, Any]]:
+        """Every fill the broker recorded today, newest first.
+
+        The order book says what was *ordered*; this says what actually
+        *executed*, one row per fill. A partially filled order appears here as
+        several rows, which is the only way to see the real average price and the
+        real quantity when an order filled across several levels.
+
+        Raises rather than returning an empty list when the broker cannot be
+        read, for the same reason :meth:`order_book` does: "no fills" and "could
+        not ask" are different facts.
+        """
+        if self.is_paper and not force:
+            return []
+        if not self.sdk_ready:
+            raise RuntimeError(self._auth_error or "KiteConnect is not initialised")
+        rows = self.kite.trades() or []
+        return sorted(
+            rows,
+            key=lambda row: str(row.get("fill_timestamp") or row.get("order_timestamp") or ""),
+            reverse=True,
+        )
+
+    def cancel_order(self, order_id: str, mode: Optional[str] = None) -> dict[str, Any]:
+        """Cancel a pending order and confirm the cancellation with the broker.
+
+        The confirmation matters: a cancel request that the exchange rejects
+        leaves the order live, and reporting success would let the bot believe
+        it had removed an order that can still fill.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": order_id,
+                "status": "CANCELLED",
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated cancel (paper mode)",
+            }
+        try:
+            self.kite.cancel_order(
+                variety=self.kite.VARIETY_REGULAR, order_id=order_id
+            )
+        except Exception as exc:
+            log.error("Order cancel failed for %s: %s", order_id, exc)
+            return {"order_id": order_id, "status": "OPEN", "mode": LIVE,
+                    "mocked": False, "message": f"Cancel failed: {exc}"}
+        verified = self.order_status(order_id, force=True) or {}
+        status = verified.get("status") or "CANCELLED"
+        return {
+            "order_id": order_id,
+            "status": status,
+            "filled_quantity": int(verified.get("filled_quantity") or 0),
+            "average_price": verified.get("average_price"),
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Cancel accepted",
+        }
 
     def positions(self, force: bool = False) -> list[dict[str, Any]]:
         """Broker net positions.

@@ -11,6 +11,7 @@ Design notes
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -64,7 +65,19 @@ CREATE TABLE IF NOT EXISTS positions (
     mode                  TEXT NOT NULL DEFAULT 'PAPER',
     source                TEXT NOT NULL DEFAULT 'WEBHOOK',
     strategy              TEXT,
-    notes                 TEXT
+    notes                 TEXT,
+    -- The exchange-held protective order (a Zerodha SL-M) that backs this
+    -- position's stop. The software stop in ``trailing_stop`` is the level the
+    -- engine trails; this is the order that keeps protecting the position when
+    -- the engine is not running. NULL means no broker-side protection, which is
+    -- the normal state in PAPER and a reported fault in LIVE.
+    protective_order_id   TEXT,
+    -- The trigger price actually resting at the exchange. Kept separately from
+    -- ``trailing_stop`` because the two can disagree: a trail that moved in the
+    -- ledger but whose broker modify failed leaves the exchange protecting the
+    -- old level, and that gap must be visible rather than assumed away.
+    protective_stop       REAL,
+    protective_status     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions (status, symbol);
 
@@ -313,6 +326,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE positions SET best_price = entry_price WHERE best_price IS NULL"
         )
+    # The exchange-held protective order. Added after the fact so an existing
+    # ledger keeps working: a row with no protective order is exactly what every
+    # position written before this column existed is, and the startup reconcile
+    # treats that as "needs one" rather than as "protected".
+    if "protective_order_id" not in position_columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN protective_order_id TEXT")
+    if "protective_stop" not in position_columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN protective_stop REAL")
+    if "protective_status" not in position_columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN protective_status TEXT")
 
 
 def _connect(path: Optional[str] = None) -> sqlite3.Connection:
@@ -747,6 +770,147 @@ def mark_open_positions(
     return touched
 
 
+def update_position_stops(
+    position_id: int,
+    *,
+    stop: Optional[float],
+    best_price: Optional[float],
+    path: Optional[str] = None,
+) -> None:
+    """Persist a position's current stop and best price.
+
+    Written on every mark so a restart resumes the trail exactly where it was
+    rather than re-deriving it from the entry - a stop that resets on restart is
+    a stop that can be jumped by a gap the process slept through.
+    """
+    with session(path) as conn:
+        conn.execute(
+            "UPDATE positions SET trailing_stop = ?, best_price = ? "
+            "WHERE id = ? AND status = 'OPEN'",
+            (stop, best_price, position_id),
+        )
+
+
+def set_position_stop(
+    position_id: int,
+    stop: float,
+    *,
+    path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Override a position's protective stop, and report what changed.
+
+    The engine's own trail only ever tightens (see :mod:`stops`), so an operator
+    override is held to the same rule: a stop may be moved **towards** the market
+    but never away from it. Loosening a stop is how a losing trade is turned into
+    a catastrophic one, and the engine would immediately re-tighten it on the
+    next mark anyway - so accepting a looser value would be a lie about what is
+    actually protecting the position.
+
+    Returns the previous and new level so the caller can log and alert on the
+    change. Raises ``ValueError`` when the position is not open or the new level
+    would widen the stop.
+    """
+    with session(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM positions WHERE id = ?", (int(position_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Position {position_id} not found")
+        if row["status"] != "OPEN":
+            raise ValueError(f"Position {position_id} is not open")
+        key = int(row["position_key"])
+        entry = float(row["entry_price"])
+        previous = row["trailing_stop"]
+        initial = row["initial_sl_price"]
+        new_stop = float(stop)
+
+        # Never widen. This is the engine's own invariant (see :mod:`stops`): a
+        # stop may move towards the market but never away from it. Loosening a
+        # stop is how a losing trade becomes a catastrophic one, and the engine
+        # would re-tighten it on the next mark anyway - so accepting a looser
+        # value would show the operator a level that is not actually protecting
+        # the position.
+        #
+        # Note this is *not* a check against the entry: a profitable long's
+        # trailing stop sits above its entry, which is the whole point of a
+        # trail. Only the direction of the move matters.
+        if previous is not None:
+            tightened = (new_stop - float(previous)) * key
+            if tightened < 0:
+                raise ValueError(
+                    f"Stop {new_stop:.2f} would widen the current {float(previous):.2f}; "
+                    "a stop may only move towards the market"
+                )
+        # A level on the wrong side of the entry is not a stop at all - it would
+        # fire instantly or never. Refused so a typo cannot silently disable the
+        # protection.
+        if key == 1 and new_stop >= entry and previous is None:
+            raise ValueError(
+                f"A long stop must be below the entry ({entry:.2f}); {new_stop:.2f} is not"
+            )
+        if key == -1 and new_stop <= entry and previous is None:
+            raise ValueError(
+                f"A short stop must be above the entry ({entry:.2f}); {new_stop:.2f} is not"
+            )
+
+        conn.execute(
+            "UPDATE positions SET trailing_stop = ?, sl_price = ? "
+            "WHERE id = ? AND status = 'OPEN'",
+            (new_stop, new_stop, int(position_id)),
+        )
+        return {
+            "position_id": int(position_id),
+            "previous_stop": previous,
+            "initial_stop": initial,
+            "stop": new_stop,
+            "entry_price": entry,
+            "side": "LONG" if key == 1 else "SHORT",
+        }
+
+
+def set_position_protective_order(
+    position_id: int,
+    order_id: Optional[str],
+    stop: Optional[float],
+    status: Optional[str],
+    *,
+    path: Optional[str] = None,
+) -> None:
+    """Record the exchange-held protective order backing a position.
+
+    Kept separate from ``trailing_stop`` on purpose. The ledger's stop is the
+    level the engine *wants*; this is the level the exchange is actually
+    holding. A trail that moved in the ledger but whose broker modify failed
+    leaves the two disagreeing, and that gap is the thing an operator most needs
+    to see - collapsing them into one column would hide it.
+    """
+    with session(path) as conn:
+        conn.execute(
+            "UPDATE positions SET protective_order_id = ?, protective_stop = ?, "
+            "protective_status = ? WHERE id = ?",
+            (order_id, stop, status, int(position_id)),
+        )
+
+
+def positions_needing_protection(
+    mode: str, path: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Open LIVE positions with no exchange-held stop, or one that is not live.
+
+    The startup reconcile and the periodic pass both read this. A position in
+    this list is unprotected at the exchange: the engine may still be watching
+    it, but nothing will close it if the engine stops.
+    """
+    return _fetch_all(
+        "SELECT * FROM positions WHERE status = 'OPEN' AND mode = ? "
+        "AND (protective_order_id IS NULL OR protective_order_id = '' "
+        "     OR protective_status IS NULL "
+        "     OR protective_status NOT IN ('TRIGGER_PENDING', 'OPEN'))",
+        (mode,),
+        path,
+    )
+
+
 def close_position(
     position_id: int,
     exit_price: float,
@@ -859,17 +1023,192 @@ def record_order(path: Optional[str] = None, **fields: Any) -> int:
         return int(cur.lastrowid)
 
 
+# Statuses that mean "the broker has not finished with this order". Anything
+# else is terminal and must never block a new entry.
+UNRESOLVED_ORDER_STATUSES = ("OPEN", "TRIGGER_PENDING", "PENDING")
+
+
 def get_pending_orders(
     mode: str, symbol: Optional[str] = None, path: Optional[str] = None
 ) -> list[dict[str, Any]]:
-    statuses = ("OPEN", "TRIGGER_PENDING", "PENDING")
-    query = "SELECT * FROM orders WHERE mode = ? AND status IN (?, ?, ?)"
-    params: list[Any] = [mode, *statuses]
+    """Orders the broker has not finished with, oldest first.
+
+    These block new entries for the symbol: an order whose outcome is unknown
+    could still fill, and stacking a second one on top would double the
+    exposure. The block is only safe because :func:`update_order_status` and
+    :meth:`OrderManager.reconcile_orders` resolve them against the broker's own
+    order book - without that, one timed-out order would block the symbol for
+    ever.
+    """
+    placeholders = ", ".join("?" for _ in UNRESOLVED_ORDER_STATUSES)
+    query = f"SELECT * FROM orders WHERE mode = ? AND status IN ({placeholders})"
+    params: list[Any] = [mode, *UNRESOLVED_ORDER_STATUSES]
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol)
     query += " ORDER BY id"
     return _fetch_all(query, params, path)
+
+
+def get_order_by_exchange_id(
+    exchange_order_id: str, mode: str, path: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """The local row for a broker order id, or ``None``.
+
+    Used by reconciliation to match a broker order back to the row that
+    recorded it. Scoped to ``mode`` because a paper order id and a live one are
+    different namespaces and must never be matched to each other.
+    """
+    if not exchange_order_id:
+        return None
+    rows = _fetch_all(
+        "SELECT * FROM orders WHERE exchange_order_id = ? AND mode = ? "
+        "ORDER BY id DESC LIMIT 1",
+        [str(exchange_order_id), mode],
+        path,
+    )
+    return rows[0] if rows else None
+
+
+def update_order_status(
+    order_id: int,
+    status: str,
+    *,
+    filled_quantity: Optional[int] = None,
+    average_price: Optional[float] = None,
+    message: Optional[str] = None,
+    path: Optional[str] = None,
+) -> bool:
+    """Move a recorded order to its final state. Returns whether a row changed.
+
+    This is the missing half of :func:`record_order`. Without it an order
+    recorded as ``OPEN`` stayed ``OPEN`` for ever, so
+    :func:`get_pending_orders` kept returning it and every later entry for that
+    symbol was refused with "Unresolved order" - a single timed-out order
+    permanently stopped the bot from trading.
+
+    Only the fields supplied are written, so a reconciliation that knows the
+    status but not the fill price cannot blank the price it already had.
+    """
+    assignments = ["status = ?"]
+    params: list[Any] = [str(status).upper()]
+    if filled_quantity is not None:
+        assignments.append("quantity = ?")
+        params.append(int(filled_quantity))
+    if average_price is not None:
+        assignments.append("price = ?")
+        params.append(float(average_price))
+    if message is not None:
+        assignments.append("message = ?")
+        params.append(str(message))
+    params.append(int(order_id))
+    with session(path) as conn:
+        cur = conn.execute(
+            f"UPDATE orders SET {', '.join(assignments)} WHERE id = ?", params
+        )
+        return cur.rowcount > 0
+
+
+def daily_realised_pnl(
+    mode: str,
+    strategy_id: Optional[str] = None,
+    path: Optional[str] = None,
+    day: Optional[str] = None,
+) -> float:
+    """Net realised PnL for one IST trading day, from closed trades.
+
+    ``day`` is a ``YYYY-MM-DD`` IST date; it defaults to today. The comparison
+    is on the date prefix of ``exit_time`` rather than a timestamp range because
+    every row is written in IST by :func:`iso`, so the prefix *is* the trading
+    day the trade settled on.
+
+    Scoped to ``mode`` so a paper loss can never trip a live daily limit, and
+    optionally to one book. ``strategy_id=None`` sums every book, which is what
+    a portfolio-wide daily cap needs.
+    """
+    target = day or iso()[:10]
+    query = (
+        "SELECT COALESCE(SUM(net_pnl), 0) AS total FROM trades "
+        "WHERE mode = ? AND substr(exit_time, 1, 10) = ?"
+    )
+    params: list[Any] = [mode, target]
+    if strategy_id is not None:
+        query += " AND strategy_id = ?"
+        params.append(strategy_id)
+    rows = _fetch_all(query, params, path)
+    try:
+        return float(rows[0]["total"]) if rows else 0.0
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def book_reconciled_fill(
+    order_row_id: int,
+    *,
+    symbol: str,
+    signed_quantity: int,
+    price: float,
+    mode: str,
+    strategy_id: str,
+    exchange_order_id: Optional[str],
+    status: str = "COMPLETE",
+    path: Optional[str] = None,
+) -> Optional[int]:
+    """Open a position and mark its order filled in **one** transaction.
+
+    Reconciliation discovers fills after the fact, so it must be exactly-once:
+    a crash between "open the position" and "mark the order complete" would
+    leave the order unresolved, and the next reconcile pass would open a second
+    position for the same fill. Doing both writes under one ``BEGIN IMMEDIATE``
+    makes that impossible - either the position exists and the order is closed,
+    or neither happened.
+
+    Returns the new position id, or ``None`` when the order was already booked
+    (its row carries a ``position_id``), which is the idempotent case.
+    """
+    with session(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (int(order_row_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Order {order_row_id} not found")
+        if row["position_id"]:
+            # Already booked by an earlier pass. Update the status only.
+            conn.execute(
+                "UPDATE orders SET status = ?, quantity = ?, price = ?, message = ? "
+                "WHERE id = ?",
+                (status, abs(int(signed_quantity)), float(price),
+                 "Reconciled (already booked)", int(order_row_id)),
+            )
+            return None
+        cur = conn.execute(
+            "INSERT INTO positions "
+            "(symbol, position_key, quantity, entry_price, entry_time, last_price, "
+            " mode, source, strategy, strategy_id, best_price, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                symbol,
+                1 if signed_quantity > 0 else -1,
+                abs(int(signed_quantity)),
+                float(price),
+                iso(),
+                float(price),
+                mode,
+                "RECONCILE",
+                strategy_id,
+                strategy_id,
+                float(price),
+                json.dumps({"reconciled_order": exchange_order_id}),
+            ),
+        )
+        position_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE orders SET status = ?, quantity = ?, price = ?, position_id = ?, "
+            "message = ? WHERE id = ?",
+            (status, abs(int(signed_quantity)), float(price), position_id,
+             f"Reconciled fill booked as position {position_id}", int(order_row_id)),
+        )
+        return position_id
 
 
 def record_signal(

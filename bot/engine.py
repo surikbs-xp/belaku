@@ -1,19 +1,18 @@
-"""Strategy engine: evaluate ``st.pine`` on GIFT Nifty, execute on Nifty futures.
+"""Strategy engine: evaluate ``st.pine`` on a signal series, execute on Nifty futures.
 
-Signal source and execution venue are deliberately different instruments:
+Two strategies run, each on its own signal series and timeframe:
 
-* **signals** come from GIFT Nifty (``NSEIX:GIFT NIFTY``) candles, loaded from
-  Kite history by :mod:`gift_nifty` (tick-built bars are a fallback). GIFT Nifty
-  is the 20-hour pre-market proxy for Nifty 50, so it reacts to overnight and
-  early-morning global moves before NSE opens.
-* **orders** go to the front-month NFO Nifty future via
-  :class:`~order_manager.OrderManager`, because GIFT Nifty is quote-only on
-  Kite and cannot be traded there.
+* **GIFT NIFTY 15m** - signals from ``NSEIX:GIFT NIFTY``, 15-minute bars.
+* **NIFTY 60m** - signals from ``NSE:NIFTY 50``, 60-minute bars.
 
-The engine **evaluates** on every closed GIFT Nifty bar, around the clock.
-LIVE orders execute only inside the NSE F&O session (09:15-15:30 IST). PAPER
-orders can also simulate after-hours using the just-closed GIFT candle; a
-deferred LIVE signal is never auto-executed later.
+Both execute on the front-month NFO Nifty future via
+:class:`~order_manager.OrderManager`, because the signal series is an index and
+cannot be traded itself.
+
+The engine **evaluates** on every closed bar of each series. Both LIVE and PAPER
+trade only inside the NSE F&O session (09:15-15:30 IST, Mon-Fri, minus exchange
+holidays). A signal that closes outside the session is deferred and dropped, never
+queued for the open.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ from typing import Any, Optional
 
 import database as db
 import risk
+import stops
 import strategy
 from config import (
     PAPER,
@@ -53,6 +53,14 @@ from order_manager import BUY, FLAT, SELL, ExecutionResult, get_order_manager
 from portfolio import get_aggregator
 
 log = logging.getLogger("engine")
+
+# How old a cached mark may be before the stop check refuses to trust it. The
+# mark loop refreshes the execution quote every ENGINE_INTERVAL_SECONDS (5s by
+# default), so a mark older than this means the quote path has failed - and a
+# stop evaluated against a stale price is a stop that reports "not breached" for
+# a position that may already be through it. Deliberately generous: a brief
+# network blip must not stop the check, only a sustained outage.
+STALE_MARK_SECONDS = 60.0
 
 
 def _trade_alert(
@@ -150,6 +158,19 @@ class EngineState:
     # rather than only after entries start being refused.
     rollover: dict[str, Any] = field(default_factory=dict)
     rollover_paused: bool = False
+    # Signal-path latency, in milliseconds. These are the numbers that answer
+    # "how fast did the bot act?", and they are measured rather than estimated:
+    #   detect  - bar close to the verdict being computed
+    #   submit  - verdict to the order being handed to the broker
+    #   ack     - order submission to the broker's acknowledgement
+    #   fill    - submission to the fill being confirmed
+    # Each is the most recent value; ``latency_samples`` keeps a short history so
+    # the dashboard can show a median rather than one noisy reading.
+    latency_detect_ms: Optional[float] = None
+    latency_submit_ms: Optional[float] = None
+    latency_ack_ms: Optional[float] = None
+    latency_fill_ms: Optional[float] = None
+    latency_samples: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -174,6 +195,13 @@ class EngineState:
             "ready": self.ready,
             "rollover": self.rollover,
             "rollover_paused": self.rollover_paused,
+            "latency": {
+                "detect_ms": self.latency_detect_ms,
+                "submit_ms": self.latency_submit_ms,
+                "ack_ms": self.latency_ack_ms,
+                "fill_ms": self.latency_fill_ms,
+                "samples": self.latency_samples[-20:],
+            },
         }
 
 
@@ -192,7 +220,7 @@ PENDING_SIGNAL_BAR_KEY = "engine_pending_signal_bar"
 
 
 class StrategyEngine:
-    """Watches GIFT Nifty bars and trades the Nifty future on fresh signals.
+    """Watches each book's signal series and trades the Nifty future on fresh signals.
 
     Entry is *transition-driven*: the bot trades the bar on which the two rules
     start agreeing, not every bar on which they still agree. That is what makes an
@@ -255,7 +283,7 @@ class StrategyEngine:
                     lots=cfg.lots,
                     display_name=cfg.name or cfg.id,
                     live=getattr(cfg, "live", False),
-                    legs=getattr(cfg, "resolved_legs", None),
+                    stop_rules=getattr(cfg, "stop_rules", None),
                 )
             )
         if not runs:
@@ -277,8 +305,8 @@ class StrategyEngine:
 
         The GIFT source is built without a feed, so it resolves ``get_feed()`` on
         first use rather than at construction. That keeps every existing stub and
-        reset of the feed working, and it is also what lets two GIFT strategies
-        share the one process-global websocket instead of opening a second.
+        reset of the feed working, and it is also what lets the GIFT book share
+        the one process-global websocket instead of opening a second.
         """
         from config import build_bar_source_for
 
@@ -328,8 +356,8 @@ class StrategyEngine:
     def _set_overnight_pending(self, value: bool, run: Optional[StrategyRun] = None) -> None:
         """Set the pre-open reconcile flag on the book that owns it.
 
-        One field for every book meant a pre-open bar in the GIFT series armed a
-        reconcile for the NIFTY book as well, which would then decide the
+        One field for every book meant a pre-open bar in one series armed a
+        reconcile for the other book as well, which would then decide the
         morning on a leg it does not hold. The engine-level attribute mirrors the
         active run, so the dashboard and existing callers still see one value.
         """
@@ -368,7 +396,7 @@ class StrategyEngine:
         so a latch set by any book belonged to the first one: the entry was then
         consumed against that book's position and booked under its id. That is
         how a palette book's fill ended up in the wrong ledger - the position
-        showed ``strategy: gift-flip`` but its ``strategy_id`` was the engine's
+        showed one strategy's name but its ``strategy_id`` was the engine's
         legacy default, and no tile could find it.
         """
         book = run if run is not None else self.run
@@ -394,7 +422,7 @@ class StrategyEngine:
                 log.info("Exit notice dismissed: %s", self._breach.detail)
             self._breach = None
 
-    def reset_for_mode(self, mode: str) -> None:
+    def reset_for_mode(self, mode: str, strategy_id: Optional[str] = None) -> None:
         """Drop the strategy state that belongs to the mode being left.
 
         The *rules* are identical in PAPER and LIVE - ``strategy`` and ``risk``
@@ -425,16 +453,21 @@ class StrategyEngine:
         """
         with self._lock:
             for run in self.runs:
+                # A per-book switch clears only that book; the global switch
+                # clears every book. ``strategy_id`` narrows it.
+                if strategy_id is not None and run.id != strategy_id:
+                    continue
                 run.state.last_bar_at = None
                 run.state.last_action = None
                 run.state.overnight_pending = False
                 # Written through to SQLite, so a PAPER-era owed entry cannot be
                 # filled as a real order by the live book.
                 run.set_pending_signal(None)
-            self._last_bar_at = None
-            self._last_signal = strategy.NO_SIGNAL
-            self._overnight_pending = False
-            self._pending_signal = None
+            if strategy_id is None:
+                self._last_bar_at = None
+                self._last_signal = strategy.NO_SIGNAL
+                self._overnight_pending = False
+                self._pending_signal = None
             self._pending_signal_bar = None
             # The memoised dashboard verdicts are keyed by bar, not by mode, so
             # they stay valid - the indicators do not care which book is trading.
@@ -513,6 +546,198 @@ class StrategyEngine:
         if not status["rolled"]:
             self._rollover_logged = False
         return status
+
+    def check_stops(self, prices: Optional[dict[str, float]] = None) -> list[dict[str, Any]]:
+        """Advance every open position's stop and close the ones that breached.
+
+        Runs on the mark cadence against **live futures prices**, not on a bar
+        close: a stop that waited for the candle would be a stop that lets the
+        market run through it for up to a whole bar. It is deliberately not gated
+        on the pause switch - pausing blocks *entries*, and a position that is
+        already on must stay protected.
+
+        Each position is evaluated against its own book's rules, so the two
+        strategies keep independent stops even though they hold the same
+        contract. A position whose book has no rules is left exactly as it was.
+
+        Returns one report per position that was closed, for the caller to log
+        and alert on. Never raises: a stop check that throws would leave the
+        position unprotected, which is the one outcome it must not produce.
+        """
+        reports: list[dict[str, Any]] = []
+        manager = get_order_manager()
+        if prices is None:
+            try:
+                prices = manager.price_map()
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Could not price positions for the stop check")
+                return reports
+
+        rules_by_book = {
+            run.id: run.stop_rules for run in self.runs if getattr(run, "stop_rules", None)
+        }
+        if not any(rules is not None and rules.enabled for rules in rules_by_book.values()):
+            return reports
+
+        try:
+            positions = db.get_open_positions()
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Could not read open positions for the stop check")
+            return reports
+
+        for position in positions:
+            book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID
+            rules = rules_by_book.get(book)
+            if rules is None or not rules.enabled:
+                continue
+            mark = prices.get(position["symbol"])
+            if mark is None:
+                continue
+            # A stale mark is not a live mark. ``get_ltp`` falls back to the last
+            # cached price when the quote endpoint fails, so a dead feed would
+            # otherwise have every stop evaluated against a price from minutes or
+            # hours ago - reported "not breached" and left unprotected. Skipping
+            # the evaluation is the honest answer: the position is not known to be
+            # safe, and the watchdog raises a stale-quote alert for it.
+            age = self._mark_age(position["symbol"])
+            if age is not None and age > STALE_MARK_SECONDS:
+                log.warning(
+                    "Stop check skipped for %s: mark is %.0fs old (limit %.0fs); "
+                    "the position is NOT known to be protected",
+                    position["symbol"], age, STALE_MARK_SECONDS,
+                )
+                continue
+            try:
+                report = self._check_one_stop(position, float(mark), rules)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Stop check failed for position %s", position.get("id"))
+                continue
+            if report is not None:
+                reports.append(report)
+        return reports
+
+    @staticmethod
+    def _mark_age(symbol: str) -> Optional[float]:
+        """Age of the cached price for ``symbol``, or ``None`` when unknown.
+
+        Read from the *order manager's* client, because that is the one whose
+        ``price_map`` produced the marks being evaluated. Reading the global
+        singleton instead would measure a different client's cache - the same
+        object in production, but not necessarily in a test or after a client
+        reset, and a mismatch there would silently disable the guard.
+
+        ``None`` (no timestamp available) is treated as fresh by the caller: a
+        test double or a client without the accessor must not disable stops.
+        """
+        try:
+            client = get_order_manager().client
+            age = getattr(client, "price_age", None)
+            return age(symbol) if callable(age) else None
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def _check_one_stop(
+        self, position: dict[str, Any], mark: float, rules: stops.StopRules
+    ) -> Optional[dict[str, Any]]:
+        """Evaluate one position's stop at ``mark``; close it if it breached."""
+        position_key = int(position["position_key"])
+        entry = float(position["entry_price"])
+        state, breached = stops.evaluate(
+            entry_price=entry,
+            position_key=position_key,
+            mark=mark,
+            rules=rules,
+            current_stop=position.get("trailing_stop"),
+            best_price=position.get("best_price"),
+        )
+        if not breached:
+            db.update_position_stops(
+                position["id"], stop=state.current, best_price=state.best_price
+            )
+            # Keep the exchange-held stop in step with the trail. Zerodha has no
+            # native trailing stop, so a trail is a modify per step - and if that
+            # modify fails the position is still protected, just at the older
+            # level. The ledger keeps the tighter number, ``protective_stop``
+            # records what the exchange actually holds, and the next reconcile
+            # retries. Only a *tightened* level is pushed: re-issuing an unchanged
+            # trigger would be a broker round-trip per mark for no gain.
+            previous = position.get("trailing_stop")
+            if (
+                state.current is not None
+                and (previous is None or (float(state.current) - float(previous)) * position_key > 0)
+            ):
+                try:
+                    get_order_manager().move_protective_stop(
+                        {**position, "trailing_stop": state.current}, float(state.current)
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    log.exception(
+                        "Could not move the protective stop for position %s",
+                        position.get("id"),
+                    )
+            return None
+
+        book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID
+        mode = position.get("mode") or get_execution_mode()
+        stop_level = position.get("trailing_stop")
+        points = (mark - entry) * position_key
+        detail = (
+            f"stop hit at {mark:.2f} (stop {stop_level if stop_level is not None else '—'}, "
+            f"{points:+.2f} pts)"
+        )
+        result = get_order_manager().square_off(
+            "STOP_LOSS",
+            source="STOP_LOSS",
+            mode=mode,
+            mark_price=mark,
+            position_id=position["id"],
+            strategy_id=book,
+        )
+        confirmed = bool(result.ok)
+        if confirmed:
+            db.update_position_stops(
+                position["id"], stop=state.current, best_price=state.best_price
+            )
+        with self._lock:
+            self._breach = risk.Breach(
+                kind="STOP_LOSS",
+                symbol=position["symbol"],
+                points=round(points, 2),
+                position_id=position["id"],
+                detail=detail,
+            )
+            if not confirmed:
+                self.state.last_error = f"stop-out unconfirmed: {result.reason}"
+        log.warning(
+            "Stop-out %s %s: %s (confirmed=%s)",
+            book, position["symbol"], detail, confirmed,
+        )
+        _trade_alert(
+            "STOP_OUT",
+            f"{position['symbol']} stopped out: {detail}",
+            severity="warning",
+            symbol=position["symbol"],
+            fields={
+                "strategy": book,
+                "venue": mode,
+                "symbol": position["symbol"],
+                "action": "EXIT",
+                "points": f"{points:+.2f}",
+                "stop": f"{stop_level:.2f}" if stop_level is not None else None,
+                "confirmed": confirmed,
+            },
+        )
+        return {
+            "kind": "STOP_LOSS",
+            "strategy_id": book,
+            "symbol": position["symbol"],
+            "position_id": position["id"],
+            "mark": mark,
+            "stop": stop_level,
+            "points": round(points, 2),
+            "confirmed": confirmed,
+            "reason": result.reason,
+        }
 
     def exit_on_signal(
         self,
@@ -837,7 +1062,7 @@ class StrategyEngine:
                 "symbol": symbol,
                 "qty_lots": settings.default_lots,
                 "strategy": book,
-                "gift_detail": detail,
+                "signal_detail": detail,
             },
             source="OPEN_RECONCILE",
             strategy_id=book,
@@ -906,7 +1131,7 @@ class StrategyEngine:
             # run must follow it rather than read a series that has stopped.
             #
             # The interval is carried across. Rebuilding without it silently
-            # reset the book to the feed's own timeframe: a 15-minute GIFT book
+            # reset the book to the feed's own timeframe: a 15-minute book
             # became 60-minute on the first reconnect, so it reported - and
             # evaluated - the wrong series for the rest of the process's life.
             source = GiftBarSource(get_feed(), interval=source.interval)
@@ -931,8 +1156,8 @@ class StrategyEngine:
         needed = required_bars()
         # The engine-level warm-up counters describe the *active* run, because
         # that is the one the hero panel shows. Writing them from every run let
-        # the last strategy to evaluate win: with a GIFT book on 63 bars and a
-        # NIFTY book on 310, the hero reported 310 bars next to a GIFT signal.
+        # the last strategy to evaluate win: with one book on 63 bars and another
+        # on 310, the hero reported 310 bars next to the first book's signal.
         if run is self.run:
             with self._lock:
                 self.state.warmup_needed = needed
@@ -994,16 +1219,25 @@ class StrategyEngine:
             lag_seconds = round(
                 (datetime.now(db.IST) - closed_aware).total_seconds(), 1
             )
+        # Detection latency: how long after the bar closed the verdict existed.
+        # This is the number the event-driven wake-up exists to shrink, so it is
+        # measured and logged rather than assumed.
+        detect_ms = None
+        if closed_at is not None:
+            detect_ms = round(
+                (datetime.now(db.IST) - closed_aware).total_seconds() * 1000.0, 1
+            )
         log.info(
             "Indicator values strategy=%s source=%s interval_seconds=%s candle_at=%s "
-            "bar_closed_at=%s lag_seconds=%s history_bars=%d ohlc=%s indicators=%s "
-            "signal=%s previous=%s fresh=%s",
+            "bar_closed_at=%s lag_seconds=%s detect_ms=%s history_bars=%d ohlc=%s "
+            "indicators=%s signal=%s previous=%s fresh=%s",
             run.id,
             run.symbol,
             source.seconds,
             newest,
             closed_at.isoformat(timespec="seconds") if closed_at else None,
             lag_seconds,
+            detect_ms,
             verdict.bars,
             json.dumps(ohlc, sort_keys=True),
             json.dumps(verdict.values, sort_keys=True),
@@ -1011,6 +1245,10 @@ class StrategyEngine:
             verdict.previous_signal,
             verdict.fresh,
         )
+        if detect_ms is not None:
+            with self._lock:
+                self.state.latency_detect_ms = detect_ms
+                run.state.latency_detect_ms = detect_ms
 
         evaluated_at = db.iso()
         with self._lock:
@@ -1082,65 +1320,13 @@ class StrategyEngine:
             # *session* boundary, not across the signal dying.
             self._set_pending_signal(None, None, run)
 
-        # The GIFT Nifty index book tracks its own state, one action per signal,
-        # and is settled here rather than beside the futures order. It has no NSE
-        # session - it prices the index, which trades ~20 hours - so gating it on
-        # the 09:15 open would make the two venues disagree on *when* they acted,
-        # which is the one thing that book exists not to do.
-        #
-        # It follows the same *transition* rule as the futures book, for the same
-        # reason: a bar that merely still agrees is not a new signal, so it cannot
-        # reopen a trade the index book just closed. ``execute`` is idempotent when
-        # the book already holds the position, so a repeated action is harmless -
-        # but a repeated action is exactly what must not be sent, because it would
-        # re-enter after an exit.
-        #
-        # The bar that exits under the configured rule settles the book too:
-        # ``FLAT`` closes whatever the index book holds, on the same bar and for
-        # the same reason the futures book closes. A ``NO_SIGNAL`` bar under the
-        # flip rule settles nothing - the book keeps its position through it,
-        # exactly as the futures book does.
-        # On a ``flip`` exit the pair has just turned the other way, so that bar
-        # is a fresh transition and the book reverses into it rather than going
-        # flat. Under ``flat`` the exiting bar carries NO_SIGNAL and there is no
-        # new direction, so it closes. Order matters: the reversal is checked
-        # first because it is both a fresh signal and an exit.
         exit_rule = (params.get("exit") or "flip").strip().lower()
-        if strategy.exits(verdict, exit_rule):
-            gift_action: Optional[str] = (
-                BUY if signal == strategy.BULL else
-                SELL if signal == strategy.BEAR else
-                FLAT
-            )
-        elif verdict.fresh:
-            gift_action = BUY if signal == strategy.BULL else SELL
-        else:
-            gift_action = None
 
         # The exit runs before any entry decision, and on the same bar the pair
         # flipped. It is not gated on the session: a position that is wrong must
         # be closable whenever the signal says so, and blocking an exit would be
         # far worse than blocking an entry.
         exit_report = self.exit_on_signal(verdict, run, params)
-        # The index leg is settled from the *exit rule*, not from whether the
-        # futures book happened to hold something. ``exit_on_signal`` returns
-        # None when the futures leg is empty, and the settlement used to live
-        # only inside the branch below - so a book whose futures leg never filled
-        # (an out-of-session entry, a rejected order, a restart between the two
-        # legs) kept its index position forever. Observed live: gift-15m held
-        # LONG 65 on the index with no futures leg and the flat exit did nothing.
-        #
-        # Settling here is safe when the futures leg *is* open: the branch below
-        # settles again with the same action, and ``GiftBook.execute`` is a no-op
-        # when the book already holds the position it is asked for.
-        if exit_report is None and strategy.exits(verdict, exit_rule):
-            gift_result = self._settle_gift_book(gift_action, verdict, newest, run)
-            if gift_result is not None:
-                return decision(
-                    FLAT,
-                    f"{verdict.detail}; index leg settled, no futures position",
-                    gift_book=gift_result,
-                )
         if exit_report is not None:
             confirmed = exit_report.get("confirmed", True)
             # An unconfirmed exit leaves the old position on the ledger while the
@@ -1152,16 +1338,13 @@ class StrategyEngine:
                     None,
                     "exit signal, but the exit is unconfirmed; retrying next bar",
                     result=exit_report,
-                    gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
                 )
 
             reverse_to = exit_report.get("reverse_to")
-            gift_result = self._settle_gift_book(gift_action, verdict, newest, run)
             if reverse_to is None:
                 # ``flat``: the exiting bar is NO_SIGNAL, so there is no new
                 # direction and the bot goes flat. This is the desired end state.
-                return decision(FLAT, exit_report["detail"], result=exit_report,
-                                gift_book=gift_result)
+                return decision(FLAT, exit_report["detail"], result=exit_report)
 
             # The reversal has to happen on this bar: it is the only fresh
             # transition into the new direction, and the next bar is the same
@@ -1186,7 +1369,6 @@ class StrategyEngine:
                     FLAT,
                     f"{exit_report['detail']}; {entry_action} owed until NSE opens",
                     result=exit_report,
-                    gift_book=gift_result,
                 )
 
             with self._lock:
@@ -1209,7 +1391,6 @@ class StrategyEngine:
                 entry_action,
                 f"{exit_report['detail']}; reversed into {entry_action} on the same bar",
                 result={"exit": exit_report, "entry": entry},
-                gift_book=gift_result,
             )
 
         # The futures decision is what waits for the first in-session bar: an
@@ -1222,7 +1403,6 @@ class StrategyEngine:
             return decision(
                 None,
                 "held until the first bar that closes in-session",
-                gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
             )
 
         # An overnight position is reconciled before the ordinary decision, even
@@ -1236,7 +1416,6 @@ class StrategyEngine:
                     reconciled["action"],
                     reconciled["detail"],
                     result=reconciled,
-                    gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
                 )
 
         if signal == strategy.NO_SIGNAL:
@@ -1246,7 +1425,6 @@ class StrategyEngine:
             return decision(
                 None,
                 "no signal",
-                gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
             )
 
         action = BUY if signal == strategy.BULL else SELL
@@ -1273,7 +1451,6 @@ class StrategyEngine:
             return decision(
                 None,
                 f"{signal} is the existing state, not a new signal; waiting for a transition",
-                gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
             )
 
         # The owed direction and this bar's verdict must agree. They can differ
@@ -1284,7 +1461,6 @@ class StrategyEngine:
             return decision(
                 None,
                 f"owed {owed} entry superseded by {signal}; waiting for a transition",
-                gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
             )
 
         # No separate "restart only primes" guard is needed any more. The
@@ -1301,7 +1477,6 @@ class StrategyEngine:
             return decision(
                 None,
                 "position already matches the verdict",
-                gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
             )
 
         # Portfolio rules, checked last so a refusal is only ever about exposure
@@ -1309,6 +1484,31 @@ class StrategyEngine:
         # are the rules no single strategy can enforce: two books trading one
         # contract net to a single broker position, so an opposing entry would
         # cancel the other book's leg instead of being a separate trade.
+        #
+        # The daily loss cap is checked first: it is the operator's circuit
+        # breaker, and a day that has already hit its limit must not open a new
+        # trade even if the portfolio budget would allow it.
+        try:
+            daily = risk.daily_loss_breach(run.mode(), strategy_id=run.id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Daily loss check failed (%s); refusing the entry", exc)
+            daily = risk.Breach(
+                kind="DAILY_LOSS",
+                detail=f"Could not verify the daily loss limit: {exc}",
+            )
+        if daily is not None:
+            with self._lock:
+                self.state.orders_blocked += 1
+                self.state.last_action = f"{action} blocked (daily loss)"
+                self.state.last_action_at = db.iso()
+                self.state.last_result = {
+                    "ok": False, "action": action, "reason": daily.detail,
+                    "risk": daily.to_dict(),
+                }
+            db.record_signal(action, detail, False, daily.detail, strategy_id=run.id)
+            log.warning("Daily loss limit refused %s: %s", action, daily.detail)
+            return decision(None, daily.detail, risk=daily.to_dict())
+
         try:
             manager = get_order_manager()
             allowed = get_aggregator().authorise(
@@ -1332,7 +1532,7 @@ class StrategyEngine:
                     "portfolio": allowed.to_dict(),
                 }
             db.record_signal(
-                action, f"GIFT {verdict.detail}".strip(), False, allowed.reason,
+                action, detail, False, allowed.reason,
                 strategy_id=run.id,
             )
             log.warning("Portfolio refused %s: %s", action, allowed.reason)
@@ -1340,17 +1540,11 @@ class StrategyEngine:
                 None,
                 allowed.reason,
                 portfolio=allowed.to_dict(),
-                gift_book=self._settle_gift_book(gift_action, verdict, newest, run),
             )
 
         with self._lock:
             self.state.signals_fired += 1
         closed_at = datetime.fromisoformat(newest) + timedelta(seconds=source.seconds)
-        # The index book settles on the *same* bar with the *same* verdict, so the
-        # two books differ only in venue and hours - never in when they acted. It
-        # can never go live (GIFT Nifty is a non-tradeable index), and it is
-        # settled first so a futures rejection cannot starve it of signals.
-        gift_result = self._settle_gift_book(gift_action, verdict, newest, run)
         result = self.execute(
             action,
             verdict.detail,
@@ -1366,69 +1560,13 @@ class StrategyEngine:
             signal_candle=getattr(verdict, "signal_candle", None),
             run=run,
         )
-        self._report_partial_legs(action, result, gift_result, run, newest)
         # The latch is cleared only once the entry is actually on the ledger. A
         # rejected or unfilled order leaves it owed, so the next bar tries again
         # instead of the signal being silently consumed by a failed attempt.
         if isinstance(result, dict) and result.get("ok"):
             self._set_pending_signal(None, None, run)
         return {"ok": True, "signal": signal, "detail": verdict.detail, "action": action,
-                "result": result, "gift_book": gift_result}
-
-    def _report_partial_legs(
-        self,
-        action: str,
-        futures_result: Optional[dict[str, Any]],
-        gift_result: Optional[dict[str, Any]],
-        run: Optional[StrategyRun],
-        bar_at: str,
-    ) -> Optional[dict[str, Any]]:
-        """Say out loud when a two-leg strategy filled only one leg.
-
-        A strategy carrying one signal on two venues has two independent fills,
-        and either can fail on its own: the index book is priced off a quote and
-        the futures order goes to a broker. Treating "the strategy acted" as one
-        outcome is what makes a half-filled strategy invisible - the tile shows a
-        position and the operator never learns the other leg was rejected.
-
-        Nothing is retried here. A rejected futures order is re-attempted by the
-        normal path (the owed-entry latch is deliberately left set when the
-        futures leg fails), and the index book is settled per-bar by its own
-        transition rule. What this adds is the *report*, so a partial fill is a
-        recorded fact rather than an inference from two unrelated logs.
-        """
-        if run is None or len(run.legs) < 2:
-            return None
-        filled = []
-        failed = []
-        if "futures" in run.legs:
-            ok = bool(isinstance(futures_result, dict) and futures_result.get("ok"))
-            # A skipped futures leg is not a failure: the book was told not to
-            # trade it, so there was no order to place.
-            skipped = bool(isinstance(futures_result, dict) and futures_result.get("skipped"))
-            (filled if ok or skipped else failed).append("futures")
-        if "gift" in run.legs:
-            (filled if gift_result else failed).append("gift")
-        if not failed or not filled:
-            # All legs acted, or none did - both are ordinary and already logged
-            # by the leg that did or did not run.
-            return None
-        reason = (
-            f"Partial execution for {run.id} on bar {bar_at}: {action} filled on "
-            f"{', '.join(filled)} but not on {', '.join(failed)}. The legs are "
-            f"independent; the missing one retries on its own next bar."
-        )
-        log.error("%s", reason)
-        with self._lock:
-            run.state.last_error = reason
-        try:
-            db.record_signal(
-                action, f"PARTIAL {reason}", False, reason, strategy_id=run.id,
-            )
-        except Exception:  # pragma: no cover - defensive
-            log.warning("Could not record the partial-leg signal for %s", run.id)
-        return {"filled": filled, "failed": failed, "reason": reason}
-
+                "result": result}
 
     def _position_needs_action(
         self, direction: int, run: Optional[StrategyRun] = None
@@ -1454,63 +1592,6 @@ class StrategyEngine:
         )
         return quantity * direction <= 0
 
-    def _settle_gift_book(
-        self,
-        action: Optional[str],
-        verdict: strategy.StrategyVerdict,
-        bar_at: str,
-        run: Optional[StrategyRun] = None,
-    ) -> Optional[dict[str, Any]]:
-        """Route a signal into the GIFT Nifty index book, if it is switched on.
-
-        The bar's own close is the reference price, so the index book needs no
-        quote and cannot be blocked by a missing execution price. Bounded and
-        non-fatal: an index-book problem must not stop the futures order.
-
-        ``action`` is ``BUY``/``SELL`` for a bar that *became* directional and
-        ``FLAT`` for the bar the pair stopped agreeing - the same transition rules
-        the futures book follows, which is what keeps the two books from drifting
-        apart in when they act. ``None`` means the bar changed nothing, so the
-        book is left exactly as it is.
-        """
-        if action is None:
-            return None
-        # The index book is a single paper book priced on the GIFT Nifty level,
-        # so only the GIFT-signalled strategy may settle it. Without this guard
-        # every strategy settles the same book: a NIFTY-signalled run would
-        # drive a GIFT-priced ledger, and two runs would each read the other's
-        # position as their own.
-        if run is not None and not isinstance(run.source, GiftBarSource):
-            return None
-        # And only if this strategy asked for the index leg at all. A book
-        # configured ``LEGS=futures`` trades the future alone; settling a GIFT
-        # ledger for it would report a position the operator never configured.
-        if run is not None and not run.trades_gift:
-            return None
-        try:
-            from gift_book import get_gift_book
-
-            # This strategy's own book. A shared one let the 15-minute book read
-            # the 60-minute book's position as its own, close it, and report P&L
-            # that belonged to neither.
-            book = get_gift_book(run.id if run is not None else None)
-            if not book.enabled:
-                return None
-            # The strategy id the leg is booked under comes from the book itself
-            # (``get_gift_book(run.id)``), so a leg can be traced back to the
-            # strategy that opened it rather than to the process.
-            return book.execute(
-                action,
-                verdict.close,
-                bar_at=bar_at,
-                detail=f"{verdict.detail} | bar {bar_at}",
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            log.exception("GIFT index book settlement failed")
-            with self._lock:
-                self.state.last_error = f"gift index book: {exc}"
-            return None
-
     def _signal_max_age(self, run: Optional[StrategyRun] = None) -> int:
         """How stale a signal may be before the broker refuses it.
 
@@ -1521,7 +1602,7 @@ class StrategyEngine:
         the bar. One and a half bars covers the engine poll and execution while
         still refusing anything that outlived a full bar plus half.
 
-        Measured from the book's own bar length, not the GIFT interval setting:
+        Measured from the book's own bar length, not a global interval setting:
         with books on different timeframes, one global figure would expire the
         60-minute book's signals three quarters of an hour before they are stale,
         or let the 15-minute book's through long after its bar has gone.
@@ -1544,7 +1625,7 @@ class StrategyEngine:
         signal_candle: Optional[dict[str, Any]] = None,
         run: Optional[StrategyRun] = None,
     ) -> dict[str, Any]:
-        """Place a signal, using a GIFT-close fill only for after-hours PAPER.
+        """Place a signal, filling from the future's own quote.
 
         ``signal_candle`` is the completed bar the signal came from. It is
         forwarded for the audit trail, so the order can be traced back to the bar
@@ -1557,32 +1638,11 @@ class StrategyEngine:
         """
         book = run.id if run is not None else self.strategy_id
         manager = get_order_manager()
-        # A book configured with only the paper index leg must not place a
-        # futures order. Without this, ``LEGS=gift`` still traded the future: the
-        # operator's leg list said one instrument and the bot traded another.
-        # Exits are deliberately not gated this way - a position that is already
-        # on the futures ledger has to be closable whatever the config now says.
-        if run is not None and not run.trades_futures:
-            reason = (
-                f"{action} not placed: {book} executes on "
-                f"{'/'.join(run.legs)} only, with no futures leg"
-            )
-            log.info("%s", reason)
-            db.record_signal(action, detail or reason, True, reason, strategy_id=book)
-            with self._lock:
-                run.state.last_action = f"{action} (no futures leg)"
-                run.state.last_action_at = db.iso()
-                run.state.last_result = {
-                    "ok": True, "action": action, "reason": reason, "skipped": True,
-                }
-            return {"ok": True, "action": action, "reason": reason, "skipped": True}
         # This book's mode, not the bot's. A run that did not opt into live keeps
-        # its paper ledger even when the bot is armed, which is what lets the GIFT
-        # book carry on unchanged beside a live NIFTY book.
+        # its paper ledger even when the bot is armed.
         mode = run.mode() if run is not None else get_execution_mode()
         symbol = manager.current_symbol()
         market = market_status()
-        paper_after_hours = mode == PAPER and not market["is_open"]
 
         # A contract that has stopped trading cannot fill anything. Refusing here
         # covers both modes, so a stale-symbol PAPER entry cannot silently book a
@@ -1609,7 +1669,7 @@ class StrategyEngine:
                 self.state.last_action = f"{action} blocked (expired contract)"
                 self.state.last_action_at = db.iso()
                 self.state.last_result = {"ok": False, "action": action, "reason": reason}
-            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
+            db.record_signal(action, detail, False, reason, strategy_id=book)
             log.error("%s", reason)
             return {"ok": False, "reason": reason, "expired": True}
 
@@ -1629,39 +1689,28 @@ class StrategyEngine:
                 self.state.last_action = f"{action} blocked (expiry unresolved)"
                 self.state.last_action_at = db.iso()
                 self.state.last_result = {"ok": False, "action": action, "reason": reason}
-            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
+            db.record_signal(action, detail, False, reason, strategy_id=book)
             log.error("%s", reason)
             return {"ok": False, "reason": reason, "expired": True}
 
-        if not market["is_open"] and not paper_after_hours:
+        # Both LIVE and PAPER trade only inside the NSE session. A signal that
+        # closes outside it is deferred and dropped, never queued for the open:
+        # firing a stale signal into the next session is worse than missing it.
+        if not market["is_open"]:
             with self._lock:
                 self.state.deferred += 1
                 self.state.last_action = f"{action} deferred"
                 self.state.last_action_at = db.iso()
             reason = (
-                f"{action} signal from GIFT Nifty held: NSE F&O closed "
+                f"{action} signal held: NSE F&O closed "
                 f"({market['reason']}). Not auto-firing later."
             )
-            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
+            db.record_signal(action, detail, False, reason, strategy_id=book)
             with self._lock:
                 self.state.last_result = {"ok": False, "action": action, "reason": reason,
                                           "deferred": True}
             log.warning("%s", reason)
             return {"ok": False, "deferred": True, "reason": reason}
-
-        if paper_after_hours and (
-            paper_reference_price is None
-            or paper_reference_price <= 0
-            or signal_timestamp is None
-        ):
-            reason = "After-hours PAPER signal needs a closed-candle price and timestamp"
-            with self._lock:
-                self.state.orders_blocked += 1
-                self.state.last_error = reason
-                self.state.last_result = {"ok": False, "action": action, "reason": reason}
-            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
-            log.error("%s", reason)
-            return {"ok": False, "reason": reason}
 
         # This book's pause, not just the global one. A book paused from its own
         # tile must stop on its own signal - waiting for the order manager to
@@ -1676,22 +1725,17 @@ class StrategyEngine:
                 f"{action} blocked: {book} paused "
                 f"({detail_reason(book) or 'PAUSED'})"
             )
-            db.record_signal(action, f"GIFT {verdict.detail}".strip(), False, reason)
+            db.record_signal(action, detail, False, reason, strategy_id=book)
             log.warning("%s", reason)
             return {"ok": False, "reason": reason}
 
         # The fill is the *future's* price, always - never the signal source's.
-        # GIFT Nifty is an index that cannot be traded, so booking an entry at its
-        # level writes the index/future basis straight into the position: the row
-        # opens already showing a P&L that no trade produced, and the paper book
-        # disagrees with the very LTP the dashboard shows for the same contract.
-        # Filled and marked from one instrument, the row only ever reports what
-        # the position itself did.
-        #
-        # `paper_reference_price` is still required for an after-hours fill, as
-        # evidence that a completed candle exists to act on, but it is no longer
-        # the price at which anything is booked: the order manager resolves the
-        # fill from the future's own quote.
+        # The signal series is an index that cannot be traded, so booking an entry
+        # at its level writes the index/future basis straight into the position:
+        # the row opens already showing a P&L that no trade produced, and the
+        # paper book disagrees with the very LTP the dashboard shows for the same
+        # contract. Filled and marked from one instrument, the row only ever
+        # reports what the position itself did.
         payload: dict[str, Any] = {
             "action": action,
             "symbol": symbol,
@@ -1700,13 +1744,19 @@ class StrategyEngine:
             # tracks the active run only, so a 60-minute book's order was stamped
             # with the 15-minute book's bar - and the duplicate guard then
             # compared it against the wrong row.
-            "signal_id": f"GIFT-{action}-{book}-{run.state.last_bar_at if run is not None else self._last_bar_at}",
+            "signal_id": f"NIFTY-{action}-{book}-{run.state.last_bar_at if run is not None else self._last_bar_at}",
             "strategy": book,
-            "source": "GIFT_NIFTY_ENGINE",
-            "gift_detail": detail,
-            "paper_after_hours": paper_after_hours,
+            "source": "NIFTY_ENGINE",
+            "signal_detail": detail,
             "max_age_seconds": max_age_seconds or self._signal_max_age(),
         }
+        # The protective stop, computed from the book's own rules. The order
+        # manager places it at the fill, so the level is relative to the price
+        # the broker actually gave rather than to the signal close. A book with
+        # no stop configured sends nothing and keeps the signal-only exit.
+        rules = getattr(run, "stop_rules", None) if run is not None else None
+        if rules is not None and rules.enabled:
+            payload["stop_rules"] = rules.to_dict()
         if signal_timestamp is not None:
             payload["timestamp"] = signal_timestamp.astimezone(IST).isoformat()
         # The completed signal bar, for the audit trail. Only the bar the signal
@@ -1714,11 +1764,10 @@ class StrategyEngine:
         # had it.
         if signal_candle:
             payload["signal_candle"] = signal_candle
-        # `price` is deliberately NOT set to the GIFT close. A payload price is
-        # treated as an after-hours *fill* reference, so stamping the index level
-        # there is what put the basis into every pre-market entry. `/api/signal`
-        # callers may still supply one for the close-only webhook and mirror
-        # paths, but the engine fills from the future's own quote.
+        # `price` is deliberately NOT set to the signal close. A payload price is
+        # treated as a fill reference, so stamping the index level there is what
+        # put the basis into every entry. `/api/signal` callers may still supply
+        # one, but the engine fills from the future's own quote.
 
         try:
             result = manager.process_signal(
@@ -1731,13 +1780,38 @@ class StrategyEngine:
             return {"ok": False, "reason": f"execution error: {exc}"}
 
         data = result.to_dict()
+        # Broker round-trip for this order, from the order manager's own timing.
+        # Recorded on the book and on the engine so the dashboard can show it per
+        # strategy and in the header.
+        details = data.get("details") or {}
+        submit_ms = details.get("submit_ms")
         with self._lock:
             self.state.orders_sent += 1 if result.ok else 0
             self.state.orders_blocked += 0 if result.ok else 1
             self.state.last_action = action
             self.state.last_action_at = db.iso()
             self.state.last_result = data
-        log.info("Engine %s -> ok=%s %s", action, result.ok, result.reason)
+            if submit_ms is not None:
+                self.state.latency_submit_ms = submit_ms
+                self.state.latency_ack_ms = submit_ms
+                self.state.latency_fill_ms = submit_ms if result.ok else None
+                self.state.latency_samples.append({
+                    "at": db.iso(),
+                    "strategy_id": book,
+                    "action": action,
+                    "detect_ms": self.state.latency_detect_ms,
+                    "submit_ms": submit_ms,
+                    "ok": result.ok,
+                })
+                del self.state.latency_samples[:-50]
+                if run is not None:
+                    run.state.latency_submit_ms = submit_ms
+                    run.state.latency_ack_ms = submit_ms
+                    run.state.latency_fill_ms = submit_ms if result.ok else None
+        log.info(
+            "Engine %s -> ok=%s %s (broker round-trip %sms)",
+            action, result.ok, result.reason, submit_ms,
+        )
         # Tell the operator a trade opened. Without this the only messages are
         # problems, so a working bot is indistinguishable from a dead one - and
         # the first thing anyone asks after a signal is "did it take it?".
@@ -1772,32 +1846,53 @@ class StrategyEngine:
 
     # -- loop ------------------------------------------------------------
     def loop(self, stop: threading.Event, interval: Optional[float] = None) -> None:
-        """Evaluate whenever a new GIFT Nifty bar closes.
+        """Evaluate the moment a bar closes, not on the next poll.
 
-        The loop is cheap: :meth:`evaluate_now` returns immediately unless the
-        newest bar timestamp changed, so a short poll interval costs one
-        comparison, not a re-evaluation.
+        The feed sets ``bar_closed`` from the tick thread as soon as a candle
+        completes, so the engine wakes immediately rather than waiting up to a
+        full poll interval. That interval is the single largest avoidable delay
+        in the signal path: at 5 s it added up to 5 s to every entry, and the
+        order itself takes a few hundred milliseconds.
+
+        The poll is kept as a *fallback*, not the mechanism. It still runs, at
+        the configured interval, because a source that cannot signal (the NIFTY
+        spot book reads REST history and has no tick subscription) and a missed
+        wake-up both need a safety net. So the loop waits on the event with a
+        timeout: whichever comes first, a close or the timeout, triggers an
+        evaluation.
+
+        Evaluation is still guarded by the bar timestamp, so a spurious wake-up
+        costs one comparison and never re-evaluates a bar it has already seen.
         """
         period = float(interval if interval is not None else settings.engine_interval_seconds)
         with self._lock:
             self.state.interval_seconds = period
-        log.info("Strategy engine started (poll %.1fs, GIFT Nifty bars)", period)
-        while not stop.wait(period):
+        log.info("Strategy engine started (event-driven, poll fallback %.1fs)", period)
+        while not stop.is_set():
+            # Wait for a bar close, or the poll interval, whichever is first.
+            # ``wait`` returns True when the event was set, False on timeout.
+            woke = self._wait_for_bar(stop, period)
+            if stop.is_set():
+                break
+            if woke:
+                log.debug("Engine woken by a bar close")
+                # A close makes the history fetch due now. Without this the
+                # engine would evaluate the series it already had and only see
+                # the new bar on the next throttled refresh - up to 30 s later,
+                # which is the delay the wake-up exists to remove.
+                try:
+                    feed = get_feed()
+                    due = getattr(feed, "history_due", None)
+                    if due is not None and due.is_set():
+                        feed.refresh_history(force=True)
+                except Exception:  # pragma: no cover - defensive
+                    log.exception("Forced history refresh after a bar close failed")
             try:
                 self.enforce_rollover()
             except Exception as exc:  # pragma: no cover - defensive
                 log.exception("Rollover check failed")
                 with self._lock:
                     self.state.last_error = f"rollover check: {exc}"
-            # Keep the shadow book in step with the live one. Cheap when the
-            # mirror is off or the two already agree, so it rides the same clock
-            # as the strategy rather than owning a thread.
-            try:
-                from paper_mirror import get_mirror
-
-                get_mirror().reconcile()
-            except Exception as exc:  # pragma: no cover - defensive
-                log.exception("Mirror reconcile failed")
             # Every configured strategy is evaluated on the same tick. One book
             # raising must not stop the others: they are independent strategies,
             # and a failure in one is not a reason to go blind in the rest.
@@ -1809,6 +1904,29 @@ class StrategyEngine:
                     with self._lock:
                         run.state.last_error = str(exc)
         log.info("Strategy engine stopped")
+
+    def _wait_for_bar(self, stop: threading.Event, period: float) -> bool:
+        """Block until a bar closes, the poll interval elapses, or ``stop``.
+
+        Returns True when a bar close woke the loop. The event is cleared here
+        rather than by the setter, so a close that arrives while the loop is
+        evaluating is not lost: it stays set and the next wait returns at once.
+        """
+        feed = get_feed()
+        event = getattr(feed, "bar_closed", None)
+        if event is None:
+            # A source with no wake signal (or a test stub): fall back to the
+            # poll. ``stop.wait`` keeps shutdown responsive.
+            return not stop.wait(period)
+        deadline = time.monotonic() + period
+        while not stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if event.wait(min(remaining, 0.5)):
+                event.clear()
+                return True
+        return False
 
     def start(self) -> None:
         self._stop.clear()
@@ -1921,6 +2039,17 @@ class StrategyEngine:
         payload["will_execute"] = bool(market["is_open"] or mode == PAPER)
         payload["paused"] = get_order_manager().paused
         payload["paused_reason"] = get_order_manager().paused_reason
+        # The emergency latch and the daily cap, so the watchdog and the
+        # dashboard see the same state the entry gate enforces. getattr because
+        # tests stub the manager with a partial namespace.
+        manager = get_order_manager()
+        payload["stopped_all"] = bool(getattr(manager, "stopped_all", False))
+        payload["stopped_all_reason"] = getattr(manager, "stopped_all_reason", "") or ""
+        try:
+            payload["daily_loss"] = risk.daily_loss_state(mode)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Could not read the daily loss state: %s", exc)
+            payload["daily_loss"] = None
         payload["risk"] = risk.limits()
         # The session's realised result against the cap, so the dashboard can
         # show how much room is left rather than only that entries are blocked.

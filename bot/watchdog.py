@@ -154,6 +154,15 @@ class Watchdog:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Feed supervision. The SDK reconnects a dropped websocket, but it
+        # cannot recover a dead reactor or a ticker thread that never started -
+        # and in both cases the process stays up, the API answers, and the bot
+        # simply stops seeing prices. Restarting the feed is the only recovery,
+        # so it is attempted here, bounded, rather than left to a human noticing.
+        self._feed_restarts = 0
+        self._last_feed_restart = 0.0
+        self.max_feed_restarts = 5
+        self.feed_restart_cooldown = 300.0
 
     # -- checks ----------------------------------------------------------
     def check(
@@ -276,6 +285,39 @@ class Watchdog:
                     severity="warning",
                     reason=engine.get("paused_reason") or "no reason given",
                     action_required="Resume from the dashboard once the cause is understood.",
+                )
+            )
+
+        # The emergency latch. Critical, not a warning: it is engaged only when
+        # something is wrong, and it blocks every entry until a human clears it.
+        if engine.get("stopped_all"):
+            alerts.append(
+                _alert(
+                    "STOP_ALL",
+                    f"Emergency STOP ALL is engaged: "
+                    f"{engine.get('stopped_all_reason') or 'no reason given'}. "
+                    f"No new entry will be taken in any book until it is cleared.",
+                    severity="critical",
+                    reason=engine.get("stopped_all_reason") or "no reason given",
+                    action_required="Resolve the incident, then clear STOP ALL from the dashboard.",
+                )
+            )
+
+        # The daily loss cap. Reported once it trips, because from that moment
+        # the bot will refuse every entry and otherwise look like a strategy that
+        # has simply stopped firing.
+        daily = engine.get("daily_loss") or {}
+        if isinstance(daily, dict) and daily.get("breached"):
+            alerts.append(
+                _alert(
+                    "DAILY_LOSS_LIMIT",
+                    f"Daily loss limit reached: Rs {float(daily.get('loss') or 0):,.0f} "
+                    f"lost today (limit Rs {float(daily.get('limit') or 0):,.0f}). "
+                    f"New entries are blocked until the next session.",
+                    severity="critical",
+                    loss=f"Rs {float(daily.get('loss') or 0):,.0f}",
+                    limit=f"Rs {float(daily.get('limit') or 0):,.0f}",
+                    action_required="No action needed to protect capital; review the day's trades.",
                 )
             )
 
@@ -475,6 +517,51 @@ class Watchdog:
         return alerts
 
     # -- loop ------------------------------------------------------------
+    def _supervise_feed(self, feed: dict[str, Any], market_open: bool) -> Optional[str]:
+        """Restart the tick feed when it is dead, not merely reconnecting.
+
+        The SDK's own ``reconnect=True`` covers a dropped websocket. It does not
+        cover the two failures that leave the process healthy and the bot blind:
+        the reactor thread dying, and the ticker never starting at all. In both
+        cases ``running`` is False while the process is up, and nothing else in
+        the bot will ever bring it back.
+
+        Bounded on purpose. A feed that cannot start is usually a bad token or a
+        network outage, and restarting it every 30 seconds would flood the log
+        and the alert channel without fixing anything. After
+        ``max_feed_restarts`` attempts the watchdog stops trying and says so,
+        which is the point at which a human has to look.
+
+        Returns a short description when a restart was attempted, else ``None``.
+        """
+        if not market_open:
+            # Out of hours the feed is idle by design; a restart would be noise.
+            return None
+        if feed.get("running"):
+            return None
+        now = time.time()
+        if now - self._last_feed_restart < self.feed_restart_cooldown:
+            return None
+        if self._feed_restarts >= self.max_feed_restarts:
+            return None
+        self._last_feed_restart = now
+        self._feed_restarts += 1
+        try:
+            import bot as bot_module
+
+            result = bot_module._start_gift_feed(reconnect=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("Feed restart failed")
+            return f"feed restart raised: {exc}"
+        log.warning(
+            "Watchdog restarted the tick feed (attempt %d/%d): %s",
+            self._feed_restarts, self.max_feed_restarts, result,
+        )
+        return (
+            f"feed restart attempt {self._feed_restarts}/{self.max_feed_restarts}: "
+            f"{result.get('error') or 'requested'}"
+        )
+
     def loop(self, stop: threading.Event, interval: float = 30.0) -> None:
         import database as db
         from engine import get_engine
@@ -489,9 +576,17 @@ class Watchdog:
                 # The full status payload, so the checks see the same figures the
                 # dashboard does - Kite auth lives beside `engine`, not inside it.
                 status = bot_module.api_status()
+                market_open = bool(market_status().get("is_open"))
+                feed_status = get_feed().status()
+                # Recover a dead feed before reporting on it, so the alert that
+                # follows describes the state after the attempt rather than the
+                # one that triggered it.
+                restarted = self._supervise_feed(feed_status, market_open)
+                if restarted:
+                    feed_status = get_feed().status()
                 self.run_once(
-                    market_open=bool(market_status().get("is_open")),
-                    feed=get_feed().status(),
+                    market_open=market_open,
+                    feed=feed_status,
                     engine=status.get("engine") or {},
                     kite=status.get("kite") or {},
                     # The mark loop's own heartbeat. It lives beside `engine` in

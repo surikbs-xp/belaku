@@ -669,8 +669,13 @@ body {
    narrow pane still stacks them. */
 .book-bands-wrap { container-type: inline-size; }
 
+/* `auto-fit` rather than a fixed two columns. Both books trade the same
+   instrument, so there is normally exactly one group - and a hardcoded
+   `repeat(2, ...)` left it occupying the left half of the page with the right
+   half empty. `auto-fit` collapses the unused track, so one group fills the
+   width and two would still sit side by side. */
 @container (min-width: 900px) {
-  .book-bands { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .book-bands { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
 }
 
 .book-group {
@@ -711,14 +716,20 @@ body {
   letter-spacing: 0.04em;
 }
 
-/* One book per row inside a column. Side by side would make each tile half a
-   column wide - too narrow for the rule rows - and the column already sets the
-   instrument, so the row order (15m above 60m) is what carries the comparison. */
+/* The two books sit side by side once the group is wide enough to give each
+   tile a readable width. Stacked, they left the right half of a full-width
+   group empty and forced the reader to scroll to compare 15m against 60m -
+   which is the comparison the group exists to make. Below the breakpoint they
+   stack, because a half-width tile cannot hold the rule rows. */
 .book-group-tiles {
   display: grid;
   gap: 0.55rem;
   grid-template-columns: 1fr;
   align-content: start;
+}
+
+@container (min-width: 860px) {
+  .book-group-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .book-band {
@@ -822,6 +833,99 @@ body {
 .book-pause.is-paused:hover:not(:disabled) {
   background: rgba(245, 158, 11, 0.2);
 }
+
+/* Per-book mode toggle and square-off, beside Pause. The mode button carries the
+   book's own LIVE/PAPER state, so the control and the label are the same thing -
+   a separate chip plus a switch would let the two disagree. */
+.book-mode-toggle,
+.book-square-off {
+  font-size: 0.58rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.36rem;
+  border-radius: 0.28rem;
+  border: 1px solid var(--edge);
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--ink-2);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.book-mode-toggle:hover:not(:disabled),
+.book-square-off:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--ink-0);
+}
+
+.book-mode-toggle:disabled,
+.book-square-off:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* LIVE reads red: it is the state that spends real money. PAPER reads neutral. */
+.book-mode-toggle.is-live {
+  color: var(--bad);
+  border-color: rgba(244, 63, 94, 0.45);
+  background: rgba(244, 63, 94, 0.12);
+}
+
+.book-mode-toggle.is-live:hover:not(:disabled) {
+  background: rgba(244, 63, 94, 0.2);
+}
+
+.book-square-off {
+  color: var(--warn);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.book-square-off:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--warn);
+}
+
+/* Manual BUY/SELL. Grouped so they read as one control, and coloured by side
+   because the direction is the one thing the operator must not misread. */
+.book-manual {
+  display: inline-flex;
+  gap: 0.16rem;
+}
+
+.book-manual-buy,
+.book-manual-sell {
+  font-size: 0.58rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.36rem;
+  border-radius: 0.28rem;
+  border: 1px solid var(--edge);
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--ink-2);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.book-manual-buy {
+  color: var(--good);
+  border-color: rgba(34, 197, 94, 0.35);
+}
+
+.book-manual-buy:hover:not(:disabled) {
+  background: rgba(34, 197, 94, 0.16);
+  color: var(--good);
+}
+
+.book-manual-sell {
+  color: var(--bad);
+  border-color: rgba(244, 63, 94, 0.35);
+}
+
+.book-manual-sell:hover:not(:disabled) {
+  background: rgba(244, 63, 94, 0.16);
+  color: var(--bad);
+}
+
+.book-manual-buy:disabled,
+.book-manual-sell:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .book-band-headline {
   display: flex;
@@ -1061,218 +1165,6 @@ body {
   display: grid;
   gap: 0.22rem;
   padding: 0.3rem 0.65rem;
-}
-
-/* Execution legs: one card per venue a strategy carries its signal on.
-   Rendered only when a book has more than one leg - a single-leg book would
-   repeat its own footer in a card of the same numbers. */
-.book-leg-cards {
-  display: grid;
-  gap: 0.4rem;
-  padding: 0.35rem 0.65rem;
-  grid-template-columns: 1fr;
-}
-
-/* Side by side once the tile is wide enough for two readable cards. The cards
-   are compared, so putting them in one row is the point - stacking them forced
-   the reader to scroll to see the leg they were comparing against.
-
-   The query is unnamed on a container declared on .book-group-tiles' own
-   wrapper, because an element cannot restyle itself from its own container
-   query: `container-type` on .book-leg-cards would leave the rule inert. */
-.book-band-split { container-type: inline-size; }
-
-/* 26rem: below that each card of a pair is under ~200px and the level grid
-   collapses to one column of truncated numbers. At or above it every level fits,
-   so the pair sits side by side - which is the point, since the two legs are
-   read against each other. */
-@container (min-width: 26rem) {
-  .book-leg-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-
-.leg-card {
-  border: 1px solid var(--edge-soft);
-  border-radius: 0.5rem;
-  background: rgba(10, 15, 28, 0.5);
-  padding: 0.4rem 0.5rem;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-}
-
-/* The two venues are told apart by the rail, not by a word: one leg reaches a
-   broker and one can only ever be paper, and that is the difference that
-   matters when reading the pair. */
-.leg-card.is-futures { border-left: 2px solid color-mix(in srgb, var(--info, #38bdf8) 60%, transparent); }
-.leg-card.is-gift { border-left: 2px solid var(--edge); }
-
-.leg-card-head {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  flex-wrap: wrap;
-}
-
-.leg-card-venue {
-  font-size: 0.62rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--ink-1);
-}
-
-.leg-card-note {
-  font-size: 0.55rem;
-  color: var(--ink-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.leg-card-head .book-band-mode { margin-left: auto; }
-
-.leg-card-position {
-  display: flex;
-  align-items: baseline;
-  gap: 0.3rem;
-}
-
-/* Unrealised P&L sits on the position line: it is the number that changes and
-   the one the position is judged by, so it belongs beside the side and size
-   rather than in a footer row. */
-.leg-card-open {
-  margin-left: auto;
-  font-size: 0.84rem;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* A flat leg, stated in words instead of four columns of em-dashes. What the
-   operator needs from it is where the leg would act. */
-.leg-card-flat {
-  display: flex;
-  align-items: baseline;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-}
-
-.leg-card-flat-state {
-  font-size: 0.86rem;
-  font-weight: 600;
-  color: var(--ink-2);
-}
-
-.leg-card-flat-flip {
-  font-size: 0.64rem;
-  color: var(--ink-3);
-  white-space: nowrap;
-}
-
-.leg-card-flat-flip strong {
-  color: var(--ink-1);
-  font-variant-numeric: tabular-nums;
-}
-
-.leg-card-flat-note {
-  margin: 0;
-  font-size: 0.6rem;
-  color: var(--ink-3);
-  line-height: 1.35;
-}
-
-.leg-card-side {
-  font-size: 0.86rem;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-
-.leg-card-side.is-long { color: var(--good); }
-.leg-card-side.is-short { color: var(--bad); }
-.leg-card-side.is-flat { color: var(--ink-3); font-weight: 500; }
-
-.leg-card-extra {
-  font-size: 0.55rem;
-  font-weight: 700;
-  color: var(--warn);
-  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
-  border-radius: 0.2rem;
-  padding: 0 0.2rem;
-}
-
-/* Auto-fit rather than four fixed columns: at a narrow width two rows of two
-   keeps every level readable instead of truncating 25,275.81 into an ellipsis. */
-.leg-card-levels {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(4.6rem, 1fr));
-  gap: 0.25rem;
-  margin: 0;
-}
-
-.leg-card-levels > div { min-width: 0; }
-
-.leg-card-levels dt {
-  font-size: 0.52rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--ink-3);
-  margin: 0;
-}
-
-.leg-card-levels dd {
-  margin: 0;
-  font-size: 0.72rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  color: var(--ink-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.leg-card-foot {
-  display: flex;
-  align-items: baseline;
-  gap: 0.3rem;
-  border-top: 1px solid var(--edge-soft);
-  padding-top: 0.28rem;
-}
-
-.leg-card-foot-note {
-  margin-left: auto;
-  font-size: 0.58rem;
-  color: var(--ink-3);
-  white-space: nowrap;
-}
-
-/* A flat leg has nothing to compare, so its rail is muted rather than carrying
-   the venue colour - there is no open position to tell apart. */
-.leg-card.is-flat.is-futures { border-left-color: var(--edge); }
-
-.leg-card-foot-item {
-  display: flex;
-  align-items: baseline;
-  gap: 0.28rem;
-  min-width: 0;
-}
-
-.leg-card-foot-label {
-  font-size: 0.52rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--ink-3);
-  white-space: nowrap;
-}
-
-.leg-card-foot-value {
-  font-size: 0.74rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  color: var(--ink-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .book-band-rule {
@@ -2229,44 +2121,6 @@ select.field { appearance: none; }
   color: var(--ink-3);
 }
 
-/* Per-leg score under a book's blended figures. A two-leg book's single Net P&L
-   is the sum of two positions that can point opposite ways, so the halves have
-   to be visible or a working leg carrying a losing one reads as one mediocre
-   strategy. */
-.perf-book-legs {
-  display: grid;
-  gap: 0.2rem;
-  border-top: 1px solid var(--edge-soft);
-  padding-top: 0.3rem;
-}
-
-.perf-book-leg {
-  display: flex;
-  align-items: baseline;
-  gap: 0.4rem;
-  font-size: 0.64rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.perf-book-leg-venue {
-  font-weight: 600;
-  color: var(--ink-2);
-  white-space: nowrap;
-}
-
-.perf-book-leg-note {
-  color: var(--ink-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.perf-book-leg-pnl {
-  margin-left: auto;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
 .perf-book-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2427,20 +2281,6 @@ select.field { appearance: none; }
   color: var(--ink-3);
   font-family: ui-monospace, SFMono-Regular, monospace;
   white-space: nowrap;
-}
-
-/* The venue of one leg, shown only when a book holds more than one. A two-leg
-   book holds a future and an index at once, so a single group heading would have
-   to be wrong for one of them. */
-.pos-venue {
-  font-size: 0.55rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  color: var(--ink-3);
-  border: 1px solid var(--edge);
-  border-radius: 0.2rem;
-  padding: 0 0.2rem;
-  margin-left: 0.2rem;
 }
 
 .pos-group-subtotal {
@@ -3263,4 +3103,410 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
   font-size: 0.72rem;
   font-variant-numeric: tabular-nums;
   color: var(--ink-3);
+}
+
+/* ── Stop-loss editing ──────────────────────────────────────────────────
+   The stop cell becomes interactive only when a position is open, because a
+   flat book has no level to move. The button is deliberately small and quiet:
+   it changes the protection on a live position, so it should be findable but
+   not the thing the eye lands on. */
+.book-band-stop.is-editable {
+  align-items: center;
+}
+
+.book-stop-edit {
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.3rem;
+  background: rgba(56, 189, 248, 0.08);
+  color: var(--brand);
+  font-size: 0.58rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.book-stop-edit:hover {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: var(--brand);
+}
+
+.book-stop-edit:disabled,
+.book-stop-edit.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: transparent;
+  border-color: var(--edge-soft);
+  color: var(--ink-3);
+}
+
+.book-stop-edit:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+/* ── NIFTY 50 group ─────────────────────────────────────────────────────
+   The group is the instrument, and both books trade it. Giving it a header
+   that states the shared facts once - instrument, venue, how many books - is
+   what stops the two tiles below from repeating them and reading as two
+   unrelated strategies. */
+.book-group {
+  border-color: rgba(56, 189, 248, 0.22);
+  background:
+    linear-gradient(180deg, rgba(56, 189, 248, 0.05), transparent 120px),
+    rgba(10, 15, 28, 0.4);
+}
+
+.book-group-head {
+  border-bottom: 1px solid var(--edge-soft);
+  padding-bottom: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+
+.book-group-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: #e2e8f0;
+}
+
+.book-group-title::before {
+  content: '';
+  width: 3px;
+  height: 0.85rem;
+  border-radius: 2px;
+  background: var(--brand);
+}
+
+.book-group-note {
+  font-size: 0.6rem;
+  letter-spacing: 0.02em;
+}
+
+.book-group-count {
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  background: rgba(5, 7, 15, 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A shared summary line: the group's combined exposure and P&L, so the two
+   tiles can be read as one instrument without adding their figures by hand. */
+.book-group-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+  padding: 0 0.3rem 0.5rem;
+  font-size: 0.63rem;
+  color: var(--ink-3);
+}
+
+.book-group-summary-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+}
+
+.book-group-summary-label {
+  font-size: 0.56rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.book-group-summary-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-1);
+}
+
+.book-group-summary-value.pos { color: var(--good); }
+.book-group-summary-value.neg { color: var(--bad); }
+
+/* ── Narrow-screen tile header ──────────────────────────────────────────
+   Below ~520px the headline and the control cluster cannot share a row: the
+   controls are `flex: none`, so they keep their width and the headline is
+   squeezed until the signal chip and the state pill overlap. Stacking them is
+   the only layout that keeps both readable, and the tile is already tall enough
+   that one extra row costs nothing. */
+@media (max-width: 520px) {
+  .book-band-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.4rem;
+  }
+
+  .book-band-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  /* The foot is a three-column grid, so a narrow tile gives each column about
+     100px - not enough for "Long 65" beside its label, and the value is what
+     gets clipped. Two columns, and the stop cell allowed to span, keeps every
+     number legible. The stop is the one figure that must never truncate. */
+  .book-band-foot {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.3rem 0.6rem;
+  }
+
+  .book-band-stop {
+    grid-column: span 2;
+  }
+
+  .book-band-foot-value {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: nowrap;
+  }
+}
+
+/* Points between the live mark and the stop. Shown beside the level because it
+   is the number a trader actually watches - "how much room is left" - and it
+   changes on every mark while the level itself only moves when the trail does. */
+.book-band-stop-distance {
+  margin-left: 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.6rem;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+/* ── Stop-loss editor ───────────────────────────────────────────────────
+   A form, not a prompt. The operator sees the four numbers that decide the
+   level - entry, live price, current stop, room left - and the resulting level
+   updates as they type, so the change is understood before it is committed. */
+.sl-card {
+  max-width: 30rem;
+  width: 100%;
+}
+
+.sl-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem 0.9rem;
+  margin: 0.75rem 0 0.9rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--edge-soft);
+  border-radius: 0.5rem;
+  background: rgba(5, 7, 15, 0.45);
+}
+
+.sl-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.sl-fact-label {
+  font-size: 0.56rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.sl-fact-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.82rem;
+  color: var(--ink-0);
+}
+
+.sl-mode {
+  display: inline-flex;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  background: rgba(5, 7, 15, 0.5);
+  margin-bottom: 0.7rem;
+}
+
+.sl-mode-btn {
+  padding: 0.3rem 0.7rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.sl-mode-btn.is-active {
+  background: rgba(56, 189, 248, 0.16);
+  color: var(--brand);
+}
+
+.sl-mode-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+.sl-input-label {
+  display: block;
+  font-size: 0.6rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 0.25rem;
+}
+
+.sl-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.sl-input {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 1rem;
+}
+
+.sl-input-unit {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 0.6rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.4rem;
+  background: rgba(5, 7, 15, 0.5);
+  font-size: 0.65rem;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.sl-preview {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--edge-soft);
+  border-radius: 0.5rem;
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.sl-preview-label {
+  font-size: 0.56rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.sl-preview-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 1rem;
+  font-weight: 650;
+  color: var(--brand);
+}
+
+.sl-preview-note {
+  font-size: 0.65rem;
+  color: var(--ink-3);
+}
+
+.sl-error {
+  margin-top: 0.6rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid rgba(244, 63, 94, 0.4);
+  border-radius: 0.4rem;
+  background: rgba(244, 63, 94, 0.1);
+  font-size: 0.7rem;
+  color: #fda4af;
+}
+
+@media (max-width: 480px) {
+  /* Keep the facts in two columns: the values are short and stacking them made
+     the dialog taller than the viewport on a phone. */
+  .sl-facts { gap: 0.35rem 0.6rem; }
+  .sl-fact-value { font-size: 0.76rem; }
+  /* The preview note is long enough to squeeze the value; give it its own row. */
+  .sl-preview { flex-wrap: wrap; gap: 0.15rem 0.5rem; }
+  .sl-preview-label { flex-basis: 100%; }
+}
+
+/* ── Unresolved orders ─────────────────────────────────────────────── */
+/* These block new entries, so they are pulled out of the execution log into
+   their own strip. Amber rather than red: an unresolved order is a warning
+   that trading is paused, not a failure that has already cost money. */
+.pending-strip {
+  margin: 0 0 0.9rem;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 0.6rem;
+  background: rgba(245, 158, 11, 0.07);
+  overflow: hidden;
+}
+
+.pending-strip.hidden { display: none; }
+
+.pending-strip-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid rgba(245, 158, 11, 0.22);
+}
+
+.pending-strip-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.pending-strip-note {
+  font-size: 0.72rem;
+  color: var(--ink-2);
+}
+
+/* ── Exchange-held stop badge ──────────────────────────────────────── */
+/* Distinguishes "the engine is watching a stop" from "the exchange is holding
+   one". Only the second survives this process dying, so a LIVE position without
+   it is called out rather than shown as protected. */
+.book-protect {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.32rem;
+  border-radius: 0.28rem;
+  border: 1px solid transparent;
+  font-size: 0.56rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.book-protect.is-ok {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.14);
+  color: #4ade80;
+}
+
+.book-protect.is-warn {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--warn);
+}
+
+.book-protect.is-bad {
+  border-color: rgba(244, 63, 94, 0.5);
+  background: rgba(244, 63, 94, 0.16);
+  color: #fb7185;
 }

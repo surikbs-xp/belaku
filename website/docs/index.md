@@ -48,16 +48,19 @@ session rather than firing them late.
 | **Entry rule** | SuperTrend (14×3) agrees **and** price on the correct side of PSAR |
 | **Warm-up** | 15 closed bars (SuperTrend ATR length + 1) |
 | **Signal trigger** | First closed bar where the condition becomes true — not repeated while it holds |
-| **Exit** | The pair flips against the position, or manual. **No stop-loss and no profit target.** |
+| **Exit** | The pair flips against the position, a protective stop, or manual. No profit target. |
 | **Modes** | `PAPER` (simulated) and `LIVE` (real orders, explicit confirmation) |
 
-:::note[The signal is the exit]
-There is no stop-loss, no trailing stop, and no profit target. A position is held
-until SuperTrend and PSAR flip the *other* way and then closed in full — that is
-the whole exit rule. A bar where the pair merely disagrees is held, not cut. The
-only exposure limit is `MAX_OPEN_LOTS`; there is no session loss cap, because
-blocking entries on the day's realised loss is a second strategy the signal never
-looked at.
+:::note[The signal is the primary exit]
+A position is held until SuperTrend and PSAR flip the *other* way and then closed
+in full; a bar where the pair merely disagrees is held, not cut. Each book also
+carries a **protective stop-loss and trailing stop** measured on the futures
+execution price (see [Strategy](./strategy.md)), which caps a single loss without
+changing when a winning trend is closed. There is no profit target.
+
+Exposure is bounded by `MAX_OPEN_LOTS` and, optionally, `MAX_DAILY_LOSS` — a
+daily realised-loss cap that blocks *new entries* once it is reached and never
+flattens an open position.
 
 :::warning[Read the backtest before trading this]
 On three years of real GIFT Nifty 60-minute bars the strategy's gross profit

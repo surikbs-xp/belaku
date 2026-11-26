@@ -54,10 +54,17 @@ agrees with the previous one is not a new signal, so it cannot open a trade:
 | Positioned | NO_SIGNAL **becomes** true | **Hold** — the pair disagreeing is not an exit |
 | Positioned | NO_SIGNAL already true | **Hold** |
 
-**The pair flipping against the position is the exit.** There is no stop-loss, no
-trailing stop, and no profit target: a position is held until SuperTrend and PSAR
-turn the *other* way, and then closed in full. A `NO_SIGNAL` bar says nothing
-about a position already on, so it is carried rather than cut.
+**The pair flipping against the position is the primary exit.** A position is
+held until SuperTrend and PSAR turn the *other* way, and then closed in full. A
+`NO_SIGNAL` bar says nothing about a position already on, so it is carried rather
+than cut. There is no profit target.
+
+Each book also carries a **protective stop-loss and trailing stop**, measured on
+the futures execution price and configured per strategy (see
+[Running multiple strategies](./multi-strategy.md#the-two-strategies)). The stop
+is a backstop that caps a single loss; it does not change when a winning trend is
+closed. The initial stop is in force from the fill, and the trail only takes over
+once the position is in profit — it never widens.
 
 The exit is a **transition**, exactly like the entry. A run of opposite bars is
 one exit, not one per bar — otherwise every bar of the new trend would be a no-op
@@ -105,12 +112,12 @@ bar it boots into has `previous_signal == signal`, so it is not a transition. An
 entry owed from *before* the restart is the exception — it was latched by a bar
 this bot did observe, so it is a real signal rather than a boot-time guess.
 
-The rule is applied to **both books and both modes**. The Nifty futures book runs
-it inside the NSE session (PAPER and LIVE alike), and the [GIFT Nifty index
-book](/execution#two-books-one-signal-stream) runs the same rule on every closed
-bar whatever the session, because it prices an index that trades ~20 hours. See
-[Execution](/execution#two-books-one-signal-stream) for where the two venues
-deliberately differ.
+The rule is applied to **both books and both modes**, and both run it inside the
+NSE session only. GIFT NIFTY quotes outside it, but the GIFT 15m strategy must
+not generate or execute a trade outside the permitted session, and neither may
+the NIFTY 60m strategy. See
+[Execution](/execution#two-strategies-one-instrument) for how the two books
+differ.
 
 ## SuperTrend
 
@@ -172,15 +179,14 @@ identifiable after the fact rather than silently trusted.
 
 ## What the strategy does not have
 
-:::warning[No stop-loss and no profit target]
-There is no stop-loss, no trailing stop, and no profit target. The exit is the
-signal flipping, or a manual square-off. Performance is expressed in rupees and
-raw index points, not in R-multiples.
-
-This is deliberate. A fixed stop exits on a price the strategy never looked at,
-which makes it a different strategy rather than a safety net around this one. The
-only exposure limit is `MAX_OPEN_LOTS` — see
-[Risk limits](/production#risk-limits).
+:::note[Signal exit plus a protective stop]
+The primary exit is the signal flipping, or a manual square-off. Each book also
+carries a protective stop-loss and trailing stop, measured on the **futures
+execution price** and configured per strategy — see
+[Running multiple strategies](./multi-strategy.md#the-two-strategies) for the
+levels. The stop is the backstop that caps a single loss; the signal is still what
+closes a winning trend. Performance is expressed in rupees and raw index points,
+not in R-multiples.
 :::
 
 :::note[What this costs]

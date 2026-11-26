@@ -22,12 +22,6 @@ const ENDPOINTS = {
   status:    '/api/status',
   portfolio: '/api/portfolio',
   positions: '/api/positions?status=all&limit=200',
-  giftPositions: '/api/gift/positions?status=all&limit=200',
-  giftOrders: '/api/gift/orders?limit=500',
-  giftTrades: '/api/gift/trades?limit=500',
-  giftSignals: '/api/gift/signals?limit=100',
-  giftAnalytics: '/api/gift/analytics',
-  giftPortfolio: '/api/gift/portfolio',
   orders:    '/api/orders?limit=500',
   trades:    '/api/trades?limit=500',
   signals:   '/api/signals?limit=100',
@@ -39,10 +33,14 @@ const ENDPOINTS = {
   toggle:    '/api/toggle-mode',
   pause:     '/api/pause',
   panic:     '/api/panic',
+  stopAll:   '/api/stop-all',
+  stopAllClear: '/api/stop-all/clear',
+  reconcile: '/api/orders/reconcile',
+  pending:   '/api/orders/pending',
 };
 
-/** The two books the dashboard can show. They are separate databases, so every
-    ledger view has to say which one it is reading. */
+/** The one book the dashboard reads. Both strategies execute on the NIFTY
+    future, so there is a single ledger and no venue switch. */
 const VENUES = {
   futures: {
     label: 'Nifty future',
@@ -52,14 +50,6 @@ const VENUES = {
     analytics: 'analytics',
     portfolio: 'portfolio',
   },
-  gift: {
-    label: 'GIFT Nifty index',
-    orders: 'giftOrders',
-    trades: 'giftTrades',
-    signals: 'giftSignals',
-    analytics: 'giftAnalytics',
-    portfolio: 'giftPortfolio',
-  },
 };
 
 const state = {
@@ -67,24 +57,10 @@ const state = {
   orders: [],
   signals: [],
   trades: [],
-  // Which book the Orders and Performance tabs are reading. The two books live
-  // in different databases, so this is a real scope switch, not a filter.
-  ordersVenue: 'futures',
-  analyticsVenue: 'futures',
-  // Index-book rows, kept apart from the futures rows so a venue switch can
-  // never show one book's numbers under the other's heading.
-  giftOrders: [],
-  giftTrades: [],
-  giftSignals: [],
   positions: [],
-  giftPositions: [],
-  giftAnalytics: null,
-  giftPortfolio: null,
-  giftEnabled: false,
-  // Index-book P&L for the monitor tab's split. Kept separate from
-  // `giftPortfolio`, which is only fetched while the Performance tab is on the
-  // index venue - the split needs the number on every poll.
-  giftPnl: null,
+  // Orders the broker has not finished with. They block new entries, so the
+  // dashboard shows them separately from the execution log.
+  pending: [],
   // Last futures portfolio payload. The Performance tab's futures venue needs
   // it, but the tab can be opened (or the venue switched) between two fast
   // polls, so the tiles read this cache instead of blanking to "—".
@@ -298,11 +274,33 @@ async function api(url, options) {
 
 /* ── Confirm dialog ────────────────────────────────────────────────── */
 
-function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
+/**
+ * Ask the operator to confirm an action.
+ *
+ * ``body`` is HTML so a caller can emphasise the consequence. The optional
+ * ``strategyId``/``action``/``mode`` triple renders a fact block, which is what
+ * makes a real-money confirmation unambiguous: the operator sees which book,
+ * which action and which mode before pressing the button. ``warn`` adds a red
+ * line for the irreversible cases.
+ */
+function confirmDialog(opts) {
+  const { title, body, okLabel = 'Confirm', danger = true } = opts;
+  const { strategyId, action, mode, warn } = opts;
   return new Promise((resolve) => {
     const modal = $('modal');
     $('modal-title').textContent = title;
     $('modal-body').innerHTML = body;
+
+    const facts = $('modal-facts');
+    facts.classList.toggle('hidden', !strategyId);
+    setText('modal-fact-strategy', strategyId || '—');
+    setText('modal-fact-action', action || '—');
+    setText('modal-fact-mode', mode || '—');
+
+    const warnEl = $('modal-warn');
+    warnEl.textContent = warn || '';
+    warnEl.classList.toggle('hidden', !warn);
+
     const ok = $('modal-ok');
     ok.textContent = okLabel;
     ok.className = `btn ${danger ? 'btn-danger' : 'btn-neutral'}`;
@@ -322,6 +320,7 @@ function confirmDialog({ title, body, okLabel = 'Confirm', danger = true }) {
     $('modal-cancel').addEventListener('click', onCancel);
     document.addEventListener('keydown', onKey);
     modal.classList.remove('hidden');
+    ok.focus();
   });
 }
 
@@ -363,6 +362,33 @@ function renderStatus(status) {
     `marks ${hb.marks ?? 0} · ticks ${hb.ticks ?? 0} · every ${interval}s`
     + (hb.last_error ? ` · last error: ${hb.last_error}` : '');
 
+  // Signal-path latency. Detection is bar-close to verdict; the round-trip is
+  // verdict to confirmed fill. Both are measured in the engine, not estimated
+  // here, so the pill reports what actually happened.
+  const lat = (status.engine || {}).latency || {};
+  const detect = num(lat.detect_ms);
+  const roundTrip = num(lat.fill_ms) ?? num(lat.submit_ms);
+  const latencyPill = $('pill-signal-latency');
+  if (latencyPill) {
+    if (detect === null && roundTrip === null) {
+      setPill('pill-signal-latency', 'Signal —', 'idle');
+      latencyPill.title = 'No signal has been evaluated yet';
+    } else {
+      const parts = [];
+      if (detect !== null) parts.push(`detect ${Math.round(detect)}ms`);
+      if (roundTrip !== null) parts.push(`fill ${Math.round(roundTrip)}ms`);
+      // A detection over a second means the engine missed the bar close and
+      // fell back to the poll, which is the thing the event-driven wake exists
+      // to prevent - so it is flagged rather than shown as normal.
+      const slow = detect !== null && detect > 1000;
+      setPill('pill-signal-latency', `Signal · ${parts.join(' / ')}`, slow ? 'bad' : 'live');
+      latencyPill.title =
+        `bar close → verdict ${detect === null ? '—' : Math.round(detect) + 'ms'}`
+        + ` · verdict → fill ${roundTrip === null ? '—' : Math.round(roundTrip) + 'ms'}`
+        + (slow ? ' · detection fell back to the poll interval' : '');
+    }
+  }
+
   $('hdr-symbol').textContent = (status.symbol && status.symbol.current) || '—';
   $('hdr-market').textContent = market.is_open
     ? `Market open · closes ${(market.session_close || '').slice(11, 16)} IST`
@@ -378,6 +404,21 @@ function renderStatus(status) {
 
   const pauseBtn = $('btn-pause');
   pauseBtn.textContent = strategy.paused ? 'Resume' : 'Pause';
+
+  // STOP ALL is a latch, not a toggle: the button reflects the latched state and
+  // clearing it is a separate, deliberate action. Showing it as a toggle would
+  // invite a second click that silently resumes trading.
+  const stopAllBtn = $('btn-stop-all');
+  if (stopAllBtn) {
+    const stopped = !!strategy.stopped_all;
+    stopAllBtn.textContent = stopped ? 'STOP ALL ✓' : 'STOP ALL';
+    stopAllBtn.classList.toggle('btn-danger', !stopped);
+    stopAllBtn.classList.toggle('btn-neutral', stopped);
+    stopAllBtn.title = stopped
+      ? `STOP ALL engaged (${strategy.stopped_all_reason || 'emergency'}) — click to clear`
+      : 'Emergency halt: block new entries in every book without closing positions';
+    stopAllBtn.dataset.stopped = stopped ? '1' : '0';
+  }
 
   const modeToggle = $('btn-mode-toggle');
   const isLive = mode === 'LIVE';
@@ -401,7 +442,6 @@ function renderStatus(status) {
   renderLatency((status.kite || {}).latency);
 
   renderExecutionMeta(status);
-  renderMirror(status.mirror);
   renderRolloverPill(status.engine || {});
 }
 
@@ -458,32 +498,6 @@ function renderRolloverPill(engine) {
       + `(last Tuesday, 15:30 IST close). The engine rolls to ${rollover.next_symbol} `
       + `${rolloverDays} days before expiry.`;
   }
-}
-
-/** Shadow paper book panel. Hidden entirely unless the mirror is running. */
-function renderMirror(mirror) {
-  const panel = $('mirror-panel');
-  if (!panel) return;
-  const enabled = !!(mirror && mirror.enabled);
-  panel.classList.toggle('hidden', !enabled);
-  if (!enabled) return;
-
-  const inSync = mirror.in_sync;
-  setPill('mirror-sync', inSync ? 'In sync' : 'Out of sync', inSync ? 'live' : 'bad');
-  $('mirror-sync').title = mirror.db_path ? `Shadow book: ${mirror.db_path}` : '';
-
-  const comparison = mirror.comparison || {};
-  const live = comparison.live || {};
-  const paper = comparison.mirror || {};
-  setText('mirror-sub',
-    `${mirror.reconciles ?? 0} reconciles · ${mirror.fills_seen ?? 0} live fill(s) seen`
-    + (mirror.last_error ? ` · last error: ${mirror.last_error}` : ''));
-
-  setText('mirror-live-pnl', signedInr(live.realized_total), pnlClass(live.realized_total));
-  setText('mirror-paper-pnl', signedInr(paper.realized_total), pnlClass(paper.realized_total));
-  setText('mirror-gap', signedInr(comparison.net_pnl_gap), pnlClass(comparison.net_pnl_gap));
-  setText('mirror-live-trades', `${live.trades ?? 0} · ${live.win_rate ?? 0}% win`);
-  setText('mirror-paper-trades', `${paper.trades ?? 0} · ${paper.win_rate ?? 0}% win`);
 }
 
 /** Static execution facts a trader checks before trusting a fill. */
@@ -628,18 +642,15 @@ function renderPortfolio(portfolio) {
  * the fast poll already fetched; the index venue reads its own endpoint.
  */
 function renderAnalyticsTiles(futuresPortfolio) {
-  const gift = state.analyticsVenue === 'gift';
   // Fall back to the cached payload: the tab can be opened between two fast
   // polls, and blanking the tiles there reads as "no data" rather than "not
   // fetched yet".
-  const source = gift ? state.giftPortfolio : (futuresPortfolio || state.portfolio);
-  const venue = VENUES[state.analyticsVenue];
+  const source = futuresPortfolio || state.portfolio;
+  const venue = VENUES.futures;
 
-  if (!source || (gift && source.enabled === false)) {
+  if (!source) {
     ['a-net', 'a-return', 'a-dd', 'a-trades'].forEach((id) => setText(id, '—'));
-    setText('analytics-venue-note', gift
-      ? 'GIFT Nifty index book is off (set GIFT_BOOK=1)'
-      : `${venue.label} · ${source?.mode || '—'}`);
+    setText('analytics-venue-note', `${venue.label} · —`);
     return;
   }
 
@@ -649,9 +660,8 @@ function renderAnalyticsTiles(futuresPortfolio) {
   setText('a-dd', `${source.max_drawdown_pct}%`, pnlClass(source.max_drawdown_pct));
   setText('a-trades', source.total_trades);
 
-  setText('analytics-venue-note', gift
-    ? `${venue.label} · paper only, the index cannot be traded`
-    : `${venue.label} · ${source.mode || '—'} · ${source.open_position_count ?? 0} open`);
+  setText('analytics-venue-note',
+    `${venue.label} · ${source.mode || '—'} · ${source.open_position_count ?? 0} open`);
 }
 
 
@@ -663,39 +673,6 @@ function renderAnalyticsTiles(futuresPortfolio) {
  * Rs 40,000 and one that is down Rs 40,000 are not "flat", they are one working
  * strategy and one that should be switched off.
  */
-/**
- * One line per execution leg, under a book's blended figures.
- *
- * A two-leg book is two positions, and its single Net P&L is the sum of two
- * things that can point opposite ways. Without this the pair reads as one
- * mediocre strategy when it is really a working leg carrying a losing one.
- *
- * Omitted entirely for a single-leg book: there the blended figure *is* the leg.
- */
-function legBreakdown(run, legPerf) {
-  const legs = Array.isArray(run.legs) && run.legs.length ? run.legs : ['futures'];
-  if (legs.length < 2) return '';
-  const book = (legPerf || {})[run.id] || {};
-  return `
-    <div class="perf-book-legs">
-      ${legs.map((leg) => {
-    const entry = book[leg] || {};
-    const trades = entry.trades ?? 0;
-    const net = num(entry.net_pnl);
-    const venue = leg === 'gift' ? 'GIFT index' : 'NIFTY fut';
-    return `
-        <div class="perf-book-leg">
-          <span class="perf-book-leg-venue">${escapeHtml(venue)}</span>
-          <span class="perf-book-leg-note">${escapeHtml(
-    trades ? `${trades} trade${trades === 1 ? '' : 's'} · win ${entry.win_rate ?? 0}%`
-      : 'no closed trades')}</span>
-          <span class="perf-book-leg-pnl ${pnlClass(net)}">${
-    net === null ? '—' : signedInr(net)}</span>
-        </div>`;
-  }).join('')}
-    </div>`;
-}
-
 function renderBookPerformance() {
   const host = $('books-performance');
   if (!host) return;
@@ -703,9 +680,6 @@ function renderBookPerformance() {
   const runs = payload.runs || [];
   const perf = payload.performance || {};
   const accounts = payload.accounts || {};
-  // Per-leg score, so a two-leg book does not present the blended pair as its
-  // record. The book figure above is the sum; these are the two halves of it.
-  const legPerf = payload.leg_performance || {};
 
   if (!runs.length) {
     host.innerHTML = '<p class="condition-empty">No strategy is configured.</p>';
@@ -742,7 +716,6 @@ function renderBookPerformance() {
     acct.return_pct === undefined || acct.return_pct === null ? 'from ' + (acct.source === 'zerodha' ? 'Zerodha' : 'ledger')
       : `${acct.return_pct > 0 ? '+' : ''}${acct.return_pct}%`)}
         </div>
-        ${legBreakdown(run, legPerf)}
       </div>`;
   }).join('');
 }
@@ -806,25 +779,14 @@ function bookSection(name, open, emptyText, note) {
 
 /* ── Orders + signals ──────────────────────────────────────────────── */
 
-/** Rows for the venue currently selected on the Orders tab. */
+/** Rows for the Orders tab. There is one ledger, so this is the whole book. */
 function venueOrders() {
-  return state.ordersVenue === 'gift' ? state.giftOrders : state.orders;
+  return state.orders;
 }
 
-/**
- * Empty-state text for a venue-scoped ledger.
- *
- * The two books are separate databases, so an empty table under one heading says
- * nothing about the other. When the selected book is empty but the other one has
- * rows, say so and name it: otherwise a trader looking at the futures tab while
- * the index book trades reads "no executions" as "the bot did nothing".
- */
+/** Empty-state text for a ledger table. */
 function emptyLedgerText(noun, venue, counts, filtered = false) {
   if (filtered) return `No matching ${noun}.`;
-  const other = venue === 'gift' ? 'futures' : 'gift';
-  if (counts[venue] === 0 && counts[other] > 0) {
-    return `No ${noun} in this book — ${counts[other]} in ${VENUES[other].label}.`;
-  }
   return `No ${noun} yet.`;
 }
 
@@ -863,10 +825,7 @@ function selectedBook() {
 
 function filteredOrders() {
   const needle = $('orders-search').value.trim().toLowerCase();
-  // The index book has no LIVE path at all, so the mode filter is meaningless
-  // there. It is disabled in the UI, but a value left over from the futures
-  // venue would otherwise filter every index row away and read as "no orders".
-  const mode = state.ordersVenue === 'gift' ? '' : $('orders-mode').value;
+  const mode = $('orders-mode').value;
   const book = selectedBook();
   return venueOrders().filter((o) => {
     if (mode && (o.mode || '').toUpperCase() !== mode) return false;
@@ -882,28 +841,14 @@ function filteredOrders() {
 function renderOrders() {
   const rows = filteredOrders();
   const total = venueOrders().length;
-  const venue = VENUES[state.ordersVenue];
-  const gift = state.ordersVenue === 'gift';
-
-  // The index book is off by default, so "0 of 0" would read as "no trades yet"
-  // rather than "this book is not running".
-  if (gift && !state.giftEnabled) {
-    setText('orders-caption', 'GIFT Nifty index book is off (set GIFT_BOOK=1)');
-  } else {
-    setText('orders-caption', `${rows.length} of ${total} executions · ${venue.label}`);
-  }
-
-  // Mode is meaningless for the index book: it has no LIVE path at all.
-  $('orders-mode').disabled = gift;
+  const venue = VENUES.futures;
+  setText('orders-caption', `${rows.length} of ${total} executions · ${venue.label}`);
 
   const body = $('orders-body');
   if (!rows.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="${ORDERS_COLS}">${gift && !state.giftEnabled
-      ? 'The GIFT Nifty index book is not running.'
-      : emptyLedgerText('executions', state.ordersVenue, {
-        futures: state.orders.length,
-        gift: state.giftOrders.length,
-      }, rows.length !== total)}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="${ORDERS_COLS}">${
+      emptyLedgerText('executions', 'futures', { futures: state.orders.length },
+        rows.length !== total)}</td></tr>`;
     return;
   }
   body.innerHTML = rows.map((o) => {
@@ -932,30 +877,21 @@ function renderOrders() {
 
 function renderSignals() {
   const body = $('signals-body');
-  const gift = state.ordersVenue === 'gift';
-  const venue = VENUES[state.ordersVenue];
-  // The book filter applies here too. A decision log across three books is three
+  const venue = VENUES.futures;
+  // The book filter applies here too. A decision log across two books is two
   // interleaved strategies, and the one being debugged is the one the operator
   // selected - the same control the order book above already uses.
   const book = selectedBook();
-  const rows = (gift ? state.giftSignals : state.signals)
+  const rows = state.signals
     .filter((s) => !book || (s.strategy_id || '') === book);
 
-  if (gift && !state.giftEnabled) {
-    setText('signals-caption', 'GIFT Nifty index book is off (set GIFT_BOOK=1)');
-  } else {
-    setText('signals-caption',
-      `${rows.length} decision${rows.length === 1 ? '' : 's'} · ${venue.label}`);
-  }
+  setText('signals-caption',
+    `${rows.length} decision${rows.length === 1 ? '' : 's'} · ${venue.label}`);
 
   if (!rows.length) {
-    const all = gift ? state.giftSignals : state.signals;
-    body.innerHTML = `<tr class="empty-row"><td colspan="${SIGNALS_COLS}">${gift && !state.giftEnabled
-      ? 'The GIFT Nifty index book is not running.'
-      : emptyLedgerText('signals', state.ordersVenue, {
-        futures: state.signals.length,
-        gift: state.giftSignals.length,
-      }, book ? rows.length !== all.length : false)}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="${SIGNALS_COLS}">${
+      emptyLedgerText('signals', 'futures', { futures: state.signals.length },
+        book ? rows.length !== state.signals.length : false)}</td></tr>`;
     return;
   }
   body.innerHTML = rows.map((s) => {
@@ -1085,9 +1021,7 @@ function renderCalendar() {
   while (cells.length % 7 !== 0) cells.push('<div class="cal-cell is-empty"></div>');
   grid.innerHTML = cells.join('');
 
-  if (state.analyticsVenue === 'gift' && !state.giftEnabled) {
-    setText('cal-caption', `${MONTH_NAMES[month]} ${year} · GIFT Nifty index book is off`);
-  } else if (!monthDays.length) {
+  if (!monthDays.length) {
     setText('cal-caption', `${MONTH_NAMES[month]} ${year} · no closed trades`);
   }
 }
@@ -1144,18 +1078,14 @@ function shiftCalendarMonth(delta) {
 
 /** Load the daily rollup + holiday list that back the calendar. */
 async function loadCalendarData() {
-  const gift = state.analyticsVenue === 'gift';
   const [analytics, holidays] = await Promise.all([
-    api(ENDPOINTS[VENUES[state.analyticsVenue].analytics]),
+    api(ENDPOINTS.analytics),
     api(ENDPOINTS.holidays).catch(() => ({ holidays: {} })),
   ]);
-  // The index book reports itself disabled rather than returning an empty
-  // rollup, so an off book must not be rendered as "no trades this month".
-  state.giftEnabled = gift ? analytics.enabled !== false : state.giftEnabled;
   state.days = Object.fromEntries((analytics.days || []).map((day) => [day.date, day]));
   state.holidays = holidays.holidays || {};
   state.dayTrades = {};
-  const trades = gift ? state.giftTrades : state.trades;
+  const trades = state.trades;
   for (const trade of trades) {
     const key = String(trade.exit_time || '').slice(0, 10);
     if (!key) continue;
@@ -1166,23 +1096,15 @@ async function loadCalendarData() {
 
 function renderTrades() {
   const body = $('trades-body');
-  const gift = state.analyticsVenue === 'gift';
-  const rows = gift ? state.giftTrades : state.trades;
-  const venue = VENUES[state.analyticsVenue];
+  const rows = state.trades;
+  const venue = VENUES.futures;
 
-  if (gift && !state.giftEnabled) {
-    setText('trades-caption', 'GIFT Nifty index book is off (set GIFT_BOOK=1)');
-  } else {
-    setText('trades-caption', `${rows.length} settled round-trip${rows.length === 1 ? '' : 's'} · ${venue.label}`);
-  }
+  setText('trades-caption',
+    `${rows.length} settled round-trip${rows.length === 1 ? '' : 's'} · ${venue.label}`);
 
   if (!rows.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="${TRADES_COLS}">${gift && !state.giftEnabled
-      ? 'The GIFT Nifty index book is not running.'
-      : emptyLedgerText('settled trades', state.analyticsVenue, {
-        futures: state.trades.length,
-        gift: state.giftTrades.length,
-      })}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="${TRADES_COLS}">${
+      emptyLedgerText('settled trades', 'futures', { futures: state.trades.length })}</td></tr>`;
     return;
   }
   body.innerHTML = rows.map((t) => {
@@ -1236,26 +1158,93 @@ function renderExitReason(reason) {
  * bot writes a row, so they are fetched on LEDGER_MS rather than every poll.
  */
 async function loadLedger() {
-  const [orders, trades, signals, giftOrders, giftTrades, giftSignals] =
-    await Promise.all([
-      api(ENDPOINTS.orders),
-      api(ENDPOINTS.trades),
-      api(ENDPOINTS.signals),
-      // Failure is normal when the GIFT index book is off; the second panel says
-      // so rather than the whole ledger load failing.
-      api(ENDPOINTS.giftOrders).catch(() => null),
-      api(ENDPOINTS.giftTrades).catch(() => null),
-      api(ENDPOINTS.giftSignals).catch(() => null),
-    ]);
+  // The pending strip follows the mode filter, not the process mode: an operator
+  // looking at LIVE orders wants to know which LIVE orders are stuck, and the
+  // server's default would answer for PAPER while the table showed LIVE.
+  const mode = $('orders-mode') ? $('orders-mode').value : '';
+  const pendingUrl = mode ? `${ENDPOINTS.pending}?mode=${mode}` : ENDPOINTS.pending;
+  const [orders, trades, signals, pending] = await Promise.all([
+    api(ENDPOINTS.orders),
+    api(ENDPOINTS.trades),
+    api(ENDPOINTS.signals),
+    api(pendingUrl).catch(() => ({ orders: [], count: 0 })),
+  ]);
   state.orders = orders.orders || [];
   state.signals = signals.signals || [];
   state.trades = trades.trades || [];
-  state.giftOrders = (giftOrders && giftOrders.orders) || [];
-  state.giftTrades = (giftTrades && giftTrades.trades) || [];
-  state.giftSignals = (giftSignals && giftSignals.signals) || [];
+  state.pending = pending.orders || [];
   renderOrders();
+  renderPending();
   renderSignals();
   renderTrades();
+}
+
+/**
+ * Unresolved orders, and the fact that they block new entries.
+ *
+ * Hidden entirely when there are none: a permanent empty table is noise, and the
+ * absence of the strip is itself the signal that nothing is stuck.
+ */
+function renderPending() {
+  const strip = $('pending-strip');
+  const rows = state.pending || [];
+  strip.classList.toggle('hidden', !rows.length);
+  if (!rows.length) return;
+  setText('pending-strip-note',
+    `${rows.length} order${rows.length === 1 ? '' : 's'} - new entries are blocked until these resolve`);
+  $('pending-body').innerHTML = rows.map((o) => {
+    const action = String(o.transaction_type || '').toUpperCase();
+    const tag = action === 'BUY' ? 'tag-buy' : 'tag-sell';
+    return `
+      <tr>
+        <td class="font-mono text-slate-400">${escapeHtml((o.ts || '').replace('T', ' '))}</td>
+        <td class="text-slate-300">${escapeHtml(bookLabel(o.strategy_id))}</td>
+        <td class="font-mono">${escapeHtml(o.symbol)}</td>
+        <td><span class="tag ${tag}">${escapeHtml(action)}</span></td>
+        <td class="num">${o.quantity}</td>
+        <td><span class="tag tag-warn">${escapeHtml(String(o.status || '').toUpperCase())}</span></td>
+        <td class="font-mono text-slate-500">${escapeHtml(o.exchange_order_id || '—')}</td>
+        <td class="max-w-[22rem] truncate text-slate-400" title="${escapeHtml(o.message || '')}">${escapeHtml(o.message || '')}</td>
+      </tr>`;
+  }).join('');
+}
+
+/**
+ * Resolve unresolved orders against the broker now.
+ *
+ * The same pass the bot runs on its own clock, exposed so an operator can clear
+ * a stuck block without restarting - and so the readiness report can be re-run
+ * straight after a manual fix.
+ */
+async function reconcileOrders() {
+  const button = $('btn-orders-reconcile');
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = 'Reconciling…';
+  try {
+    // Reconcile the mode being viewed, not the process mode: an operator looking
+    // at LIVE orders means the LIVE ones.
+    const mode = $('orders-mode') ? $('orders-mode').value : '';
+    const url = mode ? `${ENDPOINTS.reconcile}?mode=${mode}` : ENDPOINTS.reconcile;
+    const result = await api(url, { method: 'POST' });
+    const parts = [];
+    if (result.filled) parts.push(`${result.filled} filled`);
+    if (result.closed) parts.push(`${result.closed} closed`);
+    if (result.still_open) parts.push(`${result.still_open} still open`);
+    if (result.unknown) parts.push(`${result.unknown} unknown`);
+    const unmatched = (result.trade_book || {}).unmatched || [];
+    if (unmatched.length) parts.push(`${unmatched.length} unmatched fill(s)`);
+    toast(
+      parts.length ? `Reconciled: ${parts.join(', ')}` : 'Nothing to reconcile',
+      (result.errors || []).length || unmatched.length ? 'warn' : 'ok',
+    );
+    await loadLedger();
+  } catch (error) {
+    toast(`Reconcile failed: ${error.message}`, 'err');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Reconcile';
+  }
 }
 
 /**
@@ -1267,20 +1256,10 @@ async function loadLedger() {
  * latency in the bot rather than in the refresh.
  */
 async function loadPositions() {
-  const [positions, giftPositions] = await Promise.all([
-    api(ENDPOINTS.positions),
-    api(ENDPOINTS.giftPositions).catch(() => null),
-  ]);
+  const positions = await api(ENDPOINTS.positions);
   state.positions = positions.positions || [];
-  state.giftPositions = (giftPositions && giftPositions.positions) || [];
-  if (giftPositions) state.giftEnabled = giftPositions.enabled !== false;
   renderPositions();
   renderDashPositions();
-  // The strategy tiles draw one row per execution leg, and the GIFT rows come
-  // from this call rather than from /api/strategies - so a tile painted before
-  // these arrived would show its index leg as flat when it was held. Repainting
-  // here is what keeps the leg table honest on the first poll.
-  if (state.strategies) renderStrategies(state.strategies);
   // The unrealised half of the summary comes from these rows, so it is repainted
   // here rather than only on the slower ledger cadence.
   if (state.strategies) renderSummary(state.strategies);
@@ -1301,18 +1280,11 @@ function renderDashPositions() {
   const runs = (state.strategies && state.strategies.runs) || [];
   const accounts = (state.strategies && state.strategies.accounts) || {};
   const byId = new Map(runs.map((r) => [r.id, r]));
-  // Every open leg, including any whose strategy_id matches no configured book.
-  // Those are real positions - an order booked under an id the dashboard does
-  // not know about - and dropping them made the totals say "flat" while the
-  // ledger held a live leg. They are shown with their raw id and a warning.
-  //
-  // The index legs are included too. They are simulated, but they are exposure
-  // the strategy is carrying, and a two-leg book whose index half was invisible
-  // looked like a one-leg book that was sometimes wrong.
-  const open = [
-    ...(state.positions || []).filter((p) => p.status === 'OPEN'),
-    ...(state.giftPositions || []).filter((p) => p.status === 'OPEN'),
-  ];
+  // Every open position, including any whose strategy_id matches no configured
+  // book. Those are real positions - an order booked under an id the dashboard
+  // does not know about - and dropping them made the totals say "flat" while the
+  // ledger held a live position. They are shown with their raw id and a warning.
+  const open = (state.positions || []).filter((p) => p.status === 'OPEN');
 
   let pnl = 0;
   let exposure = 0;
@@ -1361,13 +1333,9 @@ function renderDashPositions() {
     const mode = acct.mode || run?.mode || legs[0].mode || 'PAPER';
     const tf = run?.seconds ? `${Math.round(run.seconds / 60)}m` : (legs[0].timeframe || '');
     const name = known ? (run.name || key) : (legs[0].strategy || key);
-    // The instrument column names the venue per row rather than once per group:
-    // a two-leg book holds a future and an index at the same time, so one
-    // heading would have to be wrong for one of them.
     const instrument = String(
       legs[0].symbol || (known ? (run.symbol || run.source?.symbol || '') : ''),
     ).replace(/^(NSEIX:|NSE:)/i, '');
-    const multiVenue = new Set(legs.map((r) => r.venue || 'FUT')).size > 1;
     const subtotal = legs.reduce((sum, r) => sum + (num(r.unrealized_pnl) || 0), 0);
     return `
       <div class="pos-group${known ? '' : ' is-orphan'}">
@@ -1384,7 +1352,7 @@ function renderDashPositions() {
           <thead>
             <tr>
               <th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
-              <th class="num">LTP</th><th class="num">Points</th>
+              <th class="num">LTP</th><th class="num">Stop</th><th class="num">Points</th>
               <th class="num">P&amp;L</th><th>Opened</th>
             </tr>
           </thead>
@@ -1395,14 +1363,13 @@ function renderDashPositions() {
               const mark = num(row.mark_price);
               const points = entry === null || mark === null ? null : (mark - entry) * k;
               const legPnl = num(row.unrealized_pnl);
-              const venue = row.venue === 'GIFT' ? 'GIFT' : '';
               return `
                 <tr>
-                  <td><span class="tag ${k === 1 ? 'tag-buy' : 'tag-sell'}">${k === 1 ? 'LONG' : 'SHORT'}</span>${
-                    multiVenue ? ` <span class="pos-venue">${escapeHtml(venue || 'FUT')}</span>` : ''}</td>
+                  <td><span class="tag ${k === 1 ? 'tag-buy' : 'tag-sell'}">${k === 1 ? 'LONG' : 'SHORT'}</span></td>
                   ${cell('Qty', row.quantity)}
                   ${cell('Entry', level(entry))}
                   ${cell('LTP', level(mark))}
+                  ${cell('Stop', level(num(row.stop_price)))} 
                   ${cell('Points', signedPoints(points), points === null ? '' : (points >= 0 ? 'pos' : 'neg'))}
                   ${cell('P&L', signedInr(legPnl), pnlClass(legPnl))}
                   <td class="text-slate-400" data-label="Opened">${escapeHtml(istClock(row.entry_time) || '—')}</td>
@@ -1441,29 +1408,20 @@ function renderPositions() {
       rows: state.positions.filter(
         (p) => (p.strategy_id || '') === run.id && p.status === 'OPEN',
       ),
-      // The index leg of the same strategy, kept as its own card. The two legs
-      // are different instruments at different prices, and summing them into one
-      // "position" would report an exposure that exists nowhere.
-      giftRows: (state.giftPositions || []).filter(
-        (p) => (p.strategy_id || '') === run.id && p.status === 'OPEN',
-      ),
     });
   }
 
-  // Both venues count toward the totals: an open index leg is exposure the
-  // operator holds, even though it is simulated. Leaving it out made the panel
-  // say "flat" while a GIFT leg was running.
   let open = 0;
   let unrealised = 0;
   let exposure = 0;
   for (const book of books) {
-    for (const row of [...book.rows, ...book.giftRows]) {
+    for (const row of book.rows) {
       open += 1;
       unrealised += num(row.unrealized_pnl) || 0;
       exposure += Math.abs((num(row.mark_price) || 0) * (num(row.quantity) || 0));
     }
   }
-  const holding = books.filter((b) => b.rows.length || b.giftRows.length).length;
+  const holding = books.filter((b) => b.rows.length).length;
 
   setText('positions-caption', open
     ? `${open} open leg${open === 1 ? '' : 's'} across ${holding} book(s)`
@@ -1487,20 +1445,14 @@ function renderPositions() {
   const orphans = state.positions.filter(
     (p) => p.status === 'OPEN' && !known.has(p.strategy_id || ''),
   );
-  const giftOrphans = (state.giftPositions || []).filter(
-    (p) => p.status === 'OPEN' && !known.has(p.strategy_id || ''),
-  );
-  if (orphans.length || giftOrphans.length) {
-    const sample = orphans[0] || giftOrphans[0] || {};
+  if (orphans.length) {
+    const sample = orphans[0] || {};
     books.push({
       id: '__orphans', name: 'Unattributed', seconds: 0, mode: sample.mode || 'PAPER',
-      source: 'futures', rows: orphans, giftRows: giftOrphans, orphan: true,
+      source: 'futures', rows: orphans, orphan: true,
     });
   }
 
-  // One table per venue, because the two legs are different instruments at
-  // different prices. A single table would put a Nifty future and a GIFT index
-  // row under one "Mark" column and invite the reader to compare them.
   const legTable = (rows, venue) => {
     if (!rows.length) return '';
     return `
@@ -1536,9 +1488,8 @@ function renderPositions() {
 
   host.innerHTML = books.map((book) => {
     const isLive = book.mode === 'LIVE';
-    const giftRows = book.giftRows || [];
-    const body = book.rows.length || giftRows.length
-      ? legTable(book.rows, 'Side') + legTable(giftRows, 'GIFT')
+    const body = book.rows.length
+      ? legTable(book.rows, 'Side')
       : '<p class="position-flat">Flat — nothing open.</p>';
     return `
       <div class="position-card${book.orphan ? ' is-orphan' : ''}">
@@ -1552,29 +1503,14 @@ function renderPositions() {
   }).join('');
 }
 
-/** Index-book account metrics, only fetched while the Performance tab needs them. */
-async function loadGiftPortfolio() {
-  try {
-    state.giftPortfolio = await api(ENDPOINTS.giftPortfolio);
-  } catch (error) {
-    state.giftPortfolio = null;
-  }
-  // Only repaint when the index venue is the one on screen; otherwise this
-  // would overwrite the futures tiles with the index book's numbers.
-  if (state.analyticsVenue === 'gift') renderAnalyticsTiles(null);
-}
-
 async function poll() {
   if (state.busy) return;
   try {
     // Fast lane: only what changes tick-by-tick. The ledger endpoints are
     // fetched on a slower cadence below, so a poll is 3 requests instead of 6.
-    const [status, portfolio, giftPnl, strategies] = await Promise.all([
+    const [status, portfolio, strategies] = await Promise.all([
       api(ENDPOINTS.status),
       api(ENDPOINTS.portfolio),
-      // The index book's P&L is on the monitor tab, so it rides the fast lane.
-      // Failure is normal when GIFT_BOOK is off; the split then stays hidden.
-      api(ENDPOINTS.giftPortfolio).catch(() => null),
       // Per-strategy state changes on the same cadence as the engine, so it
       // belongs on the fast lane rather than the slower ledger one.
       api(ENDPOINTS.strategies).catch(() => null),
@@ -1582,7 +1518,6 @@ async function poll() {
 
     state.lastSync = new Date();
     state.failures = 0;
-    state.giftPnl = giftPnl;
 
     // Track server clock drift so the countdown can trust it.
     const serverTime = status.server_time ? new Date(status.server_time) : null;
@@ -1622,11 +1557,6 @@ async function poll() {
           if (state.selectedDay) renderCalendarDay(state.selectedDay);
         })
         .catch(() => { /* the tab still shows the ledger */ });
-    }
-    // The index book's account metrics are only on screen on the Performance
-    // tab, and they cost a second database read, so they ride that tab.
-    if (state.tab === 'analytics' && state.analyticsVenue === 'gift') {
-      loadGiftPortfolio();
     }
     // Token health changes rarely; refresh it on a slow cadence instead of
     // adding a request to every 1.5s poll.
@@ -1995,6 +1925,64 @@ async function initAuth() {
   }
 }
 
+async function stopAll() {
+  const btn = $('btn-stop-all');
+  // Already latched: this click clears it, which is a different confirmation.
+  if (btn && btn.dataset.stopped === '1') {
+    const ok = await confirmDialog({
+      title: 'Clear STOP ALL',
+      body: 'This allows <strong>new entries</strong> in every strategy again. '
+        + 'Only clear it once you are satisfied the problem is resolved.',
+      okLabel: 'Resume trading',
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    await withBusy(async () => {
+      try {
+        const result = await api(ENDPOINTS.stopAllClear, { method: 'POST' });
+        toast(result.stopped_all ? 'STOP ALL still engaged' : 'STOP ALL cleared',
+          result.stopped_all ? 'err' : 'ok');
+        setActionStatus('STOP ALL cleared', 'ok');
+      } catch (error) {
+        toast(`Clear failed: ${error.message}`, 'err');
+        setActionStatus(error.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    return;
+  }
+
+  const ok = await confirmDialog({
+    title: '🛑 STOP ALL',
+    body: 'This blocks <strong>new entries in every strategy</strong> immediately and '
+      + 'latches until you clear it, including across a restart. Open positions are '
+      + '<strong>not</strong> closed and keep their protective stops — use Square off '
+      + 'if you also want them closed.',
+    okLabel: 'Stop all trading',
+  });
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Stopping…';
+  await withBusy(async () => {
+    try {
+      const result = await api(ENDPOINTS.stopAll, {
+        method: 'POST',
+        body: JSON.stringify({ confirm: true, reason: 'STOP_ALL_UI' }),
+      });
+      toast(result.note || 'STOP ALL engaged', 'ok');
+      setActionStatus(result.note || 'STOP ALL engaged', 'ok');
+    } catch (error) {
+      toast(`STOP ALL failed: ${error.message}`, 'err');
+      setActionStatus(error.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'STOP ALL';
+    }
+  });
+}
+
 async function panic() {
   const ok = await confirmDialog({
     title: '🚨 Panic square-off',
@@ -2083,6 +2071,342 @@ async function toggleBookPause(event) {
 }
 
 /**
+ * Switch one book between PAPER and LIVE.
+ *
+ * Arming LIVE is confirmed first, because it is the act that starts placing real
+ * orders. The server enforces the same confirmation and the pre-flight checks;
+ * this dialog is the operator's own guard, not the only one.
+ */
+async function toggleBookMode(event) {
+  const button = event.target.closest('[data-book-mode]');
+  if (!button || button.disabled) return;
+  const strategyId = button.dataset.bookMode;
+  const current = button.dataset.bookModeCurrent;
+  const target = current === 'LIVE' ? 'PAPER' : 'LIVE';
+  if (target === 'LIVE') {
+    const ok = await confirmDialog({
+      title: 'Arm LIVE trading?',
+      body: `Switch ${strategyId} to LIVE. From the next signal this book places real orders on the NIFTY future.`,
+      strategyId,
+      action: 'PAPER → LIVE',
+      mode: 'LIVE',
+      warn: 'Real money. The book keeps its own stop and risk limits, but fills are final.',
+      okLabel: 'Arm LIVE',
+    });
+    if (!ok) return;
+  }
+  button.disabled = true;
+  try {
+    const result = await api('/api/books/mode', {
+      method: 'POST',
+      body: JSON.stringify({ strategy_id: strategyId, mode: target, confirm: true }),
+    });
+    toast(`${strategyId} switched ${result.previous} → ${result.mode}`, 'ok');
+    await poll();
+  } catch (error) {
+    toast(`Could not switch ${strategyId}: ${error.message}`, 'err');
+    button.disabled = false;
+  }
+}
+
+/**
+ * Square off one book, then pause it.
+ *
+ * Confirmed because it closes a real position in LIVE. The server scopes the
+ * exit to this book, so the other book's leg in the same contract is untouched.
+ */
+async function squareOffBook(event) {
+  const button = event.target.closest('[data-book-square-off]');
+  if (!button || button.disabled) return;
+  const strategyId = button.dataset.bookSquareOff;
+  const mode = button.dataset.bookSquareOffMode || 'PAPER';
+  const ok = await confirmDialog({
+    title: 'Square off this book?',
+    body: `Close ${strategyId}'s open position at market and pause the book. The other book's leg in the same contract is left alone.`,
+    strategyId,
+    action: 'Square off + pause',
+    mode,
+    warn: mode === 'LIVE' ? 'This sends a real market order.' : '',
+    okLabel: 'Square off',
+    danger: mode === 'LIVE',
+  });
+  if (!ok) return;
+  button.disabled = true;
+  try {
+    const result = await api('/api/books/square-off', {
+      method: 'POST',
+      body: JSON.stringify({ strategy_id: strategyId, confirm: true }),
+    });
+    toast(
+      result.ok ? `${strategyId} squared off` : `${strategyId}: ${result.reason}`,
+      result.ok ? 'ok' : 'err',
+    );
+    await poll();
+  } catch (error) {
+    toast(`Could not square off ${strategyId}: ${error.message}`, 'err');
+    button.disabled = false;
+  }
+}
+
+/**
+ * Place a manual BUY or SELL for one book.
+ *
+ * Confirmed first: in LIVE this is a real order. The server routes it through
+ * the same path as a signal, so the session gate, pause switch, duplicate-entry
+ * guard, lot/margin limits and the book's initial stop all still apply - the
+ * operator picks the direction, not the risk rules.
+ */
+async function manualBookOrder(event) {
+  const button = event.target.closest('[data-book-manual]');
+  if (!button || button.disabled) return;
+  const strategyId = button.dataset.bookManual;
+  const action = button.dataset.bookManualAction;
+  const mode = button.dataset.bookManualMode || 'PAPER';
+  const ok = await confirmDialog({
+    title: `Manual ${action}?`,
+    body: `Place a manual ${action} for ${strategyId}. It goes through the same risk checks as a signal, and the book's initial stop is applied on fill.`,
+    strategyId,
+    action: `Manual ${action}`,
+    mode,
+    warn: mode === 'LIVE' ? 'This is a real order.' : '',
+    okLabel: `Send ${action}`,
+    danger: mode === 'LIVE',
+  });
+  if (!ok) return;
+  button.disabled = true;
+  try {
+    const result = await api('/api/books/manual-order', {
+      method: 'POST',
+      body: JSON.stringify({ strategy_id: strategyId, action, confirm: true }),
+    });
+    toast(
+      result.ok
+        ? `${strategyId}: manual ${action} filled`
+        : `${strategyId}: ${result.reason}`,
+      result.ok ? 'ok' : 'err',
+    );
+    await poll();
+  } catch (error) {
+    toast(`Could not place ${action} for ${strategyId}: ${error.message}`, 'err');
+    button.disabled = false;
+  }
+}
+
+/**
+ * Move one book's protective stop.
+ *
+ * The engine's trail only ever tightens, so the dialog states the direction and
+ * the server refuses a looser level. The operator is asked for a price rather
+ * than a distance because the level is what the engine stores and what the
+ * position card shows - a distance would have to be converted, and a conversion
+ * is a place for the two to disagree.
+ */
+/**
+ * Open the stop editor for one book.
+ *
+ * A dedicated form rather than ``window.prompt``: the operator needs to see the
+ * entry, the live price, the current level and the resulting level *as they
+ * type*, and a prompt can show none of that. It also removes the "type d40 for
+ * points" syntax, which was a parser disguised as a text field.
+ */
+function editBookStop(event) {
+  const button = event.target.closest('[data-book-stopedit]');
+  if (!button || button.disabled) return;
+  const parse = (raw) => {
+    const n = Number(raw);
+    return raw !== '' && raw !== undefined && Number.isFinite(n) ? n : null;
+  };
+  openStopEditor({
+    strategyId: button.dataset.bookStopedit,
+    side: button.dataset.bookSlSide || '',
+    mode: button.dataset.bookSlMode || 'PAPER',
+    entry: parse(button.dataset.bookSlEntry),
+    current: parse(button.dataset.bookSlCurrent),
+    mark: parse(button.dataset.bookSlMark),
+    distance: parse(button.dataset.bookSlGap),
+  });
+}
+
+/** The stop editor's live state, while it is open. */
+const slState = {
+  open: false,
+  strategyId: '',
+  side: '',
+  mode: 'PAPER',
+  entry: null,
+  current: null,
+  mark: null,
+  byPoints: false,
+};
+
+function openStopEditor(opts) {
+  // A plain parameter rather than a destructured one: the static analyser that
+  // guards against undefined names cannot see names bound by destructuring, so
+  // a destructured signature reads as a call to an undefined function.
+  const { strategyId, side, mode, entry, current, mark, distance } = opts;
+  const isLong = side === 'LONG';
+  Object.assign(slState, {
+    open: true, strategyId, side, mode, entry, current, mark, byPoints: false,
+  });
+
+  setText('sl-title', `Modify stop-loss · ${strategyId}`);
+  setText('sl-sub', `${side} position. The stop may only move ${isLong ? 'up' : 'down'} - never back.`);
+  setText('sl-entry', entry === null ? '—' : level(entry));
+  setText('sl-mark', mark === null ? '—' : level(mark));
+  setText('sl-current', current === null ? '—' : level(current));
+  setText('sl-room', distance === null ? '—' : `${Math.abs(distance).toFixed(1)} pts`);
+
+  // Default to the current level so a small nudge is one edit, not a retype.
+  const input = $('sl-input');
+  input.value = current === null ? '' : current.toFixed(2);
+  input.min = '0';
+  input.step = '0.05';
+
+  setStopMode(false);
+  // Validate the seeded value immediately. Opening with "—" and a disabled
+  // button made the dialog look broken until the operator typed something,
+  // even though the field already held a valid level.
+  updateStopPreview();
+  $('sl-modal').classList.remove('hidden');
+  input.focus();
+  input.select();
+}
+
+function closeStopEditor() {
+  slState.open = false;
+  $('sl-modal').classList.add('hidden');
+}
+
+/** Switch between entering a price and entering a distance in points. */
+function setStopMode(byPoints) {
+  slState.byPoints = byPoints;
+  const priceBtn = $('sl-mode-price');
+  const pointsBtn = $('sl-mode-points');
+  priceBtn.classList.toggle('is-active', !byPoints);
+  pointsBtn.classList.toggle('is-active', byPoints);
+  priceBtn.setAttribute('aria-selected', String(!byPoints));
+  pointsBtn.setAttribute('aria-selected', String(byPoints));
+
+  setText('sl-input-label', byPoints ? 'Distance from the live price' : 'New stop price');
+  setText('sl-input-unit', byPoints ? 'points' : 'price');
+  const input = $('sl-input');
+  input.step = byPoints ? '1' : '0.05';
+  // Seed the field with the value that means "no change", so switching modes
+  // does not leave a number that reads as a different level.
+  if (byPoints) {
+    input.value = slState.distance === null || slState.distance === undefined
+      ? ''
+      : Math.abs(slState.distance).toFixed(1);
+  } else {
+    input.value = slState.current === null ? '' : slState.current.toFixed(2);
+  }
+  updateStopPreview();
+  input.focus();
+  input.select();
+}
+
+/** Resolve the typed value to a price and validate it, live. */
+function updateStopPreview() {
+  const isLong = slState.side === 'LONG';
+  const raw = $('sl-input').value.trim();
+  const value = Number(raw);
+  const error = $('sl-error');
+  const apply = $('sl-apply');
+  const preview = $('sl-preview');
+  const note = $('sl-preview-note');
+
+  const fail = (message) => {
+    error.textContent = message;
+    error.classList.remove('hidden');
+    preview.textContent = '—';
+    note.textContent = '';
+    apply.disabled = true;
+  };
+
+  if (!raw || !Number.isFinite(value) || value <= 0) {
+    fail(slState.byPoints ? 'Enter a distance in points.' : 'Enter a stop price.');
+    return;
+  }
+
+  let resolved;
+  if (slState.byPoints) {
+    if (slState.mark === null) {
+      fail('No live price to measure from. Use "By price" instead.');
+      return;
+    }
+    resolved = Math.round((slState.mark - (isLong ? 1 : -1) * value) * 100) / 100;
+  } else {
+    resolved = Math.round(value * 100) / 100;
+  }
+
+  // The engine's own invariant: a stop may tighten, never widen.
+  if (slState.current !== null) {
+    const tightens = (resolved - slState.current) * (isLong ? 1 : -1);
+    if (tightens < 0) {
+      fail(
+        `That would widen the stop. A ${isLong ? 'long' : 'short'} stop may only move `
+          + `${isLong ? 'up' : 'down'} from ${level(slState.current)}.`,
+      );
+      return;
+    }
+    if (tightens === 0) {
+      // Not an error: the field is seeded with the current level so a small
+      // nudge is one edit. Say what to do rather than flagging red on open.
+      error.classList.add('hidden');
+      preview.textContent = level(resolved);
+      note.textContent = 'unchanged - enter a new level';
+      apply.disabled = true;
+      return;
+    }
+  }
+
+  error.classList.add('hidden');
+  preview.textContent = level(resolved);
+  const moved = slState.current === null ? null : (resolved - slState.current) * (isLong ? 1 : -1);
+  note.textContent = moved === null
+    ? 'first stop on this position'
+    : `tightens by ${moved.toFixed(1)} pts`;
+  apply.disabled = false;
+  apply.dataset.resolved = String(resolved);
+}
+
+/** Apply the stop the editor has resolved. */
+async function applyStopEditor() {
+  const apply = $('sl-apply');
+  if (apply.disabled || !slState.open) return;
+  const resolved = Number(apply.dataset.resolved);
+  if (!Number.isFinite(resolved)) return;
+
+  apply.disabled = true;
+  apply.textContent = 'Moving…';
+  try {
+    const result = await api('/api/books/stop', {
+      method: 'POST',
+      body: JSON.stringify({
+        strategy_id: slState.strategyId,
+        stop: resolved,
+        confirm: true,
+        reason: 'MANUAL_SL',
+      }),
+    });
+    closeStopEditor();
+    toast(
+      `${slState.strategyId}: stop ${result.previous_stop === null ? 'set' : 'moved'} to ${result.stop.toFixed(2)}`,
+      'ok',
+    );
+    await poll();
+  } catch (error) {
+    const box = $('sl-error');
+    box.textContent = error.message;
+    box.classList.remove('hidden');
+    apply.disabled = false;
+  } finally {
+    apply.textContent = 'Move stop';
+  }
+}
+
+/**
+ * The five summary figures at the top of the dashboard./**
  * The five summary figures at the top of the dashboard.
  *
  * Everything here is derived from payloads the page already fetches, so this
@@ -2094,12 +2418,7 @@ async function toggleBookPause(event) {
 function renderSummary(payload) {
   const runs = (payload && payload.runs) || [];
   const perf = (payload && payload.performance) || {};
-  // Both venues: an open index leg is exposure the strategy is carrying, and
-  // leaving it out made the headline say "flat" while a GIFT leg was running.
-  const open = [
-    ...(state.positions || []).filter((p) => p.status === 'OPEN'),
-    ...(state.giftPositions || []).filter((p) => p.status === 'OPEN'),
-  ];
+  const open = (state.positions || []).filter((p) => p.status === 'OPEN');
 
   let realised = 0;
   let closed = 0;
@@ -2164,6 +2483,67 @@ function syncBookFilter(runs) {
   }
 }
 
+/**
+ * The group's shared facts, stated once above its tiles.
+ *
+ * Both books trade the same contract, so the instrument, the venue and the
+ * combined exposure are properties of the *group*, not of either tile. Repeating
+ * them in both tiles made two strategies on one instrument read as two unrelated
+ * things; stating them once here is what makes the pair legible as one position
+ * at the broker.
+ *
+ * The figures are summed across books but never across modes: a LIVE leg and a
+ * PAPER leg are different money, and adding them would produce a number that is
+ * true of neither.
+ */
+function renderGroupSummary(books, perf, accounts) {
+  if (!books.length) return '';
+  const modes = new Set(books.map((r) => (accounts[r.id] || {}).mode || r.mode || 'PAPER'));
+  const mixed = modes.size > 1;
+  const modeLabel = mixed ? 'MIXED' : [...modes][0];
+
+  let netPnl = 0;
+  let openUnits = 0;
+  let trades = 0;
+  let havePnl = false;
+  for (const run of books) {
+    const book = perf[run.id] || {};
+    const pnl = num(book.net_pnl);
+    if (pnl !== null) { netPnl += pnl; havePnl = true; }
+    trades += Number(book.trades) || 0;
+    openUnits += Number((run.state || {}).open_units) || 0;
+  }
+
+  const positionText = openUnits === 0
+    ? 'Flat'
+    : `${openUnits > 0 ? 'Long' : 'Short'} ${Math.abs(openUnits)}`;
+  const pnlClass = netPnl > 0 ? 'pos' : netPnl < 0 ? 'neg' : '';
+
+  return `
+    <div class="book-group-summary">
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Venue</span>
+        <span class="book-group-summary-value">NIFTY futures</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Mode</span>
+        <span class="book-group-summary-value">${escapeHtml(modeLabel)}</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Net position</span>
+        <span class="book-group-summary-value">${escapeHtml(positionText)}</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Combined P&amp;L</span>
+        <span class="book-group-summary-value ${pnlClass}">${havePnl ? signedInr(netPnl) : '—'}</span>
+      </span>
+      <span class="book-group-summary-item">
+        <span class="book-group-summary-label">Trades</span>
+        <span class="book-group-summary-value">${trades}</span>
+      </span>
+    </div>`;
+}
+
 function renderStrategies(payload) {
   const host = $('book-bands');
   if (!host) return;
@@ -2173,44 +2553,25 @@ function renderStrategies(payload) {
   syncBookFilter(runs);
   const perf = (payload && payload.performance) || {};
   const accounts = (payload && payload.accounts) || {};
-  // Per-leg score, so a two-leg strategy can be read as two positions rather
-  // than one blended figure.
-  const legPerf = (payload && payload.leg_performance) || {};
 
   if (!runs.length) {
     host.innerHTML = '<p class="condition-empty">No strategy is configured.</p>';
     return;
   }
 
-  // Grouped by where the book is *exposed*, not by where its signal comes from.
+  // Both strategies execute on the NIFTY future, so there is one column. The
+  // signal series differs (GIFT 15m vs NIFTY 60m) and each tile names its own,
+  // but the venue the operator is exposed to is the same for both.
   //
-  // A strategy reads one series and executes on another, and the two are not
-  // always the same instrument: a GIFT-sourced book that carries its trade on
-  // the Nifty future is NIFTY exposure, and filing it under "GIFT Nifty" put a
-  // real futures position in a column labelled "paper only". The column is the
-  // venue the operator is actually exposed to, which is what they scan for.
-  //
-  // One column per book, chosen by the leg that carries real exposure: the
-  // futures leg if it has one, otherwise the index leg. A two-leg book is one
-  // strategy, so drawing it in both columns would show the same tile twice and
-  // read as two books. The tile names its signal series when that differs from
-  // the column, so "GIFT signal, NIFTY exposure" is stated rather than implied.
-  //
-  // Within a column the books are ordered by timeframe, so 15m and 60m of the
-  // same venue sit one above the other.
-  const legsOf = (run) => (Array.isArray(run.legs) && run.legs.length ? run.legs : ['futures']);
-  const columnFor = (run) => (legsOf(run).includes('futures') ? 'nifty' : 'gift');
-
+  // Within the column the books are ordered by timeframe, so 15m and 60m sit one
+  // above the other.
   const columns = [
     { key: 'nifty', title: 'NIFTY 50', note: 'NSE · traded via the future' },
-    { key: 'gift', title: 'GIFT Nifty', note: 'NSEIX · 24h index, paper only' },
   ];
 
   const buckets = new Map(columns.map((c) => [c.key, []]));
   for (const run of runs) {
-    const key = columnFor(run);
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(run);
+    buckets.get('nifty').push(run);
   }
 
   host.innerHTML = columns.map((column) => {
@@ -2218,7 +2579,7 @@ function renderStrategies(payload) {
       .slice()
       .sort((a, b) => (a.seconds || 0) - (b.seconds || 0));
     const body = books.length
-      ? books.map((run) => renderBookBand(run, perf, accounts, column.key, legPerf)).join('')
+      ? books.map((run) => renderBookBand(run, perf, accounts, column.key)).join('')
       : '<p class="condition-empty">No book on this instrument.</p>';
     return `
       <section class="book-group">
@@ -2229,6 +2590,7 @@ function renderStrategies(payload) {
           </div>
           <span class="book-group-count">${books.length} book${books.length === 1 ? '' : 's'}</span>
         </div>
+        ${renderGroupSummary(books, perf, accounts)}
         <div class="book-group-tiles">
           ${body}
         </div>
@@ -2245,7 +2607,7 @@ function renderStrategies(payload) {
  * belonged to which. What changed is the density: the same numbers in four
  * compact rows instead of four boxed sections, so four tiles fit on one screen.
  */
-function renderBookBand(run, perf, accounts, columnKey, legPerf) {
+function renderBookBand(run, perf, accounts, columnKey) {
   const st = run.state || {};
   const src = run.source || {};
   const values = st.last_values || {};
@@ -2355,92 +2717,91 @@ function renderBookBand(run, perf, accounts, columnKey, legPerf) {
       : `Holding ${open > 0 ? 'long' : 'short'} ${Math.abs(open)}; exits at ${level(singleFlip)} `
         + 'or on the next flip.';
 
+  // The protective stop, from the open position's own row. A flat book has no
+  // stop to show; a book with stops disabled says so rather than showing a dash
+  // that reads as "missing data".
+  const openRow = (state.positions || []).find(
+    (p) => p.status === 'OPEN' && (p.strategy_id || '') === run.id,
+  );
+  // The API publishes the stop as ``stop_price`` / ``initial_stop_price`` (the
+  // enriched names), not the raw ledger columns ``trailing_stop`` /
+  // ``initial_sl_price``. Reading the raw names returned undefined for every
+  // position, so the tile showed "—" and the Edit button never appeared - the
+  // feature was there but unreachable.
+  const stopLevel = openRow ? num(openRow.stop_price) : null;
+  const initialStop = openRow ? num(openRow.initial_stop_price) : null;
+  // Points between the live mark and the stop: how much room is left before the
+  // position is out. This is the number a trader watches, so it is shown beside
+  // the level rather than left to be worked out from two prices.
+  const stopDistance = openRow ? num(openRow.stop_distance_points) : null;
+  const stopText = stopLevel === null
+    ? (run.stop_loss ? '—' : 'off')
+    : level(stopLevel);
+  const stopDistanceText = stopDistance === null
+    ? ''
+    : `${stopDistance >= 0 ? '' : '+'}${Math.abs(stopDistance).toFixed(1)} pts`;
+  const stopTitle = stopLevel === null
+    ? (run.stop_loss ? 'No open position to protect' : 'Stops are disabled for this book')
+    : `Initial ${initialStop === null ? '—' : level(initialStop)} · now ${level(stopLevel)}`
+      + (stopDistance === null ? '' : ` · ${stopDistance.toFixed(1)} pts from the mark`);
+
+  // Whether the exchange is holding a stop, not just whether the engine is
+  // watching one. The two are different facts and only the first survives this
+  // process dying, so a LIVE position with no resting SL-M is called out rather
+  // than shown as protected.
+  const protection = openRow ? String(openRow.protection || '') : '';
+  const protectiveStop = openRow ? num(openRow.protective_stop) : null;
+  const protectionBadge = (() => {
+    if (!openRow) return '';
+    if (protection === 'PAPER') return '';
+    if (protection === 'PROTECTED') {
+      return `<span class="book-protect is-ok" title="${escapeHtml(
+        `Zerodha is holding an SL-M at ${protectiveStop === null ? '—' : level(protectiveStop)}. `
+        + 'It fires even if this bot stops running.')}">SL-M</span>`;
+    }
+    if (protection === 'LAGGING') {
+      return `<span class="book-protect is-warn" title="${escapeHtml(
+        `The exchange is still holding ${protectiveStop === null ? 'an older level' : level(protectiveStop)} `
+        + `while the engine has moved to ${stopLevel === null ? '—' : level(stopLevel)}. `
+        + 'The position is protected, just not as tightly as shown. The next reconcile retries.')}">SL-M lag</span>`;
+    }
+    if (protection === 'STALE') {
+      return `<span class="book-protect is-bad" title="${escapeHtml(
+        `The protective order is ${openRow.protective_status || 'not resting'}. `
+        + 'It is not protecting this position.')}">SL-M ${escapeHtml(String(openRow.protective_status || 'stale'))}</span>`;
+    }
+    return `<span class="book-protect is-bad" title="${escapeHtml(
+      'No exchange-held stop on this LIVE position. Only the software stop protects it, '
+      + 'so a crash or an API outage would leave it unprotected.')}">NO SL-M</span>`;
+  })();
+
+  // The stop editor, built outside the tile template. A nested template literal
+  // here is unreadable and the static analyser that guards against undefined
+  // names cannot parse it, so the markup is assembled first.
+  // The control is always rendered, disabled when there is nothing to protect.
+  // Hiding it on a flat book made the feature undiscoverable: an operator
+  // looking for "where do I move the stop" found no control at all and
+  // concluded it did not exist. A disabled button with a reason answers that
+  // question instead of raising it.
+  const stopEditButton = openRow
+    ? '<button class="book-stop-edit" type="button"'
+      + ` data-book-stopedit="${escapeHtml(run.id)}"`
+      + ` data-book-sl-current="${escapeHtml(stopLevel === null ? '' : stopLevel)}"`
+      + ` data-book-sl-entry="${escapeHtml(openRow.entry_price)}"`
+      + ` data-book-sl-side="${escapeHtml(openRow.side || '')}"`
+      + ` data-book-sl-mode="${escapeHtml(bookMode)}"`
+      + ` data-book-sl-gap="${escapeHtml(stopDistance === null ? '' : stopDistance)}"`
+      + ` data-book-sl-mark="${escapeHtml(openRow.mark_price === undefined ? '' : openRow.mark_price)}"`
+      + ` title="${escapeHtml('Move the stop for ' + (run.name || run.id) + '. It may only tighten, never widen.')}"`
+      + ' aria-label="Modify stop-loss">Edit</button>'
+    : '<button class="book-stop-edit is-disabled" type="button" disabled'
+      + ` title="${escapeHtml('No open position on ' + (run.name || run.id) + ' to protect. The stop becomes editable once a trade is on.')}"`
+      + ' aria-label="Modify stop-loss (no open position)">Edit</button>';
+
   const detail = err || st.last_detail || 'no evaluation yet';
   const counts = signal === 'BEAR' ? `${sellN}/${total} short`
     : signal === 'BULL' ? `${buyN}/${total} long`
       : `${buyN} long · ${sellN} short`;
-
-  // A two-leg strategy is split into one card per execution leg. The legs are
-  // independent positions - different instruments, different fills, different
-  // P&L - so drawing them as a single "Position" row hid one of them behind the
-  // other. The shared header keeps them recognisably one strategy; the cards
-  // below are what is actually held.
-  const legCards = renderLegCards(run, legPerf, columnKey);
-  if (legCards) {
-    // The exit level is a property of the *signal*, not of a leg: both legs
-    // share it, so stating it inside each card printed the same number twice.
-    // It belongs here, beside the verdict it came from - and it is the same
-    // figure singleFlip already computed, so it is reused rather than derived
-    // a second time (two copies of one rule is how they drift apart).
-    const holds = num(st.open_units) || 0;
-    const legFooter = singleFlip === null
-      ? 'No level to act on yet - the indicators have not produced a value.'
-      : holds === 0
-        ? `Waiting for a fresh flip. Both legs would act at ${level(singleFlip)}.`
-        : `Holding ${holds > 0 ? 'long' : 'short'} ${Math.abs(holds)}. `
-          + `Either leg exits at ${level(singleFlip)} or on the next flip.`;
-
-    // A split tile carries a lot: two legs, two rule rows, a verdict. The head is
-    // kept to what identifies the book - its name, the series it reads, and how
-    // it is running - because every chip added here pushes the positions down.
-    const modeChip = `
-          <span class="book-band-mode ${bookMode === 'LIVE' ? 'is-live' : 'is-paper'}"
-            title="${escapeHtml(bookMode === 'LIVE'
-              ? `Real orders. Equity is ${acctSource}.`
-              : run.live
-                ? 'Armed for LIVE - real orders once the bot is switched to LIVE. '
-                  + 'Simulated until then.'
-                : 'Simulated. Its orders, fills and P&L stay in the paper ledger.')}"
-          >${escapeHtml(bookMode)}${run.live && bookMode !== 'LIVE'
-            ? '<span class="book-band-armed" title="Armed for LIVE">armed</span>'
-            : ''}</span>`;
-    return `
-    <article class="book-band book-band-split ${tone}">
-      <div class="book-band-head">
-        <div class="book-band-headline">
-          <span class="book-band-title">${escapeHtml(run.name || run.id)}</span>
-          <span class="book-band-venue">${escapeHtml(
-            `${signalVenue || 'series'} signal · ${Math.round((run.seconds || 0) / 60)}m`)}</span>
-          ${modeChip}
-        </div>
-        <span class="book-band-actions">
-          <span class="pill pill-${stateVariant}">${escapeHtml(stateText)}</span>
-          <button
-            class="book-pause ${paused ? 'is-paused' : ''}"
-            type="button"
-            data-book-pause="${escapeHtml(run.id)}"
-            aria-pressed="${paused ? 'true' : 'false'}"
-            title="${escapeHtml(paused
-              ? `Resume ${run.name || run.id}. Entries resume on its next signal.`
-              : `Pause ${run.name || run.id}. Its exits stay available.`)}"
-          >${paused ? 'Resume' : 'Pause'}</button>
-        </span>
-      </div>
-
-      <div class="book-band-signal">
-        <span class="book-band-signal-value ${signalClass}">${escapeHtml(signal)}</span>
-        <span class="book-band-signal-note">${escapeHtml(signalNote)}</span>
-        <span class="book-band-close-inline" title="${escapeHtml(`Bar closed at ${g.close === null ? '—' : level(g.close)}; range ${g.range ? level(g.range, 1) : '—'}`)}">
-          ${g.close === null ? '—' : level(g.close)}
-        </span>
-      </div>
-
-      <div class="book-band-rules">
-        ${ruleRow('SuperTrend', g.st === null ? '—' : level(g.st), stDir,
-          g.stGap === null ? '—' : `${level(g.stGap, 1)}`, g.stNear)}
-        ${ruleRow('PSAR', g.psar === null ? '—' : level(g.psar), psarDir,
-          g.psarGap === null ? '—' : `${level(g.psarGap, 1)}`, g.psarNear)}
-      </div>
-
-      <div class="book-leg-cards">
-        ${legCards}
-      </div>
-
-      <p class="strategy-detail${err ? ' is-bad' : ''}" title="${escapeHtml(detail)}">
-        ${escapeHtml(err ? detail : legFooter)}
-      </p>
-    </article>`;
-  }
 
   return `
     <article class="book-band ${tone}">
@@ -2469,6 +2830,15 @@ function renderBookBand(run, perf, accounts, columnKey, legPerf) {
         <span class="book-band-actions">
           <span class="pill pill-${stateVariant}">${escapeHtml(stateText)}</span>
           <button
+            class="book-mode-toggle ${bookMode === 'LIVE' ? 'is-live' : 'is-paper'}"
+            type="button"
+            data-book-mode="${escapeHtml(run.id)}"
+            data-book-mode-current="${escapeHtml(bookMode)}"
+            title="${escapeHtml(bookMode === 'LIVE'
+              ? `Switch ${run.name || run.id} to PAPER. Requires its live position to be flat.`
+              : `Switch ${run.name || run.id} to LIVE. Real orders will be placed.`)}"
+          >${escapeHtml(bookMode)}</button>
+          <button
             class="book-pause ${paused ? 'is-paused' : ''}"
             type="button"
             data-book-pause="${escapeHtml(run.id)}"
@@ -2477,6 +2847,31 @@ function renderBookBand(run, perf, accounts, columnKey, legPerf) {
               ? `Resume ${run.name || run.id}. Entries resume on its next signal.`
               : `Pause ${run.name || run.id}. Its exits stay available.`)}"
           >${paused ? 'Resume' : 'Pause'}</button>
+          <button
+            class="book-square-off"
+            type="button"
+            data-book-square-off="${escapeHtml(run.id)}"
+            data-book-square-off-mode="${escapeHtml(bookMode)}"
+            title="${escapeHtml(`Square off ${run.name || run.id} and pause it. Never touches the other book.`)}"
+          >Square off</button>
+          <span class="book-manual" role="group" aria-label="Manual orders">
+            <button
+              class="book-manual-buy"
+              type="button"
+              data-book-manual="${escapeHtml(run.id)}"
+              data-book-manual-action="BUY"
+              data-book-manual-mode="${escapeHtml(bookMode)}"
+              title="${escapeHtml(`Manual BUY for ${run.name || run.id}. Same risk rules as an automated signal.`)}"
+            >Buy</button>
+            <button
+              class="book-manual-sell"
+              type="button"
+              data-book-manual="${escapeHtml(run.id)}"
+              data-book-manual-action="SELL"
+              data-book-manual-mode="${escapeHtml(bookMode)}"
+              title="${escapeHtml(`Manual SELL for ${run.name || run.id}. Same risk rules as an automated signal.`)}"
+            >Sell</button>
+          </span>
         </span>
       </div>
 
@@ -2500,6 +2895,15 @@ function renderBookBand(run, perf, accounts, columnKey, legPerf) {
           <span class="book-band-foot-label">Position</span>
           <span class="book-band-foot-value ${open === 0 ? 'is-flat' : ''}">${escapeHtml(positionText)}</span>
         </span>
+        <span class="book-band-foot-item book-band-stop${openRow ? ' is-editable' : ''}"
+          title="${escapeHtml(stopTitle)}">
+          <span class="book-band-foot-label">Stop</span>
+          <span class="book-band-foot-value">${escapeHtml(stopText)}</span>
+          ${stopDistanceText ? `<span class="book-band-stop-distance" title="${escapeHtml(
+            'Points between the live mark and the stop - how much room is left before the position is out')}">${escapeHtml(stopDistanceText)}</span>` : ''}
+          ${protectionBadge}
+          ${stopEditButton}
+        </span>
         <span class="book-band-foot-item">
           <span class="book-band-foot-label">P&amp;L</span>
           <span class="book-band-foot-value ${pnlClass(pnl)}">${pnl === null ? '—' : signedInr(pnl)}</span>
@@ -2518,194 +2922,6 @@ function renderBookBand(run, perf, accounts, columnKey, legPerf) {
     </article>`;
 }
 
-
-/**
- * One card per execution leg, for a strategy that carries its signal on more
- * than one venue.
- *
- * The legs are independent positions: different instruments, different fills,
- * different P&L. Drawing them as a single "Position" row hid one behind the
- * other, so a two-leg strategy looked like a one-leg strategy that was sometimes
- * wrong. Each card now states its own venue, mode, position, entry, mark, flip
- * level and score.
- *
- * Returns '' for a single-leg book, which keeps its one footer row: a card per
- * leg would repeat the same numbers in a shape twice the height.
- *
- * A configured leg with nothing open is still drawn, because "flat" is
- * information - an absent card would leave the reader unsure whether the leg was
- * flat or the panel was broken.
- */
-function renderLegCards(run, legPerf, columnKey) {
-  const st = run.state || {};
-  const legs = Array.isArray(run.legs) && run.legs.length ? run.legs : ['futures'];
-  if (legs.length < 2) return '';
-  // The verdict, used to say why a flat leg is waiting. Read here rather than
-  // passed in: the split tile has already computed it, and threading it through
-  // as another parameter is what made a caller able to forget it.
-  const signal = st.last_signal || 'NO_SIGNAL';
-
-  // Open rows per venue. Futures rows live in the main ledger keyed by the book;
-  // the GIFT rows come from the index book's own endpoint, already stamped with
-  // the strategy that owns them.
-  const futuresRows = (state.positions || []).filter(
-    (p) => p.status === 'OPEN' && (p.strategy_id || '') === run.id,
-  );
-  const giftRows = (state.giftPositions || []).filter(
-    (p) => p.status === 'OPEN' && (p.strategy_id || '') === run.id,
-  );
-  const rowsFor = (leg) => (leg === 'gift' ? giftRows : futuresRows);
-
-  // The exit level the strategy would act on: the price at which *both* rules
-  // turn the other way, which is the only "stop" this strategy has. For a long
-  // that is the lower of the two levels (price has to fall through both), for a
-  // short the higher (it has to rise through both). Shared across legs because
-  // both read the same signal; only the fills differ.
-  const g = flipGaps(num(run.last_close), st.last_values || {});
-  const levels = [g.st, g.psar].filter((v) => v !== null);
-  const flip = levels.length === 0
-    ? null
-    : (st.last_signal === 'BEAR' ? Math.max(...levels) : Math.min(...levels));
-
-  return legs.map((leg) => {
-    const isGift = leg === 'gift';
-    const rows = rowsFor(leg);
-    const book = ((legPerf || {})[run.id] || {})[leg] || {};
-    const legPnl = num(book.net_pnl);
-
-    // A GIFT leg is paper by construction - the index cannot be filled - so the
-    // chip says so rather than inheriting the book's LIVE label. A futures leg
-    // inherits the book's own mode, which is not the bot's.
-    const modeText = isGift ? 'PAPER' : (run.mode || 'PAPER');
-    const armed = !isGift && run.live && modeText !== 'LIVE';
-
-    // One leg can hold more than one row only if a rollover left an old
-    // contract behind, which the order manager refuses; the first row is the
-    // position, so the card reports that and lists any extra as a note.
-    const row = rows[0] || null;
-    const key = row ? (num(row.position_key) || 1) : 0;
-    const entry = row ? num(row.entry_price) : null;
-    const mark = row ? num(row.mark_price) : null;
-    const points = entry === null || mark === null ? null : (mark - entry) * key;
-    const openPnl = row ? num(row.unrealized_pnl) : null;
-
-    const positionText = !row
-      ? 'Flat'
-      : `${key === 1 ? 'Long' : 'Short'} ${row.quantity}`;
-    const positionClass = !row ? 'is-flat' : key === 1 ? 'is-long' : 'is-short';
-    const venueText = isGift ? 'GIFT index' : 'NIFTY futures';
-    const venueNote = isGift
-      ? 'paper · index cannot be filled'
-      : (run.source && /gift/i.test(run.source.symbol || '') ? 'signal read from GIFT' : '');
-
-    const extra = rows.length > 1
-      ? `<span class="leg-card-extra" title="${escapeHtml(
-        `This leg also holds ${rows.slice(1).map((r) => r.symbol).join(', ')}`)}">+${rows.length - 1}</span>`
-      : '';
-
-    // Realised is always worth stating; open P&L only exists while holding. Both
-    // go on one line so the card is not a footer of em-dashes when flat.
-    const closedText = (book.trades ?? 0) === 0
-      ? 'no closed trades yet'
-      : `${book.trades} closed · win ${book.win_rate ?? 0}%`;
-
-    // A flat leg is the common case and it was the least readable: four columns
-    // of em-dashes under a big "Flat" said nothing. What an operator actually
-    // needs from a flat leg is where it *would* act, so that is what it says -
-    // the price the entry direction has to reach, and the reason it is waiting.
-    if (!row) {
-      // Why it is flat, in the strategy's own terms. A book holding no position
-      // enters on a *transition*, not on the state - so "the rules agree" is not
-      // enough and saying only that would leave the reader expecting an entry
-      // that cannot come. The three cases are genuinely different and the note
-      // has to name the one that applies.
-      const waiting = signal === 'NO_SIGNAL'
-        ? 'SuperTrend and PSAR disagree, so there is no signal to act on'
-        : `rules already ${signal === 'BULL' ? 'long' : 'short'} - this leg enters on the next flip, not on the state`;
-      return `
-      <div class="leg-card is-flat ${isGift ? 'is-gift' : 'is-futures'}">
-        <div class="leg-card-head">
-          <span class="leg-card-venue">${escapeHtml(venueText)}</span>
-          <span class="book-band-mode ${isGift ? 'is-paper' : (modeText === 'LIVE' ? 'is-live' : 'is-paper')}"
-            title="${escapeHtml(isGift
-              ? 'GIFT Nifty is quote-only on Kite, so this leg can never reach a broker.'
-              : armed
-                ? 'Armed for LIVE - real orders once the bot is switched to LIVE.'
-                : modeText === 'LIVE' ? 'Real orders at the broker.' : 'Simulated fills.')}"
-          >${escapeHtml(modeText)}${armed
-            ? '<span class="book-band-armed" title="Armed for LIVE">armed</span>' : ''}</span>
-        </div>
-
-        <div class="leg-card-flat">
-          <span class="leg-card-flat-state">No position</span>
-        </div>
-        <p class="leg-card-flat-note">${escapeHtml(waiting)}</p>
-
-        <div class="leg-card-foot">
-          <span class="leg-card-foot-item" title="${escapeHtml(closedText)}">
-            <span class="leg-card-foot-label">Realised</span>
-            <span class="leg-card-foot-value ${pnlClass(legPnl)}">${
-              legPnl === null ? '—' : signedInr(legPnl)}</span>
-          </span>
-          <span class="leg-card-foot-note">${escapeHtml(
-            (book.trades ?? 0) === 0 ? '—' : `${book.trades} trade${book.trades === 1 ? '' : 's'}`)}</span>
-        </div>
-      </div>`;
-    }
-
-    return `
-      <div class="leg-card ${isGift ? 'is-gift' : 'is-futures'}">
-        <div class="leg-card-head">
-          <span class="leg-card-venue">${escapeHtml(venueText)}</span>
-          <span class="book-band-mode ${isGift ? 'is-paper' : (modeText === 'LIVE' ? 'is-live' : 'is-paper')}"
-            title="${escapeHtml(isGift
-              ? 'GIFT Nifty is quote-only on Kite, so this leg can never reach a broker.'
-              : armed
-                ? 'Armed for LIVE - real orders once the bot is switched to LIVE.'
-                : modeText === 'LIVE' ? 'Real orders at the broker.' : 'Simulated fills.')}"
-          >${escapeHtml(modeText)}${armed
-            ? '<span class="book-band-armed" title="Armed for LIVE">armed</span>' : ''}</span>
-        </div>
-
-        <div class="leg-card-position">
-          <span class="leg-card-side ${positionClass}">${escapeHtml(positionText)}</span>
-          ${extra}
-          <span class="leg-card-open ${pnlClass(openPnl)}" title="Unrealised, marked live">${
-            signedInr(openPnl)}</span>
-        </div>
-
-        <dl class="leg-card-levels">
-          <div>
-            <dt>Entry</dt>
-            <dd>${level(entry)}</dd>
-          </div>
-          <div>
-            <dt>Now</dt>
-            <dd>${level(mark)}</dd>
-          </div>
-          <div>
-            <dt>Points</dt>
-            <dd class="${points === null ? '' : (points >= 0 ? 'pos' : 'neg')}">
-              ${signedPoints(points)}</dd>
-          </div>
-          <div>
-            <dt title="The price where both rules turn; the only stop this strategy has">Exit at</dt>
-            <dd>${flip === null ? '—' : level(flip)}</dd>
-          </div>
-        </dl>
-
-        <div class="leg-card-foot">
-          <span class="leg-card-foot-item" title="${escapeHtml(closedText)}">
-            <span class="leg-card-foot-label">Realised</span>
-            <span class="leg-card-foot-value ${pnlClass(legPnl)}">${
-              legPnl === null ? '—' : signedInr(legPnl)}</span>
-          </span>
-          <span class="leg-card-foot-note">${escapeHtml(
-            (book.trades ?? 0) === 0 ? '—' : `${book.trades} trade${book.trades === 1 ? '' : 's'}`)}</span>
-        </div>
-      </div>`;
-  }).join('');
-}
 
 /**
  * Fill the alerting panel: where alerts would go, and whether they are armed.
@@ -2838,13 +3054,10 @@ function exportCsv() {
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
   const link = document.createElement('a');
   link.href = url;
-  // Name the venue in the file: the two books export the same columns, so
-  // without it two downloads are indistinguishable.
-  const venue = state.ordersVenue === 'gift' ? 'gift_index' : 'nifty_future';
-  // The book filter is reflected in the name too, or two exports taken with
+  // The book filter is reflected in the name, or two exports taken with
   // different filters look like the same file.
   const book = selectedBook() ? `_${selectedBook()}` : '';
-  link.download = `order_book_${venue}${book}_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.csv`;
+  link.download = `order_book_nifty_future${book}_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -3012,7 +3225,6 @@ function switchTab(tab) {
     renderCalendar();
     renderTrades();
     renderAnalyticsTiles(null);
-    if (state.analyticsVenue === 'gift') loadGiftPortfolio();
   }
   // The log tail is only interesting on its own tab, and each refresh costs a
   // file read, so the interval lives and dies with the tab.
@@ -3045,11 +3257,35 @@ function init() {
   $('btn-pause').addEventListener('click', togglePause);
   $('btn-resume').addEventListener('click', togglePause);
   $('btn-panic').addEventListener('click', panic);
+  $('btn-stop-all').addEventListener('click', stopAll);
   $('btn-logout').addEventListener('click', signOut);
   $('btn-risk-clear').addEventListener('click', clearRiskBreach);
 
   $('btn-orders-csv').addEventListener('click', exportCsv);
+  $('btn-orders-reconcile').addEventListener('click', reconcileOrders);
   $('book-bands').addEventListener('click', toggleBookPause);
+  $('book-bands').addEventListener('click', toggleBookMode);
+  $('book-bands').addEventListener('click', squareOffBook);
+  $('book-bands').addEventListener('click', manualBookOrder);
+  $('book-bands').addEventListener('click', editBookStop);
+
+  // Stop editor wiring. The preview updates on every keystroke so the operator
+  // sees the resulting level before committing, and Enter applies it.
+  $('sl-mode-price').addEventListener('click', () => setStopMode(false));
+  $('sl-mode-points').addEventListener('click', () => setStopMode(true));
+  $('sl-input').addEventListener('input', updateStopPreview);
+  $('sl-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); applyStopEditor(); }
+    if (event.key === 'Escape') { event.preventDefault(); closeStopEditor(); }
+  });
+  $('sl-apply').addEventListener('click', applyStopEditor);
+  $('sl-cancel').addEventListener('click', closeStopEditor);
+  $('sl-modal').addEventListener('click', (event) => {
+    if (event.target === $('sl-modal')) closeStopEditor();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && slState.open) closeStopEditor();
+  });
   $('btn-alerts-test').addEventListener('click', sendTestAlert);
   $('btn-alert-toggle').addEventListener('click', toggleAlerting);
 
@@ -3101,36 +3337,18 @@ function init() {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(renderOrders, 120);
   });
-  $('orders-mode').addEventListener('change', renderOrders);
+  $('orders-mode').addEventListener('change', () => {
+    renderOrders();
+    // The pending strip is mode-scoped too, so it has to be refetched rather
+    // than re-rendered from the previous mode's rows.
+    loadLedger().catch((error) => toast(`Ledger: ${error.message}`, 'err'));
+  });
   // The book filter narrows both the order book and the signal trail, so both
   // are repainted: leaving the signal trail showing every book's decisions while
   // the order book showed one book's would make the two panels disagree.
   $('orders-book').addEventListener('change', () => {
     renderOrders();
     renderSignals();
-  });
-  $('orders-venue').addEventListener('change', (event) => {
-    state.ordersVenue = event.target.value;
-    // The signal trail is per-book too, so it is rebuilt from the new venue's
-    // rows rather than left showing the other book's decisions.
-    renderOrders();
-    renderSignals();
-  });
-  $('analytics-venue').addEventListener('change', (event) => {
-    state.analyticsVenue = event.target.value;
-    // The calendar and ledger are per-book, so both are rebuilt from the new
-    // venue's data rather than filtered in place.
-    state.selectedDay = null;
-    state.calendarLoadedAt = 0;
-    renderTrades();
-    renderAnalyticsTiles(null);
-    loadCalendarData()
-      .then(() => {
-        renderCalendar();
-        renderCalendarDay(null);
-      })
-      .catch(() => { /* the previous rollup stays on screen */ });
-    if (state.analyticsVenue === 'gift') loadGiftPortfolio();
   });
 
   // Pause polling while the tab is hidden; refresh immediately on return so

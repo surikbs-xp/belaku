@@ -64,9 +64,13 @@ your machine, anyone who can send a request can panic the account.
 | `DEFAULT_LOTS` | `1` | Lots per entry |
 | `NIFTY_LOT_SIZE` | `65` | Fallback when Kite instruments are unavailable |
 | `MAX_OPEN_LOTS` | `4` | Hard cap on concurrent lots |
+| `MAX_DAILY_LOSS` | `0` | Daily realised-loss cap in rupees; blocks new entries once reached. `0` disables it. Never flattens a position. |
+| `RECONCILE_INTERVAL_SECONDS` | `60` | How often the mark loop reconciles unresolved orders against the Zerodha order book. `0` disables the periodic pass. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
-| `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT` |
+| `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT`. Not `SL`/`SL-M`: the protective stop is placed as its own SL-M, and an entry order type of `SL-M` would be sent with no trigger price. |
+| `PROTECTIVE_STOPS` | `true` | Place an exchange-held SL-M behind every LIVE position. See [Protective stops](#protective-stops). |
+| `MARKET_PROTECTION` | `-1` | Zerodha's market-protection band in ticks. `-1` lets Kite choose; empty omits the parameter. |
 | `SLIPPAGE_TICKS` | `1.0` | Adverse-tick fallback for a paper fill with no order-book depth |
 | `TICK_SIZE` | `0.05` | Nifty futures tick |
 | `LOT_MARGIN` | `150000` | **Estimate** used when Kite's margin API is unavailable |
@@ -95,7 +99,7 @@ harmless and cannot add an instance.
 | Variable | Default | Notes |
 |---|---|---|
 | `GIFT_CANDLE_INTERVAL` | `60minute` | Signal timeframe. See the tuning note below. |
-| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop and closed-bar check cadence |
+| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop cadence, and the engine's *fallback* poll. A bar close wakes the engine immediately, so this is not the signal latency. |
 | `QUOTE_POLL_SECONDS` | `5` | |
 | `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
 | `HTTP_TIMEOUT_SECONDS` | `4.0` | |
@@ -109,35 +113,49 @@ harmless and cannot add an instance.
 
 :::warning[Docker paths must be on the volume]
 The image is `read_only: true`. Any path inside the image cannot be written,
-so `DB_PATH`, `LOG_FILE`, `HOLIDAY_CACHE_PATH`, `GIFT_BOOK_DB_PATH` and
-`PAPER_MIRROR_DB_PATH` must all point at `/data`.
+so `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` must all point at `/data`.
 :::
 
 
-## GIFT Nifty index book
+## Strategy
+
+The strategy uses exactly two indicators: **SuperTrend (14-period ATR × 3)** and
+**Parabolic SAR (0.02 / 0.02 / 0.2)**. The SuperTrend is fixed in code rather than
+configured — a second instance would reintroduce the vote the strategy dropped —
+so only the PSAR inputs are settings.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `GIFT_BOOK` | `0` | Also settle every signal in a paper book on the GIFT Nifty index. |
-| `GIFT_BOOK_DB_PATH` | `bot/gift_book.db` | Docker: `/data/gift_book.db`. Separate file, so the index ledger is isolated. |
-| `GIFT_BOOK_UNITS` | `0` | Units per position. `0` means "use `NIFTY_LOT_SIZE`", so both books carry the same notional. |
-| `GIFT_BOOK_BALANCE` | `200000` | Virtual balance the index book starts with, applied only when its file is created. |
+| `STRATEGY_PSAR_START` | `0.02` | |
+| `STRATEGY_PSAR_INCREMENT` | `0.02` | |
+| `STRATEGY_PSAR_MAXIMUM` | `0.2` | |
 
-GIFT Nifty is a non-tradeable index, so this book is **paper-only** by
-construction. See [Execution → Two books, one signal stream](./execution.md#two-books-one-signal-stream).
-State is on `/api/gift/*`, `/api/venues`, and under `gift_book` in `/api/status`.
+The warm-up requirement follows the fixed SuperTrend: 14 ATR bars plus one to
+compare against, so **15 closed candles**. `STRATEGY_SUPERTRENDS` and
+`STRATEGY_ST_MIN_AGREE` are no longer read; leaving them in an old `.env` is
+harmless and cannot add an instance.
 
-
-## Shadow paper book
+## Market data
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PAPER_MIRROR` | `0` | Mirror live positions into a parallel paper book. Only active with `EXECUTION_MODE=LIVE`. |
-| `PAPER_MIRROR_DB_PATH` | `bot/paper_mirror.db` | Docker: `/data/paper_mirror.db`. Separate file, so the shadow book can never touch the live ledger. |
-| `PAPER_MIRROR_BALANCE` | `200000` | Virtual balance the shadow book starts with, applied only when its file is created. |
+| `GIFT_CANDLE_INTERVAL` | `60minute` | Signal timeframe. See the tuning note below. |
+| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop cadence, and the engine's *fallback* poll. A bar close wakes the engine immediately, so this is not the signal latency. |
+| `QUOTE_POLL_SECONDS` | `5` | |
+| `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
+| `HTTP_TIMEOUT_SECONDS` | `4.0` | |
 
-See [Execution → Shadow paper book](./execution.md#shadow-paper-book). State is
-on `/api/mirror` and under `mirror` in `/api/status`.
+## Storage
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DB_PATH` | `bot/paper_trading.db` | Docker: `/data/paper_trading.db` |
+| `HOLIDAY_CACHE_PATH` | `bot/data/nse_holidays.json` | Docker: `/data/nse_holidays.json` |
+
+:::warning[Docker paths must be on the volume]
+The image is `read_only: true`. Any path inside the image cannot be written,
+so `DB_PATH`, `LOG_FILE` and `HOLIDAY_CACHE_PATH` must all point at `/data`.
+:::
 
 
 ## Strategy
@@ -155,9 +173,9 @@ reintroduce the vote this strategy deliberately does not have.
 
 ## Strategies
 
-One strategy runs by default, built from the flat keys above. Additional ones are
-added with `STRATEGY_<n>_*` — see [Running multiple strategies](./multi-strategy.md),
-which also explains why two strategies in one contract can cancel each other.
+Two strategies run: **GIFT NIFTY 15m** and **NIFTY 60m**, each configured with
+`STRATEGY_<n>_*` — see [Running multiple strategies](./multi-strategy.md), which
+also explains why two strategies in one contract can cancel each other.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -168,8 +186,27 @@ which also explains why two strategies in one contract can cancel each other.
 | `STRATEGY_<n>_EXIT` | `flip` | `flip` or `flat`. |
 | `STRATEGY_<n>_LOTS` | `1` | Position size for that run. |
 | `STRATEGY_<n>_ENABLED` | `1` | `0` configures it without starting it. |
+| `STRATEGY_<n>_LIVE` | `0` | Initial LIVE/PAPER choice; the dashboard toggle persists it. |
+| `STRATEGY_<n>_STOP_LOSS` | `0` | Initial stop, in index points, from the futures fill. `0` disables stops. |
+| `STRATEGY_<n>_TRAIL_POINTS` | `0` | Trail distance before the wider band. |
+| `STRATEGY_<n>_TRAIL_AFTER` | `0` | Open profit (points) at which the wider trail takes over. |
+| `STRATEGY_<n>_TRAIL_POINTS_AFTER` | `0` | Trail distance once `TRAIL_AFTER` is reached. |
 | `STRATEGY_<n>_FILTER_ADX` | *(off)* | Only enter when ADX(14) exceeds this. |
 | `STRATEGY_<n>_FILTER_MA` | *(off)* | Only enter on the trend's side of this SMA. |
+
+The shipped configuration sets the stops the two strategies are specified with:
+
+| | GIFT 15m | NIFTY 60m |
+|---|---|---|
+| `STOP_LOSS` | 50 | 200 |
+| `TRAIL_POINTS` | 5 | 100 |
+| `TRAIL_AFTER` | 50 | 200 |
+| `TRAIL_POINTS_AFTER` | 30 | 100 |
+
+Every stop is measured on the **futures execution price**, never on the signal
+index, and it only ever moves in the profitable direction — it never widens. It
+is checked on the live futures price every mark cycle, not on a bar close, and it
+stays active while the book is paused.
 
 **Neither filter is recommended.** Measured on three years of NIFTY 60-minute
 bars, ADX makes the net monotonically worse — ADX>15 drops it from ₹160,318 to
@@ -258,20 +295,18 @@ when it falls back to this number. Set it conservatively.
 **There is no session loss cap.** It was removed: blocking new entries once the
 day's realised loss reached a limit sounds prudent, but it is a second, hidden
 strategy — it changes when the bot trades based on a number the strategy never
-looked at. The strategy's own signal is the only exit, and `MAX_OPEN_LOTS` is the
-only exposure limit.
+looked at. Each book's protective stop and `MAX_OPEN_LOTS` are the exposure
+limits.
 
-**`MAX_OPEN_LOTS` caps position size.** The strategy owns its own exit: a
-position is held while SuperTrend and PSAR agree and closed on the first bar they
-stop. There is no per-trade stop-loss, no trailing stop, and no profit target —
-see [Strategy](./strategy.md#what-the-strategy-does-not-have) for why, and for
-what the exit actually earns on real data.
+**`MAX_OPEN_LOTS` caps position size.** Each book also carries its own
+protective stop (`STRATEGY_<n>_STOP_LOSS` and the trail settings above), measured
+on the futures execution price. The signal is still the primary exit; the stop is
+the backstop that caps a single loss.
 
 `STOP_LOSS_POINTS`, `TRAILING_STOP_ENABLED`, `TRAILING_INITIAL_POINTS`,
 `TRAILING_STEP_POINTS`, `TRAILING_TIGHTEN_AT_POINTS`, `TRAILING_TIGHT_POINTS`,
 `LARGE_CANDLE_ATR_MULTIPLIER` and `LARGE_CANDLE_MAX_POINTS` are **no longer
-read**. Leaving them in an old `.env` is harmless: they cannot arm a stop or
-suppress a signal.
+read**. Stops are configured per strategy with the `STRATEGY_<n>_*` keys above.
 
 The signal exit is verified before it is reported: if the square-off did not
 fill, the position stays open and the exit is retried on the next bar rather than

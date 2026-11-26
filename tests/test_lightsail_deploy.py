@@ -53,8 +53,6 @@ def test_the_spec_carries_the_paths_compose_would_have_pinned(tmp_path) -> None:
     spec = json.loads(out.read_text())
     env = spec["containers"]["bot"]["environment"]
     assert env["DB_PATH"] == "/data/paper_trading.db"
-    assert env["GIFT_BOOK_DB_PATH"] == "/data/gift_book.db"
-    assert env["PAPER_MIRROR_DB_PATH"] == "/data/paper_mirror.db"
     assert env["LOG_FILE"] == "/data/bot.log"
     assert env["HOLIDAY_CACHE_PATH"] == "/data/nse_holidays.json"
     assert env["WEBHOOK_HOST"] == "0.0.0.0"

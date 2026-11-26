@@ -1,28 +1,40 @@
-# Belaku — GIFT Nifty → Nifty Futures execution bot
+# Belaku — two-strategy NIFTY futures execution bot
 
 Single-process algorithmic trading bot for the `Surikbs` Pine strategy
-(`bot/st.pine`). It subscribes to **GIFT Nifty** ticks, builds candles, evaluates
-the Pine conditions itself, and trades the **NFO Nifty future**. No TradingView
-in the loop.
+(`bot/st.pine`). It runs **two independent strategies** — **GIFT NIFTY 15m** and
+**NIFTY 60m** — each on its own signal series and timeframe, and both execute on
+the **NFO Nifty future**. No TradingView in the loop.
 
 Requires Python 3.12 or newer.
 
 **📖 Full documentation: <https://surikbs-xp.github.io/belaku/>**
 
-## The one idea that explains the design
+## The two strategies
 
-GIFT Nifty trades ~20 hours a day and is the standard pre-market proxy for
-Nifty 50 — but it is an *index*, and cannot be traded. So Belaku reads signals
-from GIFT Nifty and places orders on the NFO Nifty future. Everything else
-follows from that split.
+| | GIFT NIFTY 15m | NIFTY 60m |
+|---|---|---|
+| Signal source | `NSEIX:GIFT NIFTY` | `NSE:NIFTY 50` |
+| Timeframe | 15 minutes | 60 minutes |
+| Execution | NIFTY futures | NIFTY futures |
+| Initial stop | 50 points | 200 points |
+| Trail | 5 points, widening to 30 once +50 | 100 points once +200 |
+
+Each computes its signal independently on its own series and timeframe. Every
+stop is measured on the **futures execution price**, never on the signal index,
+and it only ever moves in the profitable direction — it never widens. It is
+checked on the live futures price every mark cycle, not on a bar close, and it
+stays active while the book is paused.
+
+Each book has its own **LIVE/PAPER** switch, **Pause/Resume** and **Square off**
+on the dashboard. Switching one never affects the other, and the mode choice is
+persisted across restarts.
 
 | Window | Behaviour |
 |---|---|
-| GIFT Nifty session (~20 h) | evaluate the strategy on every closed bar |
 | NSE F&O session (09:15–15:30 IST) | LIVE orders may be placed; PAPER uses available prices |
-| Outside NSE F&O hours | PAPER signals may simulate at the completed GIFT close; LIVE signals are **deferred and dropped** |
+| Outside NSE F&O hours | PAPER signals may simulate at the completed close; LIVE signals are **deferred and dropped** |
 
-A signal computed on a 02:00 bar is not a signal at 09:15, so deferred signals
+A signal computed on a pre-open bar is not a signal at 09:15, so deferred signals
 are never queued for the open.
 
 ## Quick start
@@ -97,7 +109,7 @@ Docker volume layout, and health checks.
 | Setting | Effect |
 |---|---|
 | `BOT_NAME` | dashboard title and browser tab name (default `Belaku`) |
-| `GIFT_CANDLE_INTERVAL` | bar size for the GIFT Nifty series (`5minute`, `15minute`…) |
+| `STRATEGY_<n>_STOP_LOSS` / `_TRAIL_*` | per-strategy protective stop and trailing stop, in index points |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
 | `STRATEGY_PSAR_START` / `_INCREMENT` / `_MAXIMUM` | Parabolic SAR inputs (default `0.02` / `0.02` / `0.2`) |
 
@@ -105,7 +117,7 @@ The strategy uses exactly two indicators — SuperTrend (14-period ATR × 3, fix
 code) and Parabolic SAR — so the warm-up requirement is a constant **15 closed
 bars**.
 
-If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
+Each strategy's `STRATEGY_<n>_INTERVAL` must match the timeframe it was tuned on
 — the indicators are only meaningful on the timeframe they were tuned for.
 
 ## Tests
@@ -124,23 +136,28 @@ If you change the timeframe in `st.pine`, change `GIFT_CANDLE_INTERVAL` to match
 | Duplicate/replayed signals rejected | `order_manager._already_processed` |
 | Stale signals rejected (default 300 s) | `order_manager._signal_age_seconds` |
 | `MAX_OPEN_LOTS` and `LOT_MARGIN` enforced before every entry | `order_manager._execute_directional` |
+| `MAX_DAILY_LOSS` blocks new entries once the day's realised loss reaches it | `risk.daily_loss_breach`, checked in `engine.evaluate_run` |
+| Per-strategy protective stop and trailing stop, on the futures fill | `stops`, applied in `engine.check_stops` |
 | LIVE orders only placed inside the NSE F&O session; after-hours PAPER uses the GIFT close | `engine.StrategyEngine.execute` |
-| Unresolved orders and broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
+| Unresolved orders are reconciled against the Zerodha order book, not assumed | `order_manager.OrderManager.reconcile_orders` |
+| Broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
+| A breached stop still closes when reconciliation fails | `order_manager.OrderManager.square_off` |
 | Panic reports partial or failed square-offs instead of claiming success | `order_manager.OrderManager.square_off` |
-| Panic pauses new entries | `order_manager.pause` / `OrderManager.paused` |
+| Emergency STOP ALL latches across restarts and blocks every entry | `order_manager.OrderManager.stop_all` |
+| Dashboard requires a password when `DASHBOARD_PASSWORD` is set | `dashboard_auth`, enforced in `bot.security_middleware` |
 
 ### Known limitations
 
-* **No stop-loss, no profit target.** The Pine strategy defines entries only.
-  Positions stay open until an opposite entry or a manual square-off. Size
-  positions accordingly — this is a property of the strategy, not a missing
-  feature.
-* **The dashboard is unauthenticated.** Keep it on loopback or behind an
-  authenticating proxy.
-* **`bot/.env` is tracked in git.** Any credentials in it are in the repository
-  history. Move it out of version control and rotate the keys before treating
-  this as production. `.gitignore` already excludes `*.env*s`; the file was
-  added before that rule.
+* **The signal is the primary exit.** Each book also carries a protective
+  stop-loss and trailing stop (see [Strategy](https://surikbs-xp.github.io/belaku/strategy)),
+  but there is no profit target: a winning trend is closed by the signal, not by
+  a fixed level.
+* **The dashboard is open when `DASHBOARD_PASSWORD` is empty.** Set it for any
+  deployment that is not on loopback; the Lightsail deploy refuses to build a
+  spec without it.
+* **`bot/.env` is not tracked in git.** `.gitignore` excludes `*.env*s` and only
+  `bot/.env.example` is committed. If an older clone ever committed a real
+  `.env`, rotate those keys — see `scripts/purge-secrets-from-history.sh`.
 
 ## Building the docs
 
