@@ -129,12 +129,23 @@ def _trailed_stop(
     and from then on the trail only ever tightens (see :func:`_tighten`). Every
     configured number then means what it says - the initial stop is the loss the
     position can take, and the trail is what it keeps once it is winning.
+
+    ``trail_after`` is the profit at which the trail **activates**, not merely the
+    point at which it widens. The two strategies specify it that way: the 60m book
+    has a 200-point stop and a 100-point trail that activates at +200, so before
+    +200 the position is protected by the 200-point stop and nothing else. Without
+    this gate the 100-point trail engaged from the first profitable tick and
+    replaced the 200-point stop with a 100-point one - the position was half as
+    protected as configured, and the 200-point stop never applied at all.
     """
     if not rules.enabled or rules.trail_points <= 0:
         return None
     profit = (best - entry_price) * position_key
     if profit <= 0:
         # Not yet in profit: the initial stop is the protection.
+        return None
+    if rules.trail_after > 0 and profit < rules.trail_after:
+        # Not yet at the activation level: the initial stop still holds.
         return None
     distance = rules.trail_for(profit)
     if distance <= 0:

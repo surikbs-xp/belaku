@@ -467,75 +467,85 @@ class StrategyConfig:
         }
 
 
-# The highest index the parser will look for, so a stray env var cannot make it
-# walk forever.
-MAX_STRATEGIES = 8
-
-
 def strategy_configs() -> list[StrategyConfig]:
-    """Every configured strategy, in order.
+    """The two strategies this bot runs. There are no others.
 
-    With nothing configured this returns exactly one strategy built from the flat
-    keys, which is what every existing deployment has - so an unchanged ``.env``
-    behaves precisely as before. Adding ``STRATEGY_2_SOURCE=nifty`` is what turns
-    the second book on, and nothing else has to change.
+    * **GIFT NIFTY 15m** - reads ``NSEIX:GIFT NIFTY`` on 15 minutes, exits on a
+      confirmed ``NO_SIGNAL``, 50-point stop, 5-point trail widening to 30 once
+      the trade is 50 points up.
+    * **NIFTY 60m** - reads ``NSE:NIFTY 50`` on 60 minutes, exits on a flip,
+      200-point stop, 100-point trail once the trade is 200 points up.
 
-    Numbering is a *label*, not a position. A deployment that declares
-    ``STRATEGY_2_*`` and ``STRATEGY_3_*`` and leaves ``STRATEGY_1_*`` unset used
-    to get three books: the implied first book from the flat keys, plus the two
-    declared ones. The operator had configured two strategies and the dashboard
-    showed three, with a phantom GIFT book nobody asked for - and because the
-    implied book takes its interval from the flat keys, it read the same series
-    as a real book at a different timeframe.
+    Both execute on the NFO NIFTY future. The source, timeframe, exit rule and
+    stop parameters are the specification, so they come from
+    :data:`DEFAULT_STRATEGIES` rather than from the environment. A ``.env`` that
+    omitted ``STRATEGY_<n>_STOP_LOSS`` used to leave that book with **no stop at
+    all** - the one state a trading bot must never reach by omission - and one
+    that set ``STRATEGY_3_INTERVAL=60minute`` silently moved the 15-minute book
+    onto 60-minute bars.
 
-    So the implied book is only added when *no* strategy is declared at all. Once
-    anything is declared, the declared set is the whole set.
+    ``STRATEGY_<n>_*`` still tunes the operational knobs: ``ID``, ``NAME``,
+    ``LOTS``, ``ENABLED``, ``LIVE`` and the entry filters. Anything numbered above
+    the two strategies is ignored, because there is no third strategy to configure.
     """
-    declared: list[StrategyConfig] = []
-    for index in range(1, MAX_STRATEGIES + 1):
-        prefix = f"STRATEGY_{index}_"
-        source = _env(prefix + "SOURCE")
-        if not source:
-            # Only the first strategy may be implied by the flat keys, and only
-            # when nothing at all is declared - see the docstring.
-            continue
-        declared.append(_strategy_from(prefix, index, source))
-    if declared:
-        return declared
-    return [_strategy_from("STRATEGY_1_", 1, "gift")]
+    return [_default_strategy(spec) for spec in DEFAULT_STRATEGIES]
 
 
-def _strategy_from(prefix: str, index: int, source: str) -> StrategyConfig:
-    """One strategy from its ``STRATEGY_<n>_*`` keys.
+# The two strategies, as specified. Order is the display order.
+DEFAULT_STRATEGIES: tuple[dict[str, Any], ...] = (
+    {
+        "index": 1,
+        "id": "gift-15m",
+        "name": "GIFT NIFTY 15m",
+        "source": "gift",
+        "interval": "15minute",
+        # ``flat`` closes on a confirmed NO_SIGNAL; ``flip`` holds through it.
+        "exit": "flat",
+        "stop_loss": 50.0,
+        "trail_points": 5.0,
+        "trail_after": 50.0,
+        "trail_points_after": 30.0,
+    },
+    {
+        "index": 2,
+        "id": "nifty-60m",
+        "name": "NIFTY 60m",
+        "source": "nifty",
+        "interval": "60minute",
+        "exit": "flip",
+        "stop_loss": 200.0,
+        "trail_points": 100.0,
+        "trail_after": 200.0,
+        "trail_points_after": 100.0,
+    },
+)
 
-    ``index`` is the number in the key, kept for reporting only: it is not a
-    position in the list, so a deployment numbered 2 and 3 is two books, not
-    three.
+
+def _default_strategy(spec: dict[str, Any]) -> StrategyConfig:
+    """One of the two strategies, with its operational knobs overridable.
+
+    The identity - source, timeframe, exit rule, stop and trail - is the
+    specification and is not read from the environment. Only the knobs an operator
+    legitimately varies per deployment are: the ledger id, the display name, the
+    size, whether it starts, its initial mode, and the entry filters.
     """
-    first = index == 1
+    prefix = f"STRATEGY_{spec['index']}_"
     return StrategyConfig(
-        index=index,
-        id=_env(prefix + "ID", settings.strategy_id if first else "")
-        or (settings.strategy_id if first else f"strategy-{index}"),
-        source=(source or "gift").strip().lower(),
-        interval=_env(
-            prefix + "INTERVAL",
-            settings.gift_candle_interval if first else "60minute",
-        ),
-        exit=(
-            _env(prefix + "EXIT", settings.strategy_exit if first else "flip")
-            .strip().lower()
-        ),
-        lots=_env_int(prefix + "LOTS", settings.default_lots if first else 1),
+        index=spec["index"],
+        id=_env(prefix + "ID") or spec["id"],
+        source=spec["source"],
+        interval=spec["interval"],
+        exit=spec["exit"],
+        lots=_env_int(prefix + "LOTS", settings.default_lots),
         enabled=_env_bool(prefix + "ENABLED", True),
-        name=_env(prefix + "NAME", ""),
+        name=_env(prefix + "NAME") or spec["name"],
         filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
         filter_ma=_env_int(prefix + "FILTER_MA", 0),
         live=_env_bool(prefix + "LIVE", False),
-        stop_loss=_env_float(prefix + "STOP_LOSS", 0.0),
-        trail_points=_env_float(prefix + "TRAIL_POINTS", 0.0),
-        trail_after=_env_float(prefix + "TRAIL_AFTER", 0.0),
-        trail_points_after=_env_float(prefix + "TRAIL_POINTS_AFTER", 0.0),
+        stop_loss=spec["stop_loss"],
+        trail_points=spec["trail_points"],
+        trail_after=spec["trail_after"],
+        trail_points_after=spec["trail_points_after"],
     )
 
 

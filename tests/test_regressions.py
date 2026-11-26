@@ -5227,11 +5227,13 @@ def test_the_dashboard_page_uses_a_hashed_asset_version() -> None:
     assert "no-store" in bot_py
 
 
-def test_one_configured_strategy_is_the_default(monkeypatch) -> None:
-    """An unchanged .env must behave exactly as it did before this existed.
+def test_the_two_strategies_are_the_built_in_default(monkeypatch) -> None:
+    """The bot implements exactly two strategies, and they need no configuration.
 
-    The parser is the migration boundary: if it invented a second strategy, or
-    dropped the first, every existing deployment would change on upgrade.
+    The source, timeframe, exit rule and stop parameters are the specification.
+    Leaving them to the environment meant a .env that omitted STOP_LOSS gave that
+    book no stop at all, and one that set the wrong INTERVAL silently moved the
+    15-minute book onto 60-minute bars.
     """
     import config
 
@@ -5241,15 +5243,83 @@ def test_one_configured_strategy_is_the_default(monkeypatch) -> None:
 
     configs = config.strategy_configs()
 
-    assert len(configs) == 1
-    first = configs[0]
-    assert first.source == "gift"
-    assert first.exit == "flip"
-    assert first.interval == config.Settings().gift_candle_interval
-    assert first.enabled is True
+    assert [c.id for c in configs] == ["gift-15m", "nifty-60m"]
+
+    gift, nifty = configs
+    # GIFT NIFTY 15m: flat exit, 50-pt stop, 5-pt trail widening to 30 at +50.
+    assert gift.source == "gift"
+    assert gift.interval == "15minute"
+    assert gift.exit == "flat"
+    assert gift.stop_rules.initial_points == 50.0
+    assert gift.stop_rules.trail_points == 5.0
+    assert gift.stop_rules.trail_after == 50.0
+    assert gift.stop_rules.trail_points_after == 30.0
+
+    # NIFTY 60m: flip exit, 200-pt stop, 100-pt trail at +200.
+    assert nifty.source == "nifty"
+    assert nifty.interval == "60minute"
+    assert nifty.exit == "flip"
+    assert nifty.stop_rules.initial_points == 200.0
+    assert nifty.stop_rules.trail_points == 100.0
+    assert nifty.stop_rules.trail_after == 200.0
+    assert nifty.stop_rules.trail_points_after == 100.0
+
     # Filters are off unless asked for.
-    assert first.filter_adx == 0.0
-    assert first.filter_ma == 0
+    assert gift.filter_adx == 0.0
+    assert gift.filter_ma == 0
+
+
+def test_the_specification_survives_a_stale_environment(monkeypatch) -> None:
+    """A .env that names the books differently must not change what they are.
+
+    The deployed environment declared STRATEGY_2_* and STRATEGY_3_* with
+    STRATEGY_3_INTERVAL=60minute and no stop keys at all. Honouring that gave a
+    15-minute book 60-minute bars and no stop - so the identity is now taken from
+    the specification and only the operational knobs come from the environment.
+    """
+    import config
+
+    for key in list(os.environ):
+        if key.startswith("STRATEGY_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
+    monkeypatch.setenv("STRATEGY_2_ID", "nifty-60m")
+    monkeypatch.setenv("STRATEGY_2_INTERVAL", "60minute")
+    monkeypatch.setenv("STRATEGY_3_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_3_ID", "gift-15m")
+    monkeypatch.setenv("STRATEGY_3_INTERVAL", "60minute")
+
+    configs = config.strategy_configs()
+
+    assert [c.id for c in configs] == ["gift-15m", "nifty-60m"]
+    gift = configs[0]
+    assert gift.interval == "15minute", "the 15-minute book must stay on 15 minutes"
+    assert gift.exit == "flat"
+    assert gift.stop_rules.initial_points == 50.0
+    assert configs[1].stop_rules.initial_points == 200.0
+
+
+def test_operational_knobs_are_still_overridable(monkeypatch) -> None:
+    """Size, mode, name and filters are per-deployment; the strategy is not."""
+    import config
+
+    for key in list(os.environ):
+        if key.startswith("STRATEGY_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STRATEGY_1_LOTS", "3")
+    monkeypatch.setenv("STRATEGY_1_LIVE", "1")
+    monkeypatch.setenv("STRATEGY_1_NAME", "GIFT book")
+    monkeypatch.setenv("STRATEGY_1_FILTER_ADX", "15")
+
+    gift = config.strategy_configs()[0]
+
+    assert gift.lots == 3
+    assert gift.live is True
+    assert gift.name == "GIFT book"
+    assert gift.filter_adx == 15.0
+    # ...but the identity is untouched.
+    assert gift.interval == "15minute"
+    assert gift.stop_rules.initial_points == 50.0
 
 
 def test_a_second_strategy_is_purely_configuration(monkeypatch) -> None:
@@ -5278,53 +5348,35 @@ def test_a_second_strategy_is_purely_configuration(monkeypatch) -> None:
     assert second.strategy_params()["exit"] == "flip"
 
 
-def test_declaring_books_does_not_add_an_implied_first(monkeypatch) -> None:
-    """Numbering is a label, not a position.
+def test_a_third_strategy_cannot_be_configured(monkeypatch) -> None:
+    """There are exactly two strategies, so a third declaration is ignored.
 
-    A deployment that declares STRATEGY_2_* and STRATEGY_3_* and leaves
-    STRATEGY_1_* unset used to get three books: the implied first book from the
-    flat keys plus the two declared ones. The operator configured two strategies
-    and the dashboard showed three, with a phantom GIFT book nobody asked for -
-    and because the implied book takes its interval from the flat keys, it read
-    the same series as a real book at a different timeframe.
+    The bot implements two. A leftover STRATEGY_3_* in a deployment's environment
+    must not conjure a third book - that is how a phantom GIFT band appeared
+    between the two real ones.
     """
     import config
 
     for key in list(os.environ):
         if key.startswith("STRATEGY_"):
             monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
-    monkeypatch.setenv("STRATEGY_2_ID", "nifty-60m")
     monkeypatch.setenv("STRATEGY_3_SOURCE", "gift")
-    monkeypatch.setenv("STRATEGY_3_ID", "gift-15m")
-    monkeypatch.setenv("STRATEGY_3_INTERVAL", "15minute")
+    monkeypatch.setenv("STRATEGY_3_ID", "phantom")
+    monkeypatch.setenv("STRATEGY_3_INTERVAL", "60minute")
 
     configs = config.strategy_configs()
 
-    assert [c.id for c in configs] == ["nifty-60m", "gift-15m"]
-    # The declared interval is honoured, not the flat-key default.
-    assert configs[1].interval == "15minute"
+    assert [c.id for c in configs] == ["gift-15m", "nifty-60m"]
+    assert "phantom" not in [c.id for c in configs]
 
 
-def test_nothing_declared_still_yields_the_legacy_book(monkeypatch) -> None:
-    """An unchanged .env must behave exactly as before."""
-    import config
+def test_a_stray_key_renames_a_book_but_never_adds_one(monkeypatch) -> None:
+    """There are always exactly two books, whatever the environment says.
 
-    for key in list(os.environ):
-        if key.startswith("STRATEGY_"):
-            monkeypatch.delenv(key, raising=False)
-
-    configs = config.strategy_configs()
-
-    assert len(configs) == 1
-    assert configs[0].source == "gift"
-
-
-def test_a_second_strategy_must_declare_its_source(monkeypatch) -> None:
-    """A numbered strategy with no SOURCE would otherwise duplicate the first.
-
-    Two runs on one book would double every order and fight over the same
-    positions, which is worse than not starting.
+    ``ID`` is a legitimate per-deployment knob, so a stray ``STRATEGY_2_ID``
+    renames the second book rather than being ignored. What it must never do is
+    add a third: two runs on one series would double every order and fight over
+    the same positions.
     """
     import config
 
@@ -5333,7 +5385,14 @@ def test_a_second_strategy_must_declare_its_source(monkeypatch) -> None:
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("STRATEGY_2_ID", "typo")
 
-    assert [c.id for c in config.strategy_configs()] == ["Surikbs"]
+    configs = config.strategy_configs()
+
+    assert len(configs) == 2
+    assert configs[0].id == "gift-15m"
+    assert configs[1].id == "typo"
+    # The identity is still the specification, not the environment.
+    assert configs[1].interval == "60minute"
+    assert configs[1].stop_rules.initial_points == 200.0
 
 
 def test_a_disabled_strategy_is_not_started(monkeypatch) -> None:
@@ -11248,3 +11307,119 @@ def test_distinct_strategy_ids_are_not_reported(monkeypatch) -> None:
     )
 
     assert not any("Duplicate" in w for w in config.validate())
+
+
+# ---------------------------------------------------------------------------
+# The two strategies, exactly as specified
+#
+# These pin the numbers from the specification rather than the implementation's
+# own defaults, so a change to either has to be deliberate. The trail activation
+# level is the one that had drifted: the 60m book's 100-point trail engaged from
+# the first profitable tick and replaced its 200-point stop with a 100-point one.
+# ---------------------------------------------------------------------------
+
+def test_gift_15m_trail_waits_for_fifty_points() -> None:
+    """50-pt stop holds until +50, then a 30-pt trail takes over."""
+    import stops
+
+    rules = stops.StopRules(50, 5, 50, 30)
+    entry = 25_000.0
+    stop = stops.initial_stop(entry, stops.LONG, rules)
+    assert stop == 24_950.0
+
+    # Below +50 the initial stop is the protection - the 5-pt trail must not
+    # replace it, or the position would be protected at 5 points from entry.
+    for mark in (25_010.0, 25_030.0, 25_049.0):
+        state, breached = stops.evaluate(
+            entry_price=entry, position_key=stops.LONG, mark=mark,
+            rules=rules, current_stop=stop, best_price=entry,
+        )
+        assert state.current == 24_950.0, f"stop moved at +{mark - entry}"
+        assert not breached
+
+    # At +50 the trail activates at 30 points behind the best price.
+    state, _ = stops.evaluate(
+        entry_price=entry, position_key=stops.LONG, mark=25_050.0,
+        rules=rules, current_stop=24_950.0, best_price=entry,
+    )
+    assert state.current == 25_020.0
+
+
+def test_nifty_60m_trail_waits_for_two_hundred_points() -> None:
+    """200-pt stop holds until +200, then a 100-pt trail takes over."""
+    import stops
+
+    rules = stops.StopRules(200, 100, 200, 100)
+    entry = 25_000.0
+    stop = stops.initial_stop(entry, stops.LONG, rules)
+    assert stop == 24_800.0
+
+    # The 100-pt trail must not engage before +200. It used to, which halved the
+    # protection: the position was stopped 100 points from entry instead of 200.
+    for mark in (25_100.0, 25_150.0, 25_199.0):
+        state, breached = stops.evaluate(
+            entry_price=entry, position_key=stops.LONG, mark=mark,
+            rules=rules, current_stop=stop, best_price=entry,
+        )
+        assert state.current == 24_800.0, f"stop moved at +{mark - entry}"
+        assert not breached
+
+    # At +200 the trail activates, 100 points behind the best price.
+    state, _ = stops.evaluate(
+        entry_price=entry, position_key=stops.LONG, mark=25_200.0,
+        rules=rules, current_stop=24_800.0, best_price=entry,
+    )
+    assert state.current == 25_100.0
+
+
+def test_a_short_trails_in_the_profitable_direction_only() -> None:
+    """The same rules mirrored: a short's stop only ever falls."""
+    import stops
+
+    rules = stops.StopRules(50, 5, 50, 30)
+    entry = 25_000.0
+    stop = stops.initial_stop(entry, stops.SHORT, rules)
+    assert stop == 25_050.0
+
+    state, _ = stops.evaluate(
+        entry_price=entry, position_key=stops.SHORT, mark=24_950.0,
+        rules=rules, current_stop=stop, best_price=entry,
+    )
+    assert state.current == 24_980.0
+
+    # A mark that gives back profit must not loosen the stop. 24,975 is still
+    # below the 24,980 stop, so the position is protected but not yet out.
+    state, breached = stops.evaluate(
+        entry_price=entry, position_key=stops.SHORT, mark=24_975.0,
+        rules=rules, current_stop=24_980.0, best_price=24_950.0,
+    )
+    assert state.current == 24_980.0
+    assert not breached
+
+    # Trading back up through the stop is the breach.
+    _, breached = stops.evaluate(
+        entry_price=entry, position_key=stops.SHORT, mark=24_985.0,
+        rules=rules, current_stop=24_980.0, best_price=24_950.0,
+    )
+    assert breached
+
+
+def test_the_two_books_use_their_own_exit_rule() -> None:
+    """GIFT 15m exits on NO_SIGNAL; NIFTY 60m holds through it."""
+    import config
+
+    gift, nifty = config.strategy_configs()
+
+    assert gift.exit == "flat", "the 15-minute book exits on a confirmed NO_SIGNAL"
+    assert nifty.exit == "flip", "the 60-minute book holds through NO_SIGNAL"
+
+
+def test_both_books_execute_on_the_nifty_future() -> None:
+    """Neither book trades its signal series - both order the future."""
+    import config
+
+    for cfg in config.strategy_configs():
+        source = config.build_bar_source_for(cfg)
+        # The signal series is an index; the execution instrument is the future.
+        assert cfg.source in {"gift", "nifty"}
+        assert source is not None

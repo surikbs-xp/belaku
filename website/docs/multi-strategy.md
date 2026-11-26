@@ -2,49 +2,60 @@
 sidebar_position: 5
 ---
 
-# Running multiple strategies
+# The two strategies
 
-The bot can trade more than one strategy at once, each with its own signals,
-positions and P&L. This page explains how to configure that and — more
-importantly — the one way two strategies can silently ruin each other.
+The bot implements **exactly two** strategies. There is no third, and neither is
+optional. They run independently and simultaneously, each with its own signals,
+positions, orders, quantity and P&L — and each with its own LIVE/PAPER toggle,
+pause switch, manual BUY/SELL and square-off.
 
-## Quick start
+| | GIFT NIFTY 15m | NIFTY 60m |
+|---|---|---|
+| Signal source | `NSEIX:GIFT NIFTY` | `NSE:NIFTY 50` |
+| Timeframe | 15 minutes | 60 minutes |
+| Execution | NFO NIFTY future | NFO NIFTY future |
+| Exit rule | `flat` — closes on a confirmed `NO_SIGNAL` | `flip` — holds through `NO_SIGNAL` |
+| Initial stop | 50 points | 200 points |
+| Trail activates at | +50 points | +200 points |
+| Trail distance | 5 points, widening to 30 at +50 | 100 points |
 
-With nothing configured, the bot runs **one** strategy built from the flat keys
-(`STRATEGY_EXIT`, `GIFT_CANDLE_INTERVAL`, …). That is the single-book behaviour
-the bot has always had, and an unchanged `.env` behaves identically.
+Every level is measured on the **futures execution price** — the fill the broker
+gave and the live LTP the mark loop reads — never on the signal index. The signal
+series is an index; a stop measured on it would sit at a level the position can
+never be filled at, and the index/future basis would silently move the stop.
 
-Adding a second book is configuration only. Declare **both** books, so the
-configuration says exactly what runs:
+## These are the specification, not defaults
 
-```bash
-STRATEGY_1_SOURCE=gift
-STRATEGY_1_ID=gift-15m
-STRATEGY_1_INTERVAL=15minute
-STRATEGY_1_EXIT=flat
-STRATEGY_1_STOP_LOSS=50
+The source, timeframe, exit rule and stop parameters come from the code, not from
+the environment. A `.env` that omitted `STRATEGY_<n>_STOP_LOSS` used to leave that
+book with **no stop at all** — the one state a trading bot must never reach by
+omission — and one that set `STRATEGY_3_INTERVAL=60minute` silently moved the
+15-minute book onto 60-minute bars.
 
-STRATEGY_2_SOURCE=nifty
-STRATEGY_2_ID=nifty-60m
-STRATEGY_2_INTERVAL=60minute
-STRATEGY_2_EXIT=flip
-STRATEGY_2_STOP_LOSS=200
-```
+`STRATEGY_<n>_*` still tunes the operational knobs:
+
+| Key | Meaning |
+|---|---|
+| `STRATEGY_<n>_ID` | The ledger book. Must be unique — see below. |
+| `STRATEGY_<n>_NAME` | Display name only. |
+| `STRATEGY_<n>_LOTS` | Position size for this book. |
+| `STRATEGY_<n>_ENABLED` | `0` leaves it configured but not started. |
+| `STRATEGY_<n>_LIVE` | Initial LIVE/PAPER choice. Default `0`; the dashboard toggle persists the operator's choice. |
+| `STRATEGY_<n>_FILTER_ADX` | Optional entry gate on trend strength. |
+| `STRATEGY_<n>_FILTER_MA` | Optional entry gate on the trend's side of an SMA. |
+
+`<n>` is `1` for the GIFT book and `2` for the NIFTY book. Anything numbered above
+2 is ignored — there is no third strategy to configure.
 
 :::warning[Numbering is a label, not a position]
-Once **any** `STRATEGY_<n>_SOURCE` is set, the declared set is the whole set —
-the implied first book is not added on top.
+A deployment that declared `STRATEGY_2_*` and `STRATEGY_3_*` and left
+`STRATEGY_1_*` unset used to get **three** books: an implied first book from the
+flat keys, plus the two declared ones. The operator had configured two strategies
+and the dashboard showed three, with a GIFT book nobody asked for — and because
+the implied book took its interval from `GIFT_CANDLE_INTERVAL`, it read the same
+series as a real book at a different timeframe.
 
-This matters because the alternative is a phantom book. A deployment that
-declared `STRATEGY_2_*` and `STRATEGY_3_*` and left `STRATEGY_1_*` unset used to
-get **three** books: the implied first book from the flat keys, plus the two
-declared ones. The operator had configured two strategies and the dashboard
-showed three, with a GIFT book nobody asked for — and because the implied book
-takes its interval from `GIFT_CANDLE_INTERVAL`, it read the same series as a real
-book at a different timeframe.
-
-So `STRATEGY_2_*` + `STRATEGY_3_*` is two books, not three. The numbers only have
-to be unique, not consecutive.
+There are now always exactly two books, whatever the environment says.
 :::
 
 The engine logs the books it built at startup, so the resolved set is never a
@@ -54,43 +65,29 @@ guess:
 Strategy books (2): gift-15m [GiftBarSource 15minute], nifty-60m [NiftyBarSource 60minute]
 ```
 
-| Key | Meaning |
-|---|---|
-| `STRATEGY_<n>_SOURCE` | `gift` or `nifty`. **Required** — a numbered strategy with no source is not started. |
-| `STRATEGY_<n>_ID` | The ledger book. Must be unique — see below. |
-| `STRATEGY_<n>_NAME` | Display name only. |
-| `STRATEGY_<n>_INTERVAL` | Kite bar interval. |
-| `STRATEGY_<n>_EXIT` | `flip` (default) or `flat`. |
-| `STRATEGY_<n>_LOTS` | Position size for this run. |
-| `STRATEGY_<n>_ENABLED` | `0` leaves it configured but not started. |
-| `STRATEGY_<n>_LIVE` | Initial LIVE/PAPER choice. Default `0`; the dashboard toggle persists the operator's choice. |
-| `STRATEGY_<n>_STOP_LOSS` | Initial stop, in index points, from the futures fill. `0` disables stops. |
-| `STRATEGY_<n>_TRAIL_POINTS` | Trail distance before the wider band. |
-| `STRATEGY_<n>_TRAIL_AFTER` | Open profit (points) at which the wider trail takes over. |
-| `STRATEGY_<n>_TRAIL_POINTS_AFTER` | Trail distance once `TRAIL_AFTER` is reached. |
-| `STRATEGY_<n>_FILTER_ADX` | Optional entry gate on trend strength. |
-| `STRATEGY_<n>_FILTER_MA` | Optional entry gate on the trend's side of an SMA. |
+## How the stops behave
 
-## The two strategies
-
-| | A | B |
-|---|---|---|
-| Signal source | GIFT NIFTY (`NSEIX:GIFT NIFTY`) | NIFTY 50 (`NSE:NIFTY 50`) |
-| Timeframe | 15 minutes | 60 minutes |
-| Execution | NIFTY futures | NIFTY futures |
-| Initial stop | 50 points | 200 points |
-| Trail | 5 points, widening to 30 once +50 | 100 points once +200 |
-
-Each computes its signal independently on its own series and timeframe. Every
-stop is measured on the **futures execution price** — the fill the broker gave
-and the live LTP the mark loop reads — never on the signal index. A stop on the
-index would sit at a level the position can never be filled at, and the
-index/future basis would silently move it.
+Each book computes its signal independently on its own series and timeframe.
 
 A stop only ever moves in the profitable direction and never widens. It is
 checked on the live futures price every mark cycle, not on a bar close, and it
 stays active while the book is paused: pausing blocks *entries*, and a position
 already on must stay protected.
+
+The trail **activates** at the level in the table above — it does not merely widen
+there. Before activation the initial stop is the only protection:
+
+| GIFT 15m | | NIFTY 60m | |
+|---|---|---|---|
+| Entry | 25,000 | Entry | 25,000 |
+| Stop at +10 | 24,950 (initial) | Stop at +100 | 24,800 (initial) |
+| Stop at +49 | 24,950 (initial) | Stop at +199 | 24,800 (initial) |
+| Stop at +50 | 25,020 (trail on) | Stop at +200 | 25,100 (trail on) |
+| Stop at +80 | 25,050 | Stop at +300 | 25,200 |
+
+Without that gate the 60m book's 100-point trail engaged from the first profitable
+tick and replaced its 200-point stop with a 100-point one — the position was half
+as protected as configured, and the 200-point stop never applied at all.
 
 ## Independent LIVE / PAPER
 
