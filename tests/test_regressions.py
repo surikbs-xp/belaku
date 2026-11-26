@@ -10360,7 +10360,11 @@ def test_repeated_bar_close_events_do_not_re_evaluate_the_same_bar() -> None:
 
         def counting(run, force=False):
             result = original(run, force=force)
-            if not result.get("skipped"):
+            # Only the GIFT book: the stub feed serves that series, so the NIFTY
+            # book reports "warming up" on every wake and would be counted as an
+            # evaluation. The guard under test is per book, so measuring the book
+            # the feed actually serves is what isolates it.
+            if run.id == "gift-15m" and not result.get("skipped"):
                 evaluated.append(result)
             return result
 
