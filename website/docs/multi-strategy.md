@@ -14,30 +14,49 @@ With nothing configured, the bot runs **one** strategy built from the flat keys
 (`STRATEGY_EXIT`, `GIFT_CANDLE_INTERVAL`, …). That is the single-book behaviour
 the bot has always had, and an unchanged `.env` behaves identically.
 
-Adding a second book is configuration only:
-
-```bash
-STRATEGY_2_SOURCE=nifty
-STRATEGY_2_ID=nifty-adx
-STRATEGY_2_NAME=nifty adx
-STRATEGY_2_INTERVAL=60minute
-STRATEGY_2_EXIT=flip
-STRATEGY_2_LOTS=1
-```
-
-The first strategy can also be written out explicitly, which is what to do when
-you want both declared in one place:
+Adding a second book is configuration only. Declare **both** books, so the
+configuration says exactly what runs:
 
 ```bash
 STRATEGY_1_SOURCE=gift
-STRATEGY_1_ID=gift-flip
-STRATEGY_1_INTERVAL=60minute
-STRATEGY_1_EXIT=flip
+STRATEGY_1_ID=gift-15m
+STRATEGY_1_INTERVAL=15minute
+STRATEGY_1_EXIT=flat
+STRATEGY_1_STOP_LOSS=50
+
+STRATEGY_2_SOURCE=nifty
+STRATEGY_2_ID=nifty-60m
+STRATEGY_2_INTERVAL=60minute
+STRATEGY_2_EXIT=flip
+STRATEGY_2_STOP_LOSS=200
+```
+
+:::warning[Numbering is a label, not a position]
+Once **any** `STRATEGY_<n>_SOURCE` is set, the declared set is the whole set —
+the implied first book is not added on top.
+
+This matters because the alternative is a phantom book. A deployment that
+declared `STRATEGY_2_*` and `STRATEGY_3_*` and left `STRATEGY_1_*` unset used to
+get **three** books: the implied first book from the flat keys, plus the two
+declared ones. The operator had configured two strategies and the dashboard
+showed three, with a GIFT book nobody asked for — and because the implied book
+takes its interval from `GIFT_CANDLE_INTERVAL`, it read the same series as a real
+book at a different timeframe.
+
+So `STRATEGY_2_*` + `STRATEGY_3_*` is two books, not three. The numbers only have
+to be unique, not consecutive.
+:::
+
+The engine logs the books it built at startup, so the resolved set is never a
+guess:
+
+```
+Strategy books (2): gift-15m [GiftBarSource 15minute], nifty-60m [NiftyBarSource 60minute]
 ```
 
 | Key | Meaning |
 |---|---|
-| `STRATEGY_<n>_SOURCE` | `gift` or `nifty`. **Required** for anything above 1. |
+| `STRATEGY_<n>_SOURCE` | `gift` or `nifty`. **Required** — a numbered strategy with no source is not started. |
 | `STRATEGY_<n>_ID` | The ledger book. Must be unique — see below. |
 | `STRATEGY_<n>_NAME` | Display name only. |
 | `STRATEGY_<n>_INTERVAL` | Kite bar interval. |

@@ -5259,6 +5259,8 @@ def test_a_second_strategy_is_purely_configuration(monkeypatch) -> None:
     for key in list(os.environ):
         if key.startswith("STRATEGY_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_ID", "gift-15m")
     monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
     monkeypatch.setenv("STRATEGY_2_ID", "nifty-adx")
     monkeypatch.setenv("STRATEGY_2_FILTER_ADX", "15")
@@ -5267,13 +5269,55 @@ def test_a_second_strategy_is_purely_configuration(monkeypatch) -> None:
 
     configs = config.strategy_configs()
 
-    assert [c.id for c in configs] == ["Surikbs", "nifty-adx"]
+    assert [c.id for c in configs] == ["gift-15m", "nifty-adx"]
     second = configs[1]
     assert second.source == "nifty"
     assert second.lots == 2
     assert second.filter_adx == 15.0
     assert second.filter_ma == 100
     assert second.strategy_params()["exit"] == "flip"
+
+
+def test_declaring_books_does_not_add_an_implied_first(monkeypatch) -> None:
+    """Numbering is a label, not a position.
+
+    A deployment that declares STRATEGY_2_* and STRATEGY_3_* and leaves
+    STRATEGY_1_* unset used to get three books: the implied first book from the
+    flat keys plus the two declared ones. The operator configured two strategies
+    and the dashboard showed three, with a phantom GIFT book nobody asked for -
+    and because the implied book takes its interval from the flat keys, it read
+    the same series as a real book at a different timeframe.
+    """
+    import config
+
+    for key in list(os.environ):
+        if key.startswith("STRATEGY_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
+    monkeypatch.setenv("STRATEGY_2_ID", "nifty-60m")
+    monkeypatch.setenv("STRATEGY_3_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_3_ID", "gift-15m")
+    monkeypatch.setenv("STRATEGY_3_INTERVAL", "15minute")
+
+    configs = config.strategy_configs()
+
+    assert [c.id for c in configs] == ["nifty-60m", "gift-15m"]
+    # The declared interval is honoured, not the flat-key default.
+    assert configs[1].interval == "15minute"
+
+
+def test_nothing_declared_still_yields_the_legacy_book(monkeypatch) -> None:
+    """An unchanged .env must behave exactly as before."""
+    import config
+
+    for key in list(os.environ):
+        if key.startswith("STRATEGY_"):
+            monkeypatch.delenv(key, raising=False)
+
+    configs = config.strategy_configs()
+
+    assert len(configs) == 1
+    assert configs[0].source == "gift"
 
 
 def test_a_second_strategy_must_declare_its_source(monkeypatch) -> None:
@@ -5298,10 +5342,12 @@ def test_a_disabled_strategy_is_not_started(monkeypatch) -> None:
     for key in list(os.environ):
         if key.startswith("STRATEGY_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STRATEGY_1_SOURCE", "gift")
+    monkeypatch.setenv("STRATEGY_1_ID", "gift-15m")
     monkeypatch.setenv("STRATEGY_2_SOURCE", "nifty")
     monkeypatch.setenv("STRATEGY_2_ENABLED", "0")
 
-    assert [c.id for c in config.enabled_strategies()] == ["Surikbs"]
+    assert [c.id for c in config.enabled_strategies()] == ["gift-15m"]
 
 
 def test_an_unknown_source_is_rejected_rather_than_defaulted(monkeypatch) -> None:

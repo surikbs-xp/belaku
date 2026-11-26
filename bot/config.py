@@ -479,49 +479,64 @@ def strategy_configs() -> list[StrategyConfig]:
     keys, which is what every existing deployment has - so an unchanged ``.env``
     behaves precisely as before. Adding ``STRATEGY_2_SOURCE=nifty`` is what turns
     the second book on, and nothing else has to change.
+
+    Numbering is a *label*, not a position. A deployment that declares
+    ``STRATEGY_2_*`` and ``STRATEGY_3_*`` and leaves ``STRATEGY_1_*`` unset used
+    to get three books: the implied first book from the flat keys, plus the two
+    declared ones. The operator had configured two strategies and the dashboard
+    showed three, with a phantom GIFT book nobody asked for - and because the
+    implied book takes its interval from the flat keys, it read the same series
+    as a real book at a different timeframe.
+
+    So the implied book is only added when *no* strategy is declared at all. Once
+    anything is declared, the declared set is the whole set.
     """
-    out: list[StrategyConfig] = []
+    declared: list[StrategyConfig] = []
     for index in range(1, MAX_STRATEGIES + 1):
         prefix = f"STRATEGY_{index}_"
         source = _env(prefix + "SOURCE")
-        explicit = bool(source)
-        if index > 1 and not explicit:
-            # Only the first strategy may be implied by the flat keys; a second
-            # needs to say what it reads, or it would silently duplicate the
-            # first and trade the same book twice.
+        if not source:
+            # Only the first strategy may be implied by the flat keys, and only
+            # when nothing at all is declared - see the docstring.
             continue
-        if not explicit and index == 1:
-            source = "gift"
-        resolved_source = (source or "gift").strip().lower()
-        out.append(
-            StrategyConfig(
-                index=index,
-                id=_env(prefix + "ID", settings.strategy_id if index == 1 else "")
-                or (settings.strategy_id if index == 1 else f"strategy-{index}"),
-                source=resolved_source,
-                interval=_env(
-                    prefix + "INTERVAL",
-                    settings.gift_candle_interval if index == 1 else "60minute",
-                ),
-                exit=(
-                    _env(prefix + "EXIT", settings.strategy_exit if index == 1 else "flip")
-                    .strip().lower()
-                ),
-                lots=_env_int(
-                    prefix + "LOTS", settings.default_lots if index == 1 else 1
-                ),
-                enabled=_env_bool(prefix + "ENABLED", True),
-                name=_env(prefix + "NAME", ""),
-                filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
-                filter_ma=_env_int(prefix + "FILTER_MA", 0),
-                live=_env_bool(prefix + "LIVE", False),
-                stop_loss=_env_float(prefix + "STOP_LOSS", 0.0),
-                trail_points=_env_float(prefix + "TRAIL_POINTS", 0.0),
-                trail_after=_env_float(prefix + "TRAIL_AFTER", 0.0),
-                trail_points_after=_env_float(prefix + "TRAIL_POINTS_AFTER", 0.0),
-            )
-        )
-    return out
+        declared.append(_strategy_from(prefix, index, source))
+    if declared:
+        return declared
+    return [_strategy_from("STRATEGY_1_", 1, "gift")]
+
+
+def _strategy_from(prefix: str, index: int, source: str) -> StrategyConfig:
+    """One strategy from its ``STRATEGY_<n>_*`` keys.
+
+    ``index`` is the number in the key, kept for reporting only: it is not a
+    position in the list, so a deployment numbered 2 and 3 is two books, not
+    three.
+    """
+    first = index == 1
+    return StrategyConfig(
+        index=index,
+        id=_env(prefix + "ID", settings.strategy_id if first else "")
+        or (settings.strategy_id if first else f"strategy-{index}"),
+        source=(source or "gift").strip().lower(),
+        interval=_env(
+            prefix + "INTERVAL",
+            settings.gift_candle_interval if first else "60minute",
+        ),
+        exit=(
+            _env(prefix + "EXIT", settings.strategy_exit if first else "flip")
+            .strip().lower()
+        ),
+        lots=_env_int(prefix + "LOTS", settings.default_lots if first else 1),
+        enabled=_env_bool(prefix + "ENABLED", True),
+        name=_env(prefix + "NAME", ""),
+        filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
+        filter_ma=_env_int(prefix + "FILTER_MA", 0),
+        live=_env_bool(prefix + "LIVE", False),
+        stop_loss=_env_float(prefix + "STOP_LOSS", 0.0),
+        trail_points=_env_float(prefix + "TRAIL_POINTS", 0.0),
+        trail_after=_env_float(prefix + "TRAIL_AFTER", 0.0),
+        trail_points_after=_env_float(prefix + "TRAIL_POINTS_AFTER", 0.0),
+    )
 
 
 def enabled_strategies() -> list[StrategyConfig]:
