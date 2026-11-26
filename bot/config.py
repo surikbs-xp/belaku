@@ -184,6 +184,13 @@ class Settings:
 
     # How often the watchdog checks trading health, in seconds.
     watchdog_interval_seconds: float = _env_float("WATCHDOG_INTERVAL_SECONDS", 30.0)
+    # How often the mark loop reconciles unresolved orders against the Zerodha
+    # order book. A late fill must be discovered while the bot is idle, not only
+    # when it next tries to trade - otherwise a position can exist at the broker
+    # that the ledger does not know about, and its protective stop is never
+    # applied. 0 disables the periodic pass (startup and pre-order reconciliation
+    # still run).
+    reconcile_interval_seconds: float = _env_float("RECONCILE_INTERVAL_SECONDS", 60.0)
     instrument_refresh_seconds: int = _env_int("INSTRUMENT_REFRESH_SECONDS", 3600)
     quote_poll_seconds: int = _env_int("QUOTE_POLL_SECONDS", 5)
     http_timeout_seconds: float = _env_float("HTTP_TIMEOUT_SECONDS", 4.0)

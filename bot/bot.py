@@ -374,6 +374,13 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
     """
     period = float(interval if interval is not None else settings.engine_interval_seconds)
     manager = get_order_manager()
+    # Reconciliation is a broker round-trip, so it runs on its own slower clock
+    # than the mark. A late fill must be discovered while the bot is idle: the
+    # startup and pre-order passes alone leave a window in which a position
+    # exists at the broker that the ledger does not know about, and an unknown
+    # position has no protective stop.
+    reconcile_every = float(getattr(settings, "reconcile_interval_seconds", 60.0) or 0.0)
+    last_reconcile = 0.0
     log.info("Mark loop started (every %.1fs)", period)
     while not stop.wait(period):
         tick_started = time.perf_counter()
@@ -383,6 +390,18 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             engine["ticks"] = int(engine["ticks"]) + 1
             engine["last_tick_at"] = db.iso()
             engine["interval_seconds"] = period
+        # Resolve anything the broker has finished with before marking, so a
+        # fill that landed since the last pass is booked and then protected by
+        # the stop check below in the same tick.
+        if reconcile_every > 0 and (time.time() - last_reconcile) >= reconcile_every:
+            last_reconcile = time.time()
+            try:
+                if get_execution_mode() == LIVE:
+                    summary = manager.reconcile_orders(LIVE)
+                    if summary.get("filled") or summary.get("closed"):
+                        log.warning("Periodic order reconciliation: %s", summary)
+            except Exception:  # pragma: no cover - network
+                log.exception("Periodic order reconciliation failed")
         try:
             # Keep the execution future's price fresh for the dashboard. Priced
             # here, at the mark cadence, rather than in the status endpoint,

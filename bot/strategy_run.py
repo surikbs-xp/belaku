@@ -79,6 +79,12 @@ class RunState:
     overnight_pending: bool = False
     # The position the last exit closed, so the dashboard can show it.
     last_exit: Optional[dict[str, Any]] = None
+    # Signal-path latency for this book, in milliseconds. See EngineState for
+    # what each figure measures.
+    latency_detect_ms: Optional[float] = None
+    latency_submit_ms: Optional[float] = None
+    latency_ack_ms: Optional[float] = None
+    latency_fill_ms: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +111,12 @@ class RunState:
             "skipped": self.skipped,
             "overnight_pending": self.overnight_pending,
             "last_exit": self.last_exit,
+            "latency": {
+                "detect_ms": self.latency_detect_ms,
+                "submit_ms": self.latency_submit_ms,
+                "ack_ms": self.latency_ack_ms,
+                "fill_ms": self.latency_fill_ms,
+            },
         }
 
 

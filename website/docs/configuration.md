@@ -65,6 +65,7 @@ your machine, anyone who can send a request can panic the account.
 | `NIFTY_LOT_SIZE` | `65` | Fallback when Kite instruments are unavailable |
 | `MAX_OPEN_LOTS` | `4` | Hard cap on concurrent lots |
 | `MAX_DAILY_LOSS` | `0` | Daily realised-loss cap in rupees; blocks new entries once reached. `0` disables it. Never flattens a position. |
+| `RECONCILE_INTERVAL_SECONDS` | `60` | How often the mark loop reconciles unresolved orders against the Zerodha order book. `0` disables the periodic pass. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
 | `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT` |
@@ -96,7 +97,7 @@ harmless and cannot add an instance.
 | Variable | Default | Notes |
 |---|---|---|
 | `GIFT_CANDLE_INTERVAL` | `60minute` | Signal timeframe. See the tuning note below. |
-| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop and closed-bar check cadence |
+| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop cadence, and the engine's *fallback* poll. A bar close wakes the engine immediately, so this is not the signal latency. |
 | `QUOTE_POLL_SECONDS` | `5` | |
 | `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
 | `HTTP_TIMEOUT_SECONDS` | `4.0` | |
@@ -137,7 +138,7 @@ harmless and cannot add an instance.
 | Variable | Default | Notes |
 |---|---|---|
 | `GIFT_CANDLE_INTERVAL` | `60minute` | Signal timeframe. See the tuning note below. |
-| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop and closed-bar check cadence |
+| `ENGINE_INTERVAL_SECONDS` | `5.0` | Mark loop cadence, and the engine's *fallback* poll. A bar close wakes the engine immediately, so this is not the signal latency. |
 | `QUOTE_POLL_SECONDS` | `5` | |
 | `INSTRUMENT_REFRESH_SECONDS` | `3600` | Kite instrument dump refresh |
 | `HTTP_TIMEOUT_SECONDS` | `4.0` | |

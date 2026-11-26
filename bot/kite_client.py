@@ -371,6 +371,11 @@ class KiteClient:
         self._instruments: list[dict[str, Any]] = []
         self._instruments_fetched_at = 0.0
         self._last_prices: dict[str, float] = {}
+        # When each symbol's cached price was last confirmed by the broker. The
+        # stop check needs this: a price that is hours old must not be treated as
+        # a live mark, or a position whose feed has died reads as "not breached"
+        # and is silently left unprotected.
+        self._price_at: dict[str, float] = {}
         self._last_quote_at: Optional[datetime] = None
         self._auth_error: Optional[str] = None
         self._session_cache: Optional[dict[str, Any]] = None
@@ -660,6 +665,7 @@ class KiteClient:
             return None
         price = float(payload["last_price"])
         self._last_prices[symbol] = price
+        self._price_at[symbol] = time.time()
         self._last_quote_at = datetime.now(IST)
         ohlc = payload.get("ohlc", {}) or {}
         # Depth is optional and, when present, drives the paper fill model. It is
@@ -738,6 +744,18 @@ class KiteClient:
     def remember_tick(self, symbol: str, price: float) -> None:
         """Cache the last known price for ``symbol``."""
         self._last_prices[symbol] = float(price)
+        self._price_at[symbol] = time.time()
+
+    def price_age(self, symbol: str) -> Optional[float]:
+        """Seconds since ``symbol``'s cached price was last confirmed, or None.
+
+        ``None`` means no price has ever been seen for the symbol. A large value
+        means the cached price is stale and must not be used as a live mark.
+        """
+        stamp = self._price_at.get(symbol)
+        if stamp is None:
+            return None
+        return max(0.0, time.time() - stamp)
 
     @property
     def last_quote_at(self) -> Optional[datetime]:

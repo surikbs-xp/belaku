@@ -69,6 +69,11 @@
         <span id="pill-market" class="pill pill-idle">Market —</span>
         <span id="pill-feed" class="pill pill-idle">GIFT —</span>
         <span id="pill-loop" class="pill pill-idle">Loop —</span>
+        <!-- Signal-path latency: bar close to verdict, and verdict to fill.
+             Distinct from pill-latency below, which is the Kite API round-trip.
+             Shown because "how fast did it act?" is a question the operator
+             should not have to read the log to answer. -->
+        <span id="pill-signal-latency" class="pill pill-idle" title="Signal detection and order round-trip latency">Signal —</span>
         <!-- Front-month rollover. Hidden until the contract is close enough to
              expiry to matter, so it is a quiet nudge rather than a banner. -->
         <span id="pill-rollover" class="pill pill-idle hidden">Rollover —</span>

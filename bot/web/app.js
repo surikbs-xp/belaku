@@ -334,6 +334,33 @@ function renderStatus(status) {
     `marks ${hb.marks ?? 0} · ticks ${hb.ticks ?? 0} · every ${interval}s`
     + (hb.last_error ? ` · last error: ${hb.last_error}` : '');
 
+  // Signal-path latency. Detection is bar-close to verdict; the round-trip is
+  // verdict to confirmed fill. Both are measured in the engine, not estimated
+  // here, so the pill reports what actually happened.
+  const lat = (status.engine || {}).latency || {};
+  const detect = num(lat.detect_ms);
+  const roundTrip = num(lat.fill_ms) ?? num(lat.submit_ms);
+  const latencyPill = $('pill-signal-latency');
+  if (latencyPill) {
+    if (detect === null && roundTrip === null) {
+      setPill('pill-signal-latency', 'Signal —', 'idle');
+      latencyPill.title = 'No signal has been evaluated yet';
+    } else {
+      const parts = [];
+      if (detect !== null) parts.push(`detect ${Math.round(detect)}ms`);
+      if (roundTrip !== null) parts.push(`fill ${Math.round(roundTrip)}ms`);
+      // A detection over a second means the engine missed the bar close and
+      // fell back to the poll, which is the thing the event-driven wake exists
+      // to prevent - so it is flagged rather than shown as normal.
+      const slow = detect !== null && detect > 1000;
+      setPill('pill-signal-latency', `Signal · ${parts.join(' / ')}`, slow ? 'bad' : 'live');
+      latencyPill.title =
+        `bar close → verdict ${detect === null ? '—' : Math.round(detect) + 'ms'}`
+        + ` · verdict → fill ${roundTrip === null ? '—' : Math.round(roundTrip) + 'ms'}`
+        + (slow ? ' · detection fell back to the poll interval' : '');
+    }
+  }
+
   $('hdr-symbol').textContent = (status.symbol && status.symbol.current) || '—';
   $('hdr-market').textContent = market.is_open
     ? `Market open · closes ${(market.session_close || '').slice(11, 16)} IST`

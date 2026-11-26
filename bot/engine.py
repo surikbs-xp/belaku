@@ -54,6 +54,14 @@ from portfolio import get_aggregator
 
 log = logging.getLogger("engine")
 
+# How old a cached mark may be before the stop check refuses to trust it. The
+# mark loop refreshes the execution quote every ENGINE_INTERVAL_SECONDS (5s by
+# default), so a mark older than this means the quote path has failed - and a
+# stop evaluated against a stale price is a stop that reports "not breached" for
+# a position that may already be through it. Deliberately generous: a brief
+# network blip must not stop the check, only a sustained outage.
+STALE_MARK_SECONDS = 60.0
+
 
 def _trade_alert(
     kind: str,
@@ -150,6 +158,19 @@ class EngineState:
     # rather than only after entries start being refused.
     rollover: dict[str, Any] = field(default_factory=dict)
     rollover_paused: bool = False
+    # Signal-path latency, in milliseconds. These are the numbers that answer
+    # "how fast did the bot act?", and they are measured rather than estimated:
+    #   detect  - bar close to the verdict being computed
+    #   submit  - verdict to the order being handed to the broker
+    #   ack     - order submission to the broker's acknowledgement
+    #   fill    - submission to the fill being confirmed
+    # Each is the most recent value; ``latency_samples`` keeps a short history so
+    # the dashboard can show a median rather than one noisy reading.
+    latency_detect_ms: Optional[float] = None
+    latency_submit_ms: Optional[float] = None
+    latency_ack_ms: Optional[float] = None
+    latency_fill_ms: Optional[float] = None
+    latency_samples: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -174,6 +195,13 @@ class EngineState:
             "ready": self.ready,
             "rollover": self.rollover,
             "rollover_paused": self.rollover_paused,
+            "latency": {
+                "detect_ms": self.latency_detect_ms,
+                "submit_ms": self.latency_submit_ms,
+                "ack_ms": self.latency_ack_ms,
+                "fill_ms": self.latency_fill_ms,
+                "samples": self.latency_samples[-20:],
+            },
         }
 
 
@@ -565,6 +593,20 @@ class StrategyEngine:
             mark = prices.get(position["symbol"])
             if mark is None:
                 continue
+            # A stale mark is not a live mark. ``get_ltp`` falls back to the last
+            # cached price when the quote endpoint fails, so a dead feed would
+            # otherwise have every stop evaluated against a price from minutes or
+            # hours ago - reported "not breached" and left unprotected. Skipping
+            # the evaluation is the honest answer: the position is not known to be
+            # safe, and the watchdog raises a stale-quote alert for it.
+            age = self._mark_age(position["symbol"])
+            if age is not None and age > STALE_MARK_SECONDS:
+                log.warning(
+                    "Stop check skipped for %s: mark is %.0fs old (limit %.0fs); "
+                    "the position is NOT known to be protected",
+                    position["symbol"], age, STALE_MARK_SECONDS,
+                )
+                continue
             try:
                 report = self._check_one_stop(position, float(mark), rules)
             except Exception:  # pragma: no cover - defensive
@@ -573,6 +615,26 @@ class StrategyEngine:
             if report is not None:
                 reports.append(report)
         return reports
+
+    @staticmethod
+    def _mark_age(symbol: str) -> Optional[float]:
+        """Age of the cached price for ``symbol``, or ``None`` when unknown.
+
+        Read from the *order manager's* client, because that is the one whose
+        ``price_map`` produced the marks being evaluated. Reading the global
+        singleton instead would measure a different client's cache - the same
+        object in production, but not necessarily in a test or after a client
+        reset, and a mismatch there would silently disable the guard.
+
+        ``None`` (no timestamp available) is treated as fresh by the caller: a
+        test double or a client without the accessor must not disable stops.
+        """
+        try:
+            client = get_order_manager().client
+            age = getattr(client, "price_age", None)
+            return age(symbol) if callable(age) else None
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _check_one_stop(
         self, position: dict[str, Any], mark: float, rules: stops.StopRules
@@ -1136,16 +1198,25 @@ class StrategyEngine:
             lag_seconds = round(
                 (datetime.now(db.IST) - closed_aware).total_seconds(), 1
             )
+        # Detection latency: how long after the bar closed the verdict existed.
+        # This is the number the event-driven wake-up exists to shrink, so it is
+        # measured and logged rather than assumed.
+        detect_ms = None
+        if closed_at is not None:
+            detect_ms = round(
+                (datetime.now(db.IST) - closed_aware).total_seconds() * 1000.0, 1
+            )
         log.info(
             "Indicator values strategy=%s source=%s interval_seconds=%s candle_at=%s "
-            "bar_closed_at=%s lag_seconds=%s history_bars=%d ohlc=%s indicators=%s "
-            "signal=%s previous=%s fresh=%s",
+            "bar_closed_at=%s lag_seconds=%s detect_ms=%s history_bars=%d ohlc=%s "
+            "indicators=%s signal=%s previous=%s fresh=%s",
             run.id,
             run.symbol,
             source.seconds,
             newest,
             closed_at.isoformat(timespec="seconds") if closed_at else None,
             lag_seconds,
+            detect_ms,
             verdict.bars,
             json.dumps(ohlc, sort_keys=True),
             json.dumps(verdict.values, sort_keys=True),
@@ -1153,6 +1224,10 @@ class StrategyEngine:
             verdict.previous_signal,
             verdict.fresh,
         )
+        if detect_ms is not None:
+            with self._lock:
+                self.state.latency_detect_ms = detect_ms
+                run.state.latency_detect_ms = detect_ms
 
         evaluated_at = db.iso()
         with self._lock:
@@ -1684,13 +1759,38 @@ class StrategyEngine:
             return {"ok": False, "reason": f"execution error: {exc}"}
 
         data = result.to_dict()
+        # Broker round-trip for this order, from the order manager's own timing.
+        # Recorded on the book and on the engine so the dashboard can show it per
+        # strategy and in the header.
+        details = data.get("details") or {}
+        submit_ms = details.get("submit_ms")
         with self._lock:
             self.state.orders_sent += 1 if result.ok else 0
             self.state.orders_blocked += 0 if result.ok else 1
             self.state.last_action = action
             self.state.last_action_at = db.iso()
             self.state.last_result = data
-        log.info("Engine %s -> ok=%s %s", action, result.ok, result.reason)
+            if submit_ms is not None:
+                self.state.latency_submit_ms = submit_ms
+                self.state.latency_ack_ms = submit_ms
+                self.state.latency_fill_ms = submit_ms if result.ok else None
+                self.state.latency_samples.append({
+                    "at": db.iso(),
+                    "strategy_id": book,
+                    "action": action,
+                    "detect_ms": self.state.latency_detect_ms,
+                    "submit_ms": submit_ms,
+                    "ok": result.ok,
+                })
+                del self.state.latency_samples[:-50]
+                if run is not None:
+                    run.state.latency_submit_ms = submit_ms
+                    run.state.latency_ack_ms = submit_ms
+                    run.state.latency_fill_ms = submit_ms if result.ok else None
+        log.info(
+            "Engine %s -> ok=%s %s (broker round-trip %sms)",
+            action, result.ok, result.reason, submit_ms,
+        )
         # Tell the operator a trade opened. Without this the only messages are
         # problems, so a working bot is indistinguishable from a dead one - and
         # the first thing anyone asks after a signal is "did it take it?".
@@ -1725,17 +1825,47 @@ class StrategyEngine:
 
     # -- loop ------------------------------------------------------------
     def loop(self, stop: threading.Event, interval: Optional[float] = None) -> None:
-        """Evaluate whenever a new bar closes.
+        """Evaluate the moment a bar closes, not on the next poll.
 
-        The loop is cheap: :meth:`evaluate_now` returns immediately unless the
-        newest bar timestamp changed, so a short poll interval costs one
-        comparison, not a re-evaluation.
+        The feed sets ``bar_closed`` from the tick thread as soon as a candle
+        completes, so the engine wakes immediately rather than waiting up to a
+        full poll interval. That interval is the single largest avoidable delay
+        in the signal path: at 5 s it added up to 5 s to every entry, and the
+        order itself takes a few hundred milliseconds.
+
+        The poll is kept as a *fallback*, not the mechanism. It still runs, at
+        the configured interval, because a source that cannot signal (the NIFTY
+        spot book reads REST history and has no tick subscription) and a missed
+        wake-up both need a safety net. So the loop waits on the event with a
+        timeout: whichever comes first, a close or the timeout, triggers an
+        evaluation.
+
+        Evaluation is still guarded by the bar timestamp, so a spurious wake-up
+        costs one comparison and never re-evaluates a bar it has already seen.
         """
         period = float(interval if interval is not None else settings.engine_interval_seconds)
         with self._lock:
             self.state.interval_seconds = period
-        log.info("Strategy engine started (poll %.1fs)", period)
-        while not stop.wait(period):
+        log.info("Strategy engine started (event-driven, poll fallback %.1fs)", period)
+        while not stop.is_set():
+            # Wait for a bar close, or the poll interval, whichever is first.
+            # ``wait`` returns True when the event was set, False on timeout.
+            woke = self._wait_for_bar(stop, period)
+            if stop.is_set():
+                break
+            if woke:
+                log.debug("Engine woken by a bar close")
+                # A close makes the history fetch due now. Without this the
+                # engine would evaluate the series it already had and only see
+                # the new bar on the next throttled refresh - up to 30 s later,
+                # which is the delay the wake-up exists to remove.
+                try:
+                    feed = get_feed()
+                    due = getattr(feed, "history_due", None)
+                    if due is not None and due.is_set():
+                        feed.refresh_history(force=True)
+                except Exception:  # pragma: no cover - defensive
+                    log.exception("Forced history refresh after a bar close failed")
             try:
                 self.enforce_rollover()
             except Exception as exc:  # pragma: no cover - defensive
@@ -1753,6 +1883,29 @@ class StrategyEngine:
                     with self._lock:
                         run.state.last_error = str(exc)
         log.info("Strategy engine stopped")
+
+    def _wait_for_bar(self, stop: threading.Event, period: float) -> bool:
+        """Block until a bar closes, the poll interval elapses, or ``stop``.
+
+        Returns True when a bar close woke the loop. The event is cleared here
+        rather than by the setter, so a close that arrives while the loop is
+        evaluating is not lost: it stays set and the next wait returns at once.
+        """
+        feed = get_feed()
+        event = getattr(feed, "bar_closed", None)
+        if event is None:
+            # A source with no wake signal (or a test stub): fall back to the
+            # poll. ``stop.wait`` keeps shutdown responsive.
+            return not stop.wait(period)
+        deadline = time.monotonic() + period
+        while not stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if event.wait(min(remaining, 0.5)):
+                event.clear()
+                return True
+        return False
 
     def start(self) -> None:
         self._stop.clear()

@@ -7075,19 +7075,19 @@ def test_live_readiness_blocks_when_no_book_is_reported(monkeypatch) -> None:
 
 
 def test_two_books_never_hold_opposing_legs_on_one_contract(monkeypatch, tmp_path) -> None:
-    """The unavailable rule, stated as a test.
+    """A second book may not open a leg opposing one already held.
 
-    Both books place orders on the *same* front-month future, because
-    ``execute`` prices and trades ``manager.current_symbol()`` regardless of which
-    series produced the signal. Position lookups are scoped per book, so nothing
-    stops one book going long while the other goes short: the ledger then holds
-    +1 and -1 lots that cancel at the broker, and the only thing joining a signal
-    to its own leg is the ``strategy_id`` stamp.
+    Both books trade the *same* front-month future, because ``execute`` prices
+    and trades ``manager.current_symbol()`` regardless of which series produced
+    the signal. Zerodha nets the two into one position, so a long from one book
+    and a short from the other cancel at the broker instead of being two trades -
+    the second entry silently reverses the first.
 
-    That is fine while it is one operator reading one dashboard, and it is the
-    reason this test exists rather than a fix: the failure is invisible in every
-    aggregate. Net exposure reads flat, the portfolio shows nothing, and the two
-    opened trades are the only evidence.
+    The portfolio rule that refuses this used to live only in
+    ``engine.evaluate_run``, so a manual order from the dashboard bypassed it and
+    could create exactly this state. It is now enforced in
+    ``_execute_directional``, the single choke point every entry passes through,
+    so no caller can skip it.
     """
     manager, client = _rollover_manager(monkeypatch, tmp_path)
     symbol = "NIFTY26DECFUT"
@@ -7096,20 +7096,17 @@ def test_two_books_never_hold_opposing_legs_on_one_contract(monkeypatch, tmp_pat
     short_book = manager._execute_directional({}, "SELL", symbol, PAPER, "test", strategy_id="book-b")
 
     assert long_book.ok, long_book.reason
-    assert short_book.ok, short_book.reason
+    assert not short_book.ok, "an opposing leg must be refused"
+    assert "opposing legs" in short_book.reason
 
     positions = db.get_open_positions(mode=PAPER)
-    # Two legs on one contract, opposite signs.
-    assert len(positions) == 2
-    assert {p["strategy_id"] for p in positions} == {"book-a", "book-b"}
-    assert sum(int(p["quantity"]) * int(p["position_key"]) for p in positions) == 0
-
-    # Each book sees only its own leg, which is what makes the double entry
-    # possible in the first place.
+    # Exactly one leg survives; the second book never opened.
+    assert len(positions) == 1
+    assert positions[0]["strategy_id"] == "book-a"
     assert manager._current_net_lots(symbol, PAPER, 65, "book-a") == 1
-    assert manager._current_net_lots(symbol, PAPER, 65, "book-b") == -1
-    # But the broker sees nothing open.
-    assert manager._current_net_lots(symbol, PAPER, 65, None) == 0
+    assert manager._current_net_lots(symbol, PAPER, 65, "book-b") == 0
+    # The broker's netted view agrees: one long, not a flat pair.
+    assert manager._current_net_lots(symbol, PAPER, 65, None) == 1
 
 
 def _readiness_live_screen(monkeypatch, *, loop_age, quote_age):
@@ -9920,3 +9917,342 @@ def test_booking_a_reconciled_fill_is_idempotent(monkeypatch, tmp_path) -> None:
     assert second is None, "a second booking must be a no-op"
     assert len(db.get_open_positions(mode=LIVE)) == 1
     assert db.get_pending_orders(LIVE, "NIFTY26DECFUT") == []
+
+
+def test_a_manual_order_cannot_open_an_opposing_leg(monkeypatch, tmp_path) -> None:
+    """A manual BUY must obey the same portfolio rule as an automated one.
+
+    The rule used to live only in ``engine.evaluate_run``, so a manual order from
+    the dashboard skipped it and could open a long in a contract another book was
+    short. Zerodha nets the two, so the second leg silently reversed the first -
+    the unintended position reversal the risk rules exist to prevent.
+    """
+    manager, client = _rollover_manager(monkeypatch, tmp_path)
+    symbol = "NIFTY26DECFUT"
+
+    short_book = manager._execute_directional(
+        {}, "SELL", symbol, PAPER, "test", strategy_id="nifty-60m"
+    )
+    assert short_book.ok, short_book.reason
+
+    manual = manager.process_signal(
+        {"action": "BUY", "qty_lots": 1, "signal_id": "MANUAL-1"},
+        source="MANUAL", strategy_id="gift-15m", mode=PAPER,
+    )
+
+    assert manual.ok is False
+    assert "opposing legs" in manual.reason
+    positions = db.get_open_positions(mode=PAPER)
+    assert len(positions) == 1
+    assert positions[0]["strategy_id"] == "nifty-60m"
+
+
+def test_a_partial_fill_is_reported_as_partial_not_as_a_normal_entry(
+    monkeypatch, tmp_path
+) -> None:
+    """A partial fill must be unmistakable, and must block the next entry.
+
+    The position is smaller than the signal asked for and is not a whole number
+    of lots, so the book cannot size a new entry against it. Reporting it as
+    "Opened 0.49 lot(s)" read like a normal fill and hid the shortfall.
+    """
+    manager, client = _rollover_manager(monkeypatch, tmp_path)
+    symbol = "NIFTY26DECFUT"
+
+    class PartialClient:
+        mode = PAPER
+
+        def get_ltp(self, symbol, max_age=None):
+            return 20_000.0
+
+        def data_source(self):
+            return "fake"
+
+        def place_order(self, symbol, transaction_type, quantity, price=None, **kw):
+            return {
+                "order_id": "P1", "status": "COMPLETE",
+                "filled_quantity": quantity // 2, "average_price": 20_000.0,
+                "depth": None, "message": "partial",
+            }
+
+    manager._client = PartialClient()
+    result = manager._execute_directional(
+        {}, "BUY", symbol, PAPER, "test", strategy_id="gift-15m"
+    )
+
+    assert result.ok is True
+    assert "PARTIAL FILL" in result.reason
+    assert result.details["partial"] is True
+    assert result.quantity == 32
+
+    # The next entry is refused: the ledger holds a non-whole-lot position.
+    again = manager._execute_directional(
+        {}, "BUY", symbol, PAPER, "test", strategy_id="gift-15m"
+    )
+    assert again.ok is False
+    assert "partial fill" in again.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Signal-path latency: event-driven evaluation
+# ---------------------------------------------------------------------------
+def test_a_bar_close_wakes_the_engine_without_waiting_for_the_poll() -> None:
+    """The engine must act on a close immediately, not on the next poll.
+
+    The poll interval was the largest avoidable delay in the signal path: at 5 s
+    it added up to 5 s to every entry. The feed now sets ``bar_closed`` from the
+    tick thread, and the loop waits on it with the poll as a fallback.
+    """
+    import threading
+    import time
+
+    import engine as engine_module
+    import gift_nifty
+
+    class StubFeed:
+        def __init__(self):
+            self.bar_closed = threading.Event()
+            self.history_due = threading.Event()
+
+        def refresh_history(self, force=False):
+            self.history_due.clear()
+            return 0
+
+        def status(self):
+            return {"connected": True}
+
+    feed = StubFeed()
+    original_feed = gift_nifty._feed
+    original_get = engine_module.get_feed
+    gift_nifty._feed = feed
+    engine_module.get_feed = lambda: feed
+    try:
+        eng = engine_module.StrategyEngine()
+        woke: list[float] = []
+        eng.evaluate_run = lambda run, force=False: woke.append(time.monotonic())
+        eng.enforce_rollover = lambda: None
+
+        stop = threading.Event()
+        thread = threading.Thread(target=eng.loop, args=(stop, 30.0), daemon=True)
+        thread.start()
+        time.sleep(0.2)
+
+        started = time.monotonic()
+        feed.bar_closed.set()
+        time.sleep(0.4)
+        stop.set()
+        thread.join(timeout=2)
+
+        assert woke, "the engine did not wake on a bar close"
+        assert (woke[0] - started) < 1.0, (
+            f"woke after {woke[0] - started:.2f}s; the poll fallback was 30s, so "
+            "the event did not drive the wake-up"
+        )
+    finally:
+        gift_nifty._feed = original_feed
+        engine_module.get_feed = original_get
+
+
+def test_a_bar_close_forces_the_history_fetch_past_the_throttle() -> None:
+    """A close must not wait out the 30 s history-refresh throttle.
+
+    When Kite history is authoritative the tick-built bar is discarded, so the
+    new bar only appears after a fetch. The throttle would otherwise delay the
+    signal by up to HISTORY_REFRESH_SECONDS.
+    """
+    import gift_nifty
+
+    feed = gift_nifty.GiftNiftyFeed.__new__(gift_nifty.GiftNiftyFeed)
+    feed.history_due = __import__("threading").Event()
+    feed.history_due.set()
+
+    # The marker must survive into refresh_history and force the fetch. Assert
+    # on the source rather than running a network call: the behaviour under test
+    # is that the throttle is bypassed, which is a control-flow property.
+    import inspect
+
+    source = inspect.getsource(gift_nifty.GiftNiftyFeed.refresh_history)
+    assert "history_due.is_set()" in source and "force = True" in source, (
+        "refresh_history no longer honours the history_due marker, so a bar "
+        "close waits out the refresh throttle"
+    )
+
+
+def test_the_order_path_records_its_broker_round_trip(monkeypatch, tmp_path) -> None:
+    """Every entry must report how long the broker took, for the latency pill."""
+    manager, client = _rollover_manager(monkeypatch, tmp_path)
+    result = manager._execute_directional(
+        {}, "BUY", "NIFTY26DECFUT", PAPER, "test", strategy_id="gift-15m"
+    )
+
+    assert result.ok, result.reason
+    assert result.details is not None
+    assert "submit_ms" in result.details
+    assert result.details["submit_ms"] >= 0.0
+
+
+def test_repeated_bar_close_events_do_not_re_evaluate_the_same_bar() -> None:
+    """A burst of wake-ups must not produce duplicate orders.
+
+    The feed sets ``bar_closed`` on every close, and a reconnecting websocket can
+    deliver the same close more than once. The bar-timestamp guard is what makes
+    that harmless: the second wake-up finds the bar already seen and returns
+    without evaluating, so no second order can be generated.
+    """
+    import threading
+    import time
+    from datetime import datetime, timedelta
+
+    import engine as engine_module
+    import gift_nifty
+
+    base = datetime(2026, 11, 25, 9, 15)
+    bars = [
+        {
+            "time": (base + timedelta(minutes=15 * i)).isoformat(sep=" "),
+            "open": 20_000 + i, "high": 20_010 + i,
+            "low": 19_990 + i, "close": 20_005 + i,
+        }
+        for i in range(40)
+    ]
+
+    class StubFeed:
+        def __init__(self):
+            self.bar_closed = threading.Event()
+            self.history_due = threading.Event()
+
+        def refresh_history(self, force=False):
+            self.history_due.clear()
+            return len(bars)
+
+        def candles(self):
+            return list(bars)
+
+        def interval_count(self, interval=None):
+            return len(bars)
+
+        def status(self):
+            return {"connected": True}
+
+    feed = StubFeed()
+    original_feed = gift_nifty._feed
+    original_get = engine_module.get_feed
+    gift_nifty._feed = feed
+    engine_module.get_feed = lambda: feed
+    try:
+        eng = engine_module.StrategyEngine()
+        eng.enforce_rollover = lambda: None
+        evaluated: list[dict] = []
+        original = eng.evaluate_run
+
+        def counting(run, force=False):
+            result = original(run, force=force)
+            if not result.get("skipped"):
+                evaluated.append(result)
+            return result
+
+        eng.evaluate_run = counting
+
+        stop = threading.Event()
+        thread = threading.Thread(target=eng.loop, args=(stop, 30.0), daemon=True)
+        thread.start()
+        time.sleep(0.2)
+        for _ in range(50):
+            feed.bar_closed.set()
+            time.sleep(0.005)
+        time.sleep(0.4)
+        stop.set()
+        thread.join(timeout=2)
+
+        assert len(evaluated) <= 2, (
+            f"50 wake-ups produced {len(evaluated)} evaluations; the bar guard "
+            "did not suppress the repeats"
+        )
+    finally:
+        gift_nifty._feed = original_feed
+        engine_module.get_feed = original_get
+
+
+def test_a_stale_mark_does_not_trigger_a_false_stop_out(monkeypatch, tmp_path) -> None:
+    """A stale price must not be treated as a live mark.
+
+    ``get_ltp`` falls back to the last cached price when the quote endpoint
+    fails. Evaluating a stop against a price from minutes ago would report "not
+    breached" for a position that may already be through it - an unprotected
+    position the bot believes is protected. The check skips a stale mark instead,
+    and the watchdog raises a stale-quote alert.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    symbol = "NIFTY26DECFUT"
+    db.open_position(
+        symbol, 65, 20_000.0, mode=LIVE, strategy_id="gift-15m",
+        sl_price=19_950.0, initial_sl_price=19_950.0,
+        trailing_stop=19_950.0, best_price=20_000.0,
+    )
+
+    class FakeClient:
+        mode = LIVE
+        age = 999.0
+
+        def get_ltp(self, symbol, max_age=None):
+            return 19_000.0
+
+        def price_age(self, symbol):
+            return self.age
+
+        def instrument_for_symbol(self, s):
+            return {"tradingsymbol": symbol, "instrument_type": "FUT", "lot_size": 65}
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": symbol}]
+
+        def front_month_symbol(self, now=None):
+            return symbol
+
+        def session_status(self, max_age=30):
+            return {"valid": True}
+
+        def positions(self, force=False):
+            return [{"tradingsymbol": symbol, "quantity": 65}]
+
+        def net_position(self, s, force=False):
+            return 65
+
+        def order_book(self, force=False):
+            return []
+
+        def available_cash(self):
+            return 5_000_000.0
+
+        def required_margin(self, *a, **k):
+            return 150_000.0
+
+        def data_source(self):
+            return "fake"
+
+        def auth_status(self):
+            return {"authenticated": True}
+
+        def place_order(self, symbol, transaction_type, quantity, price=None, **kw):
+            return {"order_id": "O1", "status": "COMPLETE",
+                    "filled_quantity": quantity, "average_price": 19_950.0,
+                    "depth": None, "message": "ok"}
+
+    client = FakeClient()
+    manager = OrderManager(client)
+    order_manager._manager = manager
+    engine._engine = None
+    eng = engine.get_engine()
+    book = next(r for r in eng.runs if r.id == "gift-15m")
+    book.stop_rules = __import__("stops").StopRules(50, 5, 50, 30)
+
+    # Stale: the deep breach must NOT close the position.
+    reports = eng.check_stops({symbol: 19_000.0})
+    assert reports == []
+    assert len(db.get_open_positions(mode=LIVE)) == 1
+
+    # Fresh: the same breach closes it.
+    client.age = 0.0
+    reports = eng.check_stops({symbol: 19_950.0})
+    assert len(db.get_open_positions(mode=LIVE)) == 0

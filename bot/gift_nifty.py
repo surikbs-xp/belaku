@@ -328,6 +328,20 @@ class GiftNiftyFeed:
         self._history_failures = 0
         self._history_retry_at: Optional[datetime] = None
         self._history_error: Optional[str] = None
+        # Set whenever a bar closes, so the engine can evaluate immediately
+        # instead of waiting for its next poll. This is the difference between a
+        # signal being acted on within milliseconds of the bar closing and being
+        # acted on up to one poll interval later. It is a plain Event rather than
+        # a queue because only the *fact* of a close matters: the engine reads
+        # the series itself, so a coalesced wake-up loses nothing.
+        self.bar_closed = threading.Event()
+        # Set when a bar closes while Kite history is authoritative. The
+        # tick-built bar is discarded in that case (Kite's OHLC is the source of
+        # truth), so the new bar only appears after a history fetch - and that
+        # fetch is normally throttled to HISTORY_REFRESH_SECONDS. Without this
+        # marker the signal waited up to 30 s for a refresh that the close had
+        # already made necessary. The engine clears it after forcing the fetch.
+        self.history_due = threading.Event()
 
     # -- history ---------------------------------------------------------
     def load_persisted(self) -> int:
@@ -384,6 +398,10 @@ class GiftNiftyFeed:
         indicators. Returns the number of closed bars now held.
         """
         now = datetime.now(IST)
+        # A bar close makes the fetch due immediately, whatever the throttle
+        # says: the series is missing a bar the market has already finished.
+        if self.history_due.is_set():
+            force = True
         with self._lock:
             if (
                 not force
@@ -453,6 +471,7 @@ class GiftNiftyFeed:
             if unchanged:
                 self._history_at = now
                 self._history_error = None
+                self.history_due.clear()
                 return len(self._history)
 
         closed: list[dict[str, Any]] = []
@@ -502,6 +521,7 @@ class GiftNiftyFeed:
                 # so far and closes the bar at a single price.
                 self._builder.current = _merge_forming(self._builder.current, forming)
                 self._resume_candle = None
+        self.history_due.clear()
         self._refresh_extra_history(now)
         log.info(
             "GIFT Nifty history refreshed from Kite: %d closed bars, forming=%s",
@@ -586,12 +606,18 @@ class GiftNiftyFeed:
 
     # -- candles ---------------------------------------------------------
     def _on_bar_close(self, candle: Candle, interval: Optional[str] = None) -> None:
+        # Wake the engine first, before the SQLite write below. The write is
+        # fast but it is still I/O on the tick thread, and the signal must not
+        # wait behind it.
+        self.bar_closed.set()
         self._persist(candle, interval)
         with self._lock:
             authoritative = self._history_source == "kite"
         if authoritative:
             # Kite history is the source of truth; the next refresh replaces
-            # this bar with the exchange's own OHLC.
+            # this bar with the exchange's own OHLC. Mark it due so the engine
+            # fetches now rather than waiting out the refresh throttle.
+            self.history_due.set()
             log.info(
                 "GIFT bar closed %s O=%.2f H=%.2f L=%.2f C=%.2f ticks=%d "
                 "(awaiting Kite history confirmation)",
@@ -697,6 +723,7 @@ class GiftNiftyFeed:
 
     def _on_extra_close(self, interval: str, candle: Candle) -> None:
         """Persist and append a closed bar from a secondary timeframe."""
+        self.bar_closed.set()
         self._persist(candle, interval)
         if candle.partial:
             return

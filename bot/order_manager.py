@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -1088,6 +1089,35 @@ class OrderManager:
                 reason=f"{lots} lots exceeds MAX_OPEN_LOTS={settings.max_open_lots}",
             )
 
+        # Portfolio rules, enforced here rather than only in the engine. This is
+        # the single choke point every entry passes through - automated, manual
+        # and webhook - so a rule placed here cannot be bypassed by a caller that
+        # does not know about it. It used to live only in ``engine.evaluate_run``,
+        # which meant a manual BUY from the dashboard could open a long in the
+        # same contract another book was short: Zerodha nets the two into one
+        # position, so the second leg silently cancelled the first instead of
+        # being a separate trade. That is the unintended reversal this refuses.
+        try:
+            from portfolio import get_aggregator
+
+            verdict = get_aggregator().authorise(
+                strategy_id, action, symbol, abs(lots),
+                lot_size=lot_size, mode=mode,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            # A portfolio check that cannot run must not silently permit the
+            # order: refusing is the safe direction, and the reason is reported.
+            log.warning("Portfolio check failed (%s); refusing the entry", exc)
+            return ExecutionResult(
+                False, action, mode, symbol,
+                reason=f"Portfolio check unavailable: {exc}",
+            )
+        if not verdict.allowed:
+            return ExecutionResult(
+                False, action, mode, symbol, reason=verdict.reason,
+                details={"portfolio": verdict.to_dict()},
+            )
+
         price = self._price(symbol, payload, allow_payload_price=(mode == PAPER))
         if not price or price <= 0:
             return ExecutionResult(False, action, mode, symbol, reason="No reference price available")
@@ -1121,6 +1151,11 @@ class OrderManager:
 
         fill = apply_slippage(price, action)
         simulated: Optional[fill.FillResult] = None
+        # Timed so the dashboard can show how long the broker round-trip took.
+        # ``place_order`` blocks until the fill is confirmed (or the timeout
+        # expires), so this single measurement covers submission, acknowledgement
+        # and fill for a market order.
+        submit_started = time.perf_counter()
         ack = self.client.place_order(
             symbol=symbol,
             transaction_type=action,
@@ -1133,6 +1168,7 @@ class OrderManager:
             # because the process is armed.
             mode=mode,
         )
+        submit_ms = round((time.perf_counter() - submit_started) * 1000.0, 1)
         order_id = ack.get("order_id")
         status = str(ack.get("status") or "REJECTED").upper().replace(" ", "_")
         try:
@@ -1149,16 +1185,13 @@ class OrderManager:
         # depth; a partial fill books only the portion that actually filled and
         # reports the rest honestly rather than inventing a price for liquidity
         # that was not shown. LIVE keeps the broker's own fill untouched.
-        partial_note = ""
         if mode == PAPER and status == "COMPLETE":
             simulated = self._paper_fill(
                 symbol, action, filled_quantity, price, ack.get("depth")
             )
-            if simulated.filled_quantity < filled_quantity:
-                partial_note = (
-                    f" (partial: {simulated.filled_quantity}/{filled_quantity} filled; "
-                    "remaining not shown in the book)"
-                )
+            # The shortfall is reported by the summary below, which compares the
+            # booked quantity against the requested one; no separate note is
+            # needed here.
             filled_quantity = simulated.filled_quantity
             fill = simulated.price
         if filled_quantity == 0:
@@ -1234,13 +1267,28 @@ class OrderManager:
 
         pending_fill = status in {"OPEN", "TRIGGER_PENDING", "PENDING"}
         filled_lots = filled_quantity / lot_size
+        is_partial = filled_quantity < qty
+        if pending_fill:
+            summary = f"Order remains unresolved ({filled_quantity}/{qty} filled)"
+        elif is_partial:
+            # A partial fill is a real, dangerous state: the position is smaller
+            # than the signal asked for and is not a whole number of lots, so the
+            # book cannot size a new entry against it. Say so plainly rather than
+            # reporting a fractional lot count that reads like a normal fill.
+            summary = (
+                f"PARTIAL FILL: {filled_quantity}/{qty} units "
+                f"({filled_lots:.2f} of {abs(lots)} lot(s)) "
+                f"{'LONG' if signed_quantity > 0 else 'SHORT'} @ {fill_price:.2f}. "
+                f"The remainder did not fill; square this off before a new entry."
+            )
+        else:
+            summary = (
+                f"Opened {filled_lots:g} lot(s) "
+                f"{'LONG' if signed_quantity > 0 else 'SHORT'} @ {fill_price:.2f}"
+            )
         return ExecutionResult(
             not pending_fill, action, mode, symbol, quantity=filled_quantity, price=fill_price,
-            reason=(
-                f"Order remains unresolved ({filled_quantity}/{qty} filled)"
-                if pending_fill
-                else f"Opened {filled_lots:g} lot(s) {'LONG' if signed_quantity > 0 else 'SHORT'} @ {fill_price:.2f}{partial_note}"
-            ),
+            reason=summary,
             position_id=position_id, order_ids=tuple(order_ids),
             details={
                 "lots": filled_lots,
@@ -1250,6 +1298,9 @@ class OrderManager:
                 "fill_source": self.client.data_source(),
                 "fill_model": simulated.source if simulated is not None else "broker",
                 "levels_touched": simulated.levels_touched if simulated is not None else None,
+                # Broker round-trip for this order, in milliseconds. Covers
+                # submission, acknowledgement and fill for a market order.
+                "submit_ms": submit_ms,
             },
         )
 

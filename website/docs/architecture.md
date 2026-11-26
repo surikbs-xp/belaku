@@ -71,6 +71,34 @@ quote from the mark loop (every `ENGINE_INTERVAL_SECONDS`, not per dashboard
 poll — Kite's quote API is rate limited). The dashboard shows which source is in
 use.
 
+## Signal latency
+
+The signal path is event-driven, not polled. When a candle closes the feed sets
+`bar_closed` from the tick thread, and the engine wakes on it immediately rather
+than waiting for its next poll. The poll (`ENGINE_INTERVAL_SECONDS`) is kept only
+as a fallback, for a source that cannot signal (the NIFTY spot book reads REST
+history and has no tick subscription) and for a missed wake-up.
+
+A close also sets `history_due`. When Kite history is authoritative the
+tick-built bar is discarded in favour of the exchange's own OHLC, so the new bar
+only appears after a fetch — and that fetch is normally throttled to
+`HISTORY_REFRESH_SECONDS`. The marker forces it past the throttle, so the signal
+does not wait 30 s for a refresh the close already made necessary.
+
+Four latencies are measured and shown on the dashboard, not estimated:
+
+| Figure | Measures |
+|---|---|
+| `detect_ms` | bar close → verdict computed |
+| `submit_ms` | verdict → order handed to the broker |
+| `ack_ms` | order submission → broker acknowledgement |
+| `fill_ms` | submission → fill confirmed |
+
+For a market order `place_order` blocks until the fill is confirmed, so
+`submit_ms` covers submission, acknowledgement and fill in one measurement. A
+`detect_ms` above one second means the engine missed the close and fell back to
+the poll, which the dashboard flags rather than showing as normal.
+
 ## Warm-up
 
 The indicators are recursive, so they need history before they mean anything.
