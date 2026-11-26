@@ -88,6 +88,9 @@ no longer shows them. Kept because they are still served.
 | `POST` | `/api/toggle-mode` | `{"mode":"PAPER\|LIVE","confirm":bool}` | Switch the process-wide execution mode |
 | `POST` | `/api/pause` | `{"paused":bool,"reason":str}` | Pause new entries for every book |
 | `POST` | `/api/panic` | `{"confirm":true,"reason":str}` | Square off every book and pause |
+| `POST` | `/api/stop-all` | `{"confirm":true,"reason":str}` | Emergency halt: block new entries in every book, close nothing. Latches across restarts. |
+| `POST` | `/api/stop-all/clear` | — | Lift the STOP ALL latch |
+| `POST` | `/api/orders/reconcile` | — | Resolve unresolved orders against the Zerodha order book now |
 | `POST` | `/api/books/mode` | `{"strategy_id":str,"mode":"PAPER\|LIVE","confirm":bool}` | Switch one book's mode |
 | `POST` | `/api/books/pause` | `{"strategy_id":str,"paused":bool,"reason":str}` | Pause or resume one book |
 | `POST` | `/api/books/square-off` | `{"strategy_id":str,"confirm":true,"reason":str}` | Square off one book, then pause it |

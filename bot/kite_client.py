@@ -973,6 +973,143 @@ class KiteClient:
             )
         return last
 
+    def order_book(self, force: bool = False) -> list[dict[str, Any]]:
+        """Every order the broker knows about today, newest first.
+
+        This is the authority for "did my order actually fill?". The local
+        ``orders`` table records what the bot *sent*; only this says what the
+        exchange *did*. Reconciliation compares the two, so a timeout, a
+        partial fill or a rejection that arrived after the bot stopped polling
+        is discovered rather than assumed.
+
+        ``force`` reads the broker even in PAPER, for the same reason
+        :meth:`positions` does: the readiness gate and the startup reconcile run
+        before the mode switch.
+
+        Raises rather than returning an empty list when the broker cannot be
+        read. An empty list means "no orders today", which is a very different
+        fact from "I could not ask", and treating the second as the first is how
+        a bot concludes it is flat when it is not.
+        """
+        if self.is_paper and not force:
+            return []
+        if not self.sdk_ready:
+            raise RuntimeError(self._auth_error or "KiteConnect is not initialised")
+        rows = self.kite.orders() or []
+        return sorted(
+            rows,
+            key=lambda row: str(row.get("order_timestamp") or ""),
+            reverse=True,
+        )
+
+    def order_status(self, order_id: str, force: bool = False) -> Optional[dict[str, Any]]:
+        """The broker's latest state for one order, or ``None`` if unreadable.
+
+        ``None`` is deliberately distinct from a status: a failed read must not
+        be mistaken for "still open" or for "cancelled". The caller decides, and
+        the safe decision on ``None`` is to leave the order unresolved.
+        """
+        if not order_id:
+            return None
+        try:
+            history = self.kite.order_history(order_id)
+        except Exception as exc:
+            log.warning("Order history read failed for %s: %s", order_id, exc)
+            return None
+        if not history:
+            return None
+        latest = dict(history[-1])
+        latest["status"] = str(latest.get("status") or "").upper().replace(" ", "_")
+        return latest
+
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        quantity: Optional[int] = None,
+        price: Optional[float] = None,
+        order_type: Optional[str] = None,
+        trigger_price: Optional[float] = None,
+        mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Modify a pending order. PAPER returns a simulated acknowledgement.
+
+        Only the fields supplied are changed, so a caller can move a price
+        without restating the quantity. A modification is verified by reading
+        the order back: Kite accepts a modify request and can still reject it
+        asynchronously, so the acknowledgement alone is not proof.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": order_id,
+                "status": "COMPLETE",
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated modify (paper mode)",
+            }
+        kwargs: dict[str, Any] = {"variety": self.kite.VARIETY_REGULAR, "order_id": order_id}
+        if quantity is not None:
+            kwargs["quantity"] = int(quantity)
+        if price is not None:
+            kwargs["price"] = float(price)
+        if order_type is not None:
+            kwargs["order_type"] = getattr(self.kite, f"ORDER_TYPE_{order_type.upper()}")
+        if trigger_price is not None:
+            kwargs["trigger_price"] = float(trigger_price)
+        try:
+            self.kite.modify_order(**kwargs)
+        except Exception as exc:
+            log.error("Order modify failed for %s: %s", order_id, exc)
+            return {"order_id": order_id, "status": "REJECTED", "mode": LIVE,
+                    "mocked": False, "message": str(exc)}
+        verified = self.order_status(order_id, force=True) or {}
+        return {
+            "order_id": order_id,
+            "status": verified.get("status") or "OPEN",
+            "average_price": verified.get("average_price"),
+            "filled_quantity": int(verified.get("filled_quantity") or 0),
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Modify accepted",
+        }
+
+    def cancel_order(self, order_id: str, mode: Optional[str] = None) -> dict[str, Any]:
+        """Cancel a pending order and confirm the cancellation with the broker.
+
+        The confirmation matters: a cancel request that the exchange rejects
+        leaves the order live, and reporting success would let the bot believe
+        it had removed an order that can still fill.
+        """
+        effective = (mode or self.mode).upper()
+        if effective != LIVE:
+            return {
+                "order_id": order_id,
+                "status": "CANCELLED",
+                "mode": PAPER,
+                "mocked": True,
+                "message": "Simulated cancel (paper mode)",
+            }
+        try:
+            self.kite.cancel_order(
+                variety=self.kite.VARIETY_REGULAR, order_id=order_id
+            )
+        except Exception as exc:
+            log.error("Order cancel failed for %s: %s", order_id, exc)
+            return {"order_id": order_id, "status": "OPEN", "mode": LIVE,
+                    "mocked": False, "message": f"Cancel failed: {exc}"}
+        verified = self.order_status(order_id, force=True) or {}
+        status = verified.get("status") or "CANCELLED"
+        return {
+            "order_id": order_id,
+            "status": status,
+            "filled_quantity": int(verified.get("filled_quantity") or 0),
+            "average_price": verified.get("average_price"),
+            "mode": LIVE,
+            "mocked": False,
+            "message": verified.get("status_message") or "Cancel accepted",
+        }
+
     def positions(self, force: bool = False) -> list[dict[str, Any]]:
         """Broker net positions.
 

@@ -188,6 +188,14 @@ class OrderManager:
         # is the operator's global kill switch: pausing one book must not stop
         # the others, and PANIC must still stop everything.
         self._book_paused: dict[str, str] = {}
+        # The emergency STOP ALL latch. Distinct from ``_paused``: a pause is a
+        # routine hold an operator lifts with RESUME, while STOP ALL is the
+        # "something is wrong, stop opening trades in every book" state. It is
+        # persisted so a restart cannot quietly clear it - an emergency that
+        # undoes itself on the next deploy is not an emergency.
+        self._stopped_all = False
+        self._stopped_all_reason = ""
+        self._load_stop_all()
 
     @property
     def client(self) -> KiteClient:
@@ -366,8 +374,15 @@ class OrderManager:
             if position["symbol"] == symbol
         )
         if quantity % lot_size:
+            # A partial fill leaves a position that is not a whole number of
+            # lots. That is a real state, not a bug, and it must be reported as
+            # one: the book cannot size a new entry against it, so entries are
+            # refused until it is squared off. Exits are unaffected, which is
+            # what lets the operator resolve it.
             raise ValueError(
-                f"Ledger quantity {quantity} for {symbol} is not a whole number of {lot_size}-unit lots"
+                f"Ledger holds {quantity} units of {symbol}, which is not a whole "
+                f"number of {lot_size}-unit lots - a partial fill is still open. "
+                f"Square it off before opening a new position."
             )
         return quantity // lot_size
 
@@ -504,6 +519,246 @@ class OrderManager:
         lots = max(1, quantity // max(1, settings.lot_size))
         return lots * float(settings.lot_margin), False
 
+    # -- order reconciliation --------------------------------------------
+    def reconcile_orders(self, mode: Optional[str] = None) -> dict[str, Any]:
+        """Resolve every locally-unresolved order against the broker's book.
+
+        This is the piece that makes the "unresolved order blocks new entries"
+        guard survivable. Without it a single order that timed out, partially
+        filled or was rejected after the bot stopped polling stayed ``OPEN`` in
+        the ledger for ever, and every later entry for that symbol was refused
+        with "Unresolved order" - the bot silently stopped trading and looked
+        like a strategy that had gone quiet.
+
+        Three outcomes per order, and each is decided by the broker, never
+        assumed:
+
+        * **filled** - the position is booked from the broker's own average
+          price and filled quantity, so a fill that arrived after the timeout is
+          recorded rather than lost.
+        * **terminal and unfilled** (rejected, cancelled, expired) - the row is
+          closed out with the broker's status, which releases the block.
+        * **still live** - left alone. It is genuinely unresolved, and the block
+          is correct.
+
+        An order the broker does not know about at all is *not* assumed dead: it
+        may be a submission whose acknowledgement was lost. It is left
+        unresolved and reported, because guessing here is how a real position
+        gets orphaned.
+
+        Returns a summary for the caller to log and alert on. Never raises: a
+        reconciliation that throws would leave the block in place with no
+        explanation.
+        """
+        mode = mode or get_execution_mode()
+        summary: dict[str, Any] = {
+            "mode": mode,
+            "checked": 0,
+            "filled": 0,
+            "closed": 0,
+            "still_open": 0,
+            "unknown": 0,
+            "errors": [],
+            "resolved": [],
+        }
+        if mode != LIVE:
+            # PAPER orders are simulated and complete synchronously; there is no
+            # broker book to reconcile them against.
+            return summary
+        try:
+            pending = db.get_pending_orders(mode)
+        except Exception as exc:  # pragma: no cover - defensive
+            summary["errors"].append(f"Could not read pending orders: {exc}")
+            return summary
+        if not pending:
+            return summary
+
+        try:
+            broker_orders = self.client.order_book(force=True)
+        except Exception as exc:
+            summary["errors"].append(f"Could not read the Zerodha order book: {exc}")
+            return summary
+        by_id = {
+            str(row.get("order_id")): row
+            for row in broker_orders
+            if row.get("order_id")
+        }
+
+        for row in pending:
+            summary["checked"] += 1
+            exchange_id = str(row.get("exchange_order_id") or "")
+            broker = by_id.get(exchange_id)
+            if broker is None:
+                # Not in today's book. Could be a lost acknowledgement or an
+                # order from a previous day; either way it is not evidence of a
+                # fill, so it stays unresolved and is reported.
+                summary["unknown"] += 1
+                summary["errors"].append(
+                    f"Order {exchange_id or row['id']} is not in the Zerodha order book; "
+                    "left unresolved"
+                )
+                continue
+            status = str(broker.get("status") or "").upper().replace(" ", "_")
+            try:
+                filled = int(broker.get("filled_quantity") or 0)
+            except (TypeError, ValueError):
+                filled = 0
+            average = broker.get("average_price")
+            try:
+                average_price = float(average) if average not in (None, "", 0) else None
+            except (TypeError, ValueError):
+                average_price = None
+
+            if status == "COMPLETE" and filled > 0:
+                self._book_reconciled_fill(row, filled, average_price, status)
+                summary["filled"] += 1
+                summary["resolved"].append(
+                    {"order_id": exchange_id, "status": status, "filled": filled}
+                )
+                continue
+            if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
+                db.update_order_status(
+                    int(row["id"]), status,
+                    filled_quantity=filled,
+                    average_price=average_price,
+                    message=broker.get("status_message") or f"Reconciled as {status}",
+                )
+                summary["closed"] += 1
+                summary["resolved"].append(
+                    {"order_id": exchange_id, "status": status, "filled": filled}
+                )
+                continue
+            # OPEN / TRIGGER_PENDING / anything else: genuinely still live.
+            summary["still_open"] += 1
+
+        if summary["filled"] or summary["closed"]:
+            log.warning(
+                "Order reconciliation (%s): %d filled, %d closed, %d still open, %d unknown",
+                mode, summary["filled"], summary["closed"],
+                summary["still_open"], summary["unknown"],
+            )
+        return summary
+
+    def _book_reconciled_fill(
+        self,
+        row: dict[str, Any],
+        filled: int,
+        average_price: Optional[float],
+        status: str,
+    ) -> None:
+        """Book a fill discovered by reconciliation, exactly once.
+
+        The order row is the idempotency key: it is moved to ``COMPLETE`` in the
+        same transaction that opens the position, so a second reconcile pass
+        cannot open the position twice. A row that already carries a
+        ``position_id`` has been booked and is only updated.
+        """
+        order_row_id = int(row["id"])
+        if row.get("position_id"):
+            db.update_order_status(
+                order_row_id, status, filled_quantity=filled,
+                average_price=average_price, message="Reconciled (already booked)",
+            )
+            return
+        price = average_price or row.get("price")
+        if not price:
+            db.update_order_status(
+                order_row_id, status, filled_quantity=filled,
+                message="Reconciled fill has no price; position not booked",
+            )
+            log.error(
+                "Order %s filled %d but the broker gave no average price; "
+                "position not booked - reconcile by hand",
+                row.get("exchange_order_id"), filled,
+            )
+            return
+        side = str(row.get("transaction_type") or "").upper()
+        signed = filled if side == BUY else -filled
+        strategy_id = row.get("strategy_id") or db.DEFAULT_STRATEGY_ID
+        # One transaction for both writes: a crash between them would leave the
+        # order unresolved and the next pass would book the fill a second time.
+        position_id = db.book_reconciled_fill(
+            order_row_id,
+            symbol=str(row["symbol"]),
+            signed_quantity=signed,
+            price=float(price),
+            mode=str(row.get("mode") or LIVE),
+            strategy_id=str(strategy_id),
+            exchange_order_id=row.get("exchange_order_id"),
+            status=status,
+        )
+        if position_id is None:
+            log.info(
+                "Order %s was already booked; status refreshed only",
+                row.get("exchange_order_id"),
+            )
+            return
+        log.warning(
+            "Reconciled a late fill: %s %s %d @ %.2f -> position %s",
+            side, row["symbol"], filled, float(price), position_id,
+        )
+
+    # -- emergency STOP ALL ----------------------------------------------
+    STOP_ALL_KEY = "emergency_stop_all"
+    STOP_ALL_REASON_KEY = "emergency_stop_all_reason"
+
+    def _load_stop_all(self) -> None:
+        """Restore the STOP ALL latch from the ledger.
+
+        Persisted because the whole point is that it survives a restart. A
+        crash-and-restart during an incident must not come back trading.
+        """
+        try:
+            stored = db.get_settings()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Could not read the STOP ALL latch: %s", exc)
+            return
+        if str(stored.get(self.STOP_ALL_KEY) or "").lower() in {"1", "true", "yes"}:
+            self._stopped_all = True
+            self._stopped_all_reason = stored.get(self.STOP_ALL_REASON_KEY) or "STOP ALL"
+            log.error("STOP ALL is latched from a previous session: %s", self._stopped_all_reason)
+
+    @property
+    def stopped_all(self) -> bool:
+        """True while the emergency STOP ALL latch is engaged."""
+        return self._stopped_all
+
+    @property
+    def stopped_all_reason(self) -> str:
+        return self._stopped_all_reason
+
+    def stop_all(self, reason: str = "STOP ALL") -> None:
+        """Engage the emergency latch: no new entries in any book.
+
+        Deliberately does **not** close anything. The operator presses this when
+        something is wrong, and the one thing that must not happen is the bot
+        assuming it knows the state of positions it can no longer see. Existing
+        positions keep their protective stops and can still be squared off by
+        hand; what stops is the opening of anything new.
+        """
+        with self._lock:
+            self._stopped_all = True
+            self._stopped_all_reason = reason or "STOP ALL"
+        try:
+            db.set_settings({
+                self.STOP_ALL_KEY: "1",
+                self.STOP_ALL_REASON_KEY: self._stopped_all_reason,
+            })
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("Could not persist the STOP ALL latch: %s", exc)
+        log.critical("STOP ALL engaged: %s", self._stopped_all_reason)
+
+    def clear_stop_all(self) -> None:
+        """Lift the emergency latch. Requires a deliberate operator action."""
+        with self._lock:
+            self._stopped_all = False
+            self._stopped_all_reason = ""
+        try:
+            db.delete_settings([self.STOP_ALL_KEY, self.STOP_ALL_REASON_KEY])
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("Could not clear the STOP ALL latch: %s", exc)
+        log.warning("STOP ALL cleared")
+
     # -- pause / resume --------------------------------------------------
     @property
     def paused(self) -> bool:
@@ -531,13 +786,21 @@ class OrderManager:
         """Whether this book's entries are blocked.
 
         The global switch still wins: an operator who pressed Pause means every
-        book stops, whatever the per-book state says.
+        book stops, whatever the per-book state says. STOP ALL also wins, and
+        for the same reason - it is the emergency latch, and no per-book state
+        may override it.
         """
         with self._lock:
-            return self._paused or str(strategy_id) in self._book_paused
+            return (
+                self._paused
+                or self._stopped_all
+                or str(strategy_id) in self._book_paused
+            )
 
     def book_paused_reason(self, strategy_id: str) -> str:
         with self._lock:
+            if self._stopped_all:
+                return f"STOP ALL: {self._stopped_all_reason or 'emergency'}"
             if self._paused:
                 return self._paused_reason or "PAUSED"
             return self._book_paused.get(str(strategy_id), "")
@@ -706,6 +969,15 @@ class OrderManager:
         lots = int(payload.get("qty_lots") or payload.get("lots") or payload.get("quantity") or settings.default_lots)
         if lots <= 0:
             return ExecutionResult(False, action, mode, symbol, reason="Quantity must be positive")
+        # Resolve anything the broker has finished with before deciding the
+        # symbol is blocked. Without this a single timed-out order blocked every
+        # later entry for ever; with it, the block only survives while the order
+        # is genuinely still live at the exchange.
+        if mode == LIVE:
+            try:
+                self.reconcile_orders(mode)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Order reconciliation failed before an entry")
         pending = db.get_pending_orders(mode, symbol)
         if pending:
             return ExecutionResult(
@@ -1041,8 +1313,29 @@ class OrderManager:
             ]
         sync_error = self._live_position_sync_error() if mode == LIVE else None
         if sync_error:
-            return ExecutionResult(False, "FLAT", mode, symbol or "*", reason=sync_error)
+            # A stop-out must not be blocked by a reconciliation failure. The
+            # position has already breached its protective level, so refusing to
+            # close it because the *ledger* disagrees with the broker leaves the
+            # one position that most needs closing open and unprotected. The
+            # mismatch is reported, and the exit is attempted anyway: closing
+            # real exposure is always the safer error.
+            if reason in {"STOP_LOSS", "PANIC"}:
+                log.error(
+                    "Closing %s despite a reconciliation mismatch (%s): a breached "
+                    "stop must not stay open",
+                    symbol or "*", sync_error,
+                )
+            else:
+                return ExecutionResult(False, "FLAT", mode, symbol or "*", reason=sync_error)
         pending = db.get_pending_orders(mode, symbol)
+        if pending and mode == LIVE:
+            # Try to resolve them first: an order the broker has already
+            # finished with must not block an exit.
+            try:
+                self.reconcile_orders(mode)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("Order reconciliation failed before an exit")
+            pending = db.get_pending_orders(mode, symbol)
         if pending:
             return ExecutionResult(
                 False, "FLAT", mode, symbol or "*",
@@ -1160,7 +1453,7 @@ class OrderManager:
         )
 
     # -- valuation -------------------------------------------------------
-    def price_map(self) -> dict[str, float]:
+    def price_map(self, mode: Optional[str] = None) -> dict[str, float]:
         """Mark price per open symbol, always the future's own last price.
 
         PAPER used to substitute the GIFT Nifty level here once the NSE closed,
@@ -1173,9 +1466,15 @@ class OrderManager:
 
         The substitute is gone, so both modes mark from `get_ltp`, which returns
         the last known price after hours and is frozen for a closed market.
+
+        ``mode=None`` prices **every** open position, across both ledgers. That
+        is what the stop check needs: with one book live and the other in paper,
+        pricing only the process-wide mode left the other book's position with no
+        mark, so its protective stop was silently skipped - an unprotected
+        position the bot believed was protected. The dashboard's own valuation
+        still passes its mode explicitly.
         """
         prices: dict[str, float] = {}
-        mode = get_execution_mode()
         positions = db.get_open_positions(mode=mode)
         for pos in positions:
             ltp = self.client.get_ltp(pos["symbol"])
@@ -1184,7 +1483,7 @@ class OrderManager:
         return prices
 
     def _mark_equity(self) -> None:
-        prices = self.price_map()
+        prices = self.price_map(PAPER)
         positions = db.get_open_positions(mode=PAPER)
         metrics = db.get_performance_metrics(
             open_positions=positions, prices=prices, mode=PAPER
@@ -1194,7 +1493,7 @@ class OrderManager:
     def portfolio(self) -> dict[str, Any]:
         """Aggregate liquidation value for the active execution mode."""
         mode = get_execution_mode()
-        prices = self.price_map()
+        prices = self.price_map(mode)
         positions = db.get_open_positions(mode=mode)
         metrics = db.get_performance_metrics(
             open_positions=positions, prices=prices, mode=mode

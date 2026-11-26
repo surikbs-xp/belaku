@@ -149,10 +149,13 @@ class Settings:
     # --- Risk / pricing ---------------------------------------------------
     lot_margin: float = _env_float("LOT_MARGIN", 150_000.0)
     # Stop opening new trades once the day's realised loss reaches this many
-    # rupees. 0 disables the check. This is the only risk limit the bot has:
-    # the strategy's own signal is the exit, so there is no per-trade stop to
-    # cap a single loss. Open positions are left alone - flattening them here
-    # would turn a bad day into a realised one at the worst possible moment.
+    # rupees. 0 disables the check. This is a portfolio-level circuit breaker,
+    # not a per-trade stop: the strategy's own signal plus each book's
+    # protective stop are the exits, and this only refuses *new* entries. Open
+    # positions are left alone - flattening them here would turn a bad day into
+    # a realised one at the worst possible moment, and they already carry their
+    # own stop.
+    max_daily_loss: float = _env_float("MAX_DAILY_LOSS", 0.0)
 
     # --- Alerting ---------------------------------------------------------
     # Where alerts go. Empty disables sending; alerts are still logged and shown

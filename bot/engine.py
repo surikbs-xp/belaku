@@ -1388,6 +1388,31 @@ class StrategyEngine:
         # are the rules no single strategy can enforce: two books trading one
         # contract net to a single broker position, so an opposing entry would
         # cancel the other book's leg instead of being a separate trade.
+        #
+        # The daily loss cap is checked first: it is the operator's circuit
+        # breaker, and a day that has already hit its limit must not open a new
+        # trade even if the portfolio budget would allow it.
+        try:
+            daily = risk.daily_loss_breach(run.mode(), strategy_id=run.id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Daily loss check failed (%s); refusing the entry", exc)
+            daily = risk.Breach(
+                kind="DAILY_LOSS",
+                detail=f"Could not verify the daily loss limit: {exc}",
+            )
+        if daily is not None:
+            with self._lock:
+                self.state.orders_blocked += 1
+                self.state.last_action = f"{action} blocked (daily loss)"
+                self.state.last_action_at = db.iso()
+                self.state.last_result = {
+                    "ok": False, "action": action, "reason": daily.detail,
+                    "risk": daily.to_dict(),
+                }
+            db.record_signal(action, detail, False, daily.detail, strategy_id=run.id)
+            log.warning("Daily loss limit refused %s: %s", action, daily.detail)
+            return decision(None, daily.detail, risk=daily.to_dict())
+
         try:
             manager = get_order_manager()
             allowed = get_aggregator().authorise(
@@ -1840,6 +1865,17 @@ class StrategyEngine:
         payload["will_execute"] = bool(market["is_open"] or mode == PAPER)
         payload["paused"] = get_order_manager().paused
         payload["paused_reason"] = get_order_manager().paused_reason
+        # The emergency latch and the daily cap, so the watchdog and the
+        # dashboard see the same state the entry gate enforces. getattr because
+        # tests stub the manager with a partial namespace.
+        manager = get_order_manager()
+        payload["stopped_all"] = bool(getattr(manager, "stopped_all", False))
+        payload["stopped_all_reason"] = getattr(manager, "stopped_all_reason", "") or ""
+        try:
+            payload["daily_loss"] = risk.daily_loss_state(mode)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Could not read the daily loss state: %s", exc)
+            payload["daily_loss"] = None
         payload["risk"] = risk.limits()
         # The session's realised result against the cap, so the dashboard can
         # show how much room is left rather than only that entries are blocked.

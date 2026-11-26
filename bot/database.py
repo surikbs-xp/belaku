@@ -11,6 +11,7 @@ Design notes
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -880,17 +881,192 @@ def record_order(path: Optional[str] = None, **fields: Any) -> int:
         return int(cur.lastrowid)
 
 
+# Statuses that mean "the broker has not finished with this order". Anything
+# else is terminal and must never block a new entry.
+UNRESOLVED_ORDER_STATUSES = ("OPEN", "TRIGGER_PENDING", "PENDING")
+
+
 def get_pending_orders(
     mode: str, symbol: Optional[str] = None, path: Optional[str] = None
 ) -> list[dict[str, Any]]:
-    statuses = ("OPEN", "TRIGGER_PENDING", "PENDING")
-    query = "SELECT * FROM orders WHERE mode = ? AND status IN (?, ?, ?)"
-    params: list[Any] = [mode, *statuses]
+    """Orders the broker has not finished with, oldest first.
+
+    These block new entries for the symbol: an order whose outcome is unknown
+    could still fill, and stacking a second one on top would double the
+    exposure. The block is only safe because :func:`update_order_status` and
+    :meth:`OrderManager.reconcile_orders` resolve them against the broker's own
+    order book - without that, one timed-out order would block the symbol for
+    ever.
+    """
+    placeholders = ", ".join("?" for _ in UNRESOLVED_ORDER_STATUSES)
+    query = f"SELECT * FROM orders WHERE mode = ? AND status IN ({placeholders})"
+    params: list[Any] = [mode, *UNRESOLVED_ORDER_STATUSES]
     if symbol:
         query += " AND symbol = ?"
         params.append(symbol)
     query += " ORDER BY id"
     return _fetch_all(query, params, path)
+
+
+def get_order_by_exchange_id(
+    exchange_order_id: str, mode: str, path: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """The local row for a broker order id, or ``None``.
+
+    Used by reconciliation to match a broker order back to the row that
+    recorded it. Scoped to ``mode`` because a paper order id and a live one are
+    different namespaces and must never be matched to each other.
+    """
+    if not exchange_order_id:
+        return None
+    rows = _fetch_all(
+        "SELECT * FROM orders WHERE exchange_order_id = ? AND mode = ? "
+        "ORDER BY id DESC LIMIT 1",
+        [str(exchange_order_id), mode],
+        path,
+    )
+    return rows[0] if rows else None
+
+
+def update_order_status(
+    order_id: int,
+    status: str,
+    *,
+    filled_quantity: Optional[int] = None,
+    average_price: Optional[float] = None,
+    message: Optional[str] = None,
+    path: Optional[str] = None,
+) -> bool:
+    """Move a recorded order to its final state. Returns whether a row changed.
+
+    This is the missing half of :func:`record_order`. Without it an order
+    recorded as ``OPEN`` stayed ``OPEN`` for ever, so
+    :func:`get_pending_orders` kept returning it and every later entry for that
+    symbol was refused with "Unresolved order" - a single timed-out order
+    permanently stopped the bot from trading.
+
+    Only the fields supplied are written, so a reconciliation that knows the
+    status but not the fill price cannot blank the price it already had.
+    """
+    assignments = ["status = ?"]
+    params: list[Any] = [str(status).upper()]
+    if filled_quantity is not None:
+        assignments.append("quantity = ?")
+        params.append(int(filled_quantity))
+    if average_price is not None:
+        assignments.append("price = ?")
+        params.append(float(average_price))
+    if message is not None:
+        assignments.append("message = ?")
+        params.append(str(message))
+    params.append(int(order_id))
+    with session(path) as conn:
+        cur = conn.execute(
+            f"UPDATE orders SET {', '.join(assignments)} WHERE id = ?", params
+        )
+        return cur.rowcount > 0
+
+
+def daily_realised_pnl(
+    mode: str,
+    strategy_id: Optional[str] = None,
+    path: Optional[str] = None,
+    day: Optional[str] = None,
+) -> float:
+    """Net realised PnL for one IST trading day, from closed trades.
+
+    ``day`` is a ``YYYY-MM-DD`` IST date; it defaults to today. The comparison
+    is on the date prefix of ``exit_time`` rather than a timestamp range because
+    every row is written in IST by :func:`iso`, so the prefix *is* the trading
+    day the trade settled on.
+
+    Scoped to ``mode`` so a paper loss can never trip a live daily limit, and
+    optionally to one book. ``strategy_id=None`` sums every book, which is what
+    a portfolio-wide daily cap needs.
+    """
+    target = day or iso()[:10]
+    query = (
+        "SELECT COALESCE(SUM(net_pnl), 0) AS total FROM trades "
+        "WHERE mode = ? AND substr(exit_time, 1, 10) = ?"
+    )
+    params: list[Any] = [mode, target]
+    if strategy_id is not None:
+        query += " AND strategy_id = ?"
+        params.append(strategy_id)
+    rows = _fetch_all(query, params, path)
+    try:
+        return float(rows[0]["total"]) if rows else 0.0
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def book_reconciled_fill(
+    order_row_id: int,
+    *,
+    symbol: str,
+    signed_quantity: int,
+    price: float,
+    mode: str,
+    strategy_id: str,
+    exchange_order_id: Optional[str],
+    status: str = "COMPLETE",
+    path: Optional[str] = None,
+) -> Optional[int]:
+    """Open a position and mark its order filled in **one** transaction.
+
+    Reconciliation discovers fills after the fact, so it must be exactly-once:
+    a crash between "open the position" and "mark the order complete" would
+    leave the order unresolved, and the next reconcile pass would open a second
+    position for the same fill. Doing both writes under one ``BEGIN IMMEDIATE``
+    makes that impossible - either the position exists and the order is closed,
+    or neither happened.
+
+    Returns the new position id, or ``None`` when the order was already booked
+    (its row carries a ``position_id``), which is the idempotent case.
+    """
+    with session(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (int(order_row_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Order {order_row_id} not found")
+        if row["position_id"]:
+            # Already booked by an earlier pass. Update the status only.
+            conn.execute(
+                "UPDATE orders SET status = ?, quantity = ?, price = ?, message = ? "
+                "WHERE id = ?",
+                (status, abs(int(signed_quantity)), float(price),
+                 "Reconciled (already booked)", int(order_row_id)),
+            )
+            return None
+        cur = conn.execute(
+            "INSERT INTO positions "
+            "(symbol, position_key, quantity, entry_price, entry_time, last_price, "
+            " mode, source, strategy, strategy_id, best_price, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                symbol,
+                1 if signed_quantity > 0 else -1,
+                abs(int(signed_quantity)),
+                float(price),
+                iso(),
+                float(price),
+                mode,
+                "RECONCILE",
+                strategy_id,
+                strategy_id,
+                float(price),
+                json.dumps({"reconciled_order": exchange_order_id}),
+            ),
+        )
+        position_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE orders SET status = ?, quantity = ?, price = ?, position_id = ?, "
+            "message = ? WHERE id = ?",
+            (status, abs(int(signed_quantity)), float(price), position_id,
+             f"Reconciled fill booked as position {position_id}", int(order_row_id)),
+        )
+        return position_id
 
 
 def record_signal(

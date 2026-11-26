@@ -115,10 +115,27 @@ def _trailed_stop(
     best: float,
     rules: StopRules,
 ) -> Optional[float]:
-    """The stop implied by the best price reached, before the never-widen clamp."""
+    """The stop implied by the best price reached, before the never-widen clamp.
+
+    The trail only counts once the position is **in profit**. Before that the
+    initial stop is the protection, and a trail measured from a best price at or
+    behind the entry would be *tighter* than the configured initial stop - which
+    silently replaced it. That is not a cosmetic difference: with a 5-point trail
+    and a 50-point initial stop, the position was protected at 5 points from the
+    first tick and the 50-point stop never applied at all. The same defect put
+    the 60-minute book's 200-point stop at 100.
+
+    So the rule is: the initial stop holds until the trail has locked in profit,
+    and from then on the trail only ever tightens (see :func:`_tighten`). Every
+    configured number then means what it says - the initial stop is the loss the
+    position can take, and the trail is what it keeps once it is winning.
+    """
     if not rules.enabled or rules.trail_points <= 0:
         return None
     profit = (best - entry_price) * position_key
+    if profit <= 0:
+        # Not yet in profit: the initial stop is the protection.
+        return None
     distance = rules.trail_for(profit)
     if distance <= 0:
         return None

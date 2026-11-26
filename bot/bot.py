@@ -389,9 +389,12 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             # which the dashboard polls every 1.5s - Kite's quote API is rate
             # limited and that would be ~16k calls a session.
             get_feed().refresh_exec_quote()
+            # Every open position, across both ledgers: a book that is live
+            # while the process is in PAPER must still be marked, or its
+            # protective stop is silently skipped.
             prices = manager.price_map()
             if prices:
-                db.mark_open_positions(get_execution_mode(), prices)
+                db.mark_open_positions(None, prices)
                 # Protective stops run on the live futures price, not on a bar
                 # close, and are not gated on the pause switch: pausing blocks
                 # entries, and a position already on must stay protected.
@@ -564,19 +567,44 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # pragma: no cover - network
         log.warning("Initial GIFT Nifty history load failed: %s", exc)
 
-    # 2. Strategy engine: evaluates GIFT Nifty bars, trades the NFO future.
+    # 2. Reconcile before trading. A restart is exactly when the ledger and the
+    #    broker are most likely to disagree: an order may have filled while the
+    #    process was down, or a position may have been closed by hand. Resolving
+    #    the order book first means the position check that follows sees the
+    #    truth, and no new entry is permitted on a stale view.
+    try:
+        manager = get_order_manager()
+        if get_execution_mode() == LIVE:
+            summary = manager.reconcile_orders(LIVE)
+            if summary.get("checked"):
+                log.warning("Startup order reconciliation: %s", summary)
+            sync_error = manager._live_position_sync_error(LIVE)
+            if sync_error:
+                log.error(
+                    "Startup position reconciliation failed: %s. LIVE entries are "
+                    "blocked until this is resolved.", sync_error,
+                )
+                _lifecycle_alert(
+                    "RECONCILE_FAILED",
+                    f"Startup reconciliation failed: {sync_error}",
+                    "error",
+                )
+    except Exception as exc:  # pragma: no cover - network
+        log.exception("Startup reconciliation failed: %s", exc)
+
+    # 3. Strategy engine: evaluates GIFT Nifty bars, trades the NFO future.
     engine = get_engine()
     engine.start()
 
-    # 3. Mark-to-market loop: keeps equity/PnL live between signals.
+    # 4. Mark-to-market loop: keeps equity/PnL live between signals.
     marks = threading.Thread(target=mark_loop, args=(_stop,), name="marks", daemon=True)
     marks.start()
 
-    # 4. Watchdog: alerts when the process is up but the trading is not.
+    # 5. Watchdog: alerts when the process is up but the trading is not.
     watchdog = get_watchdog()
     watchdog.start(settings.watchdog_interval_seconds)
 
-    # 5. Token keeper: re-logs in when the daily token expires mid-session.
+    # 6. Token keeper: re-logs in when the daily token expires mid-session.
     #    Startup covers a fresh container; this covers a process that outlives
     #    the token, which is the normal case for a bot that runs for weeks.
     token_keeper = threading.Thread(
@@ -787,7 +815,61 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 # ---------------------------------------------------------------------------
 @app.get("/api/health", tags=["status"])
 def health() -> dict[str, Any]:
-    return {"ok": True, "time": db.iso(), "uptime_seconds": round(time.time() - STARTED_AT, 1)}
+    """Liveness plus the resource facts an operator needs to see.
+
+    The container healthcheck only needs ``ok``; the rest is here because a bot
+    that is alive but out of memory, out of disk or thrashing is not healthy in
+    any sense that matters, and none of those trip a liveness probe.
+    """
+    payload: dict[str, Any] = {
+        "ok": True,
+        "time": db.iso(),
+        "uptime_seconds": round(time.time() - STARTED_AT, 1),
+    }
+    try:
+        payload["resources"] = _resource_snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        payload["resources"] = {"error": str(exc)}
+    return payload
+
+
+def _resource_snapshot() -> dict[str, Any]:
+    """CPU, memory and disk for this process and its host.
+
+    ``resource`` is in the standard library, so this costs no dependency. CPU is
+    the process's own cumulative time, which is what a leak or a runaway loop
+    shows up in; memory is the peak RSS, which is what an OOM kill is preceded
+    by. Disk is the ledger's volume, because a full disk stops SQLite writing
+    and the bot would keep trading on a ledger it can no longer record.
+    """
+    import resource as _resource
+    import shutil
+    import sys
+
+    usage = _resource.getrusage(_resource.RUSAGE_SELF)
+    # ru_maxrss is bytes on macOS and kilobytes on Linux. Getting this wrong
+    # would report a 140 MB process as 140 GB (or 140 KB), so the platform
+    # decides the multiplier rather than a guess.
+    rss_bytes = int(usage.ru_maxrss) * (1 if sys.platform == "darwin" else 1024)
+    db_dir = Path(settings.db_path).resolve().parent
+    try:
+        disk = shutil.disk_usage(db_dir)
+        disk_info = {
+            "path": str(db_dir),
+            "total_bytes": disk.total,
+            "free_bytes": disk.free,
+            "used_percent": round(100.0 * (disk.total - disk.free) / disk.total, 1)
+            if disk.total
+            else None,
+        }
+    except OSError as exc:
+        disk_info = {"path": str(db_dir), "error": str(exc)}
+    return {
+        "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 2),
+        "max_rss_bytes": rss_bytes,
+        "threads": threading.active_count(),
+        "disk": disk_info,
+    }
 
 
 @app.get("/api/logs", tags=["status"])
@@ -898,6 +980,10 @@ def api_status() -> dict[str, Any]:
         },
         "strategy": {
             "paused": manager.paused,
+            # The emergency latch, separate from the routine pause: the dashboard
+            # renders it as a latched state rather than a toggle.
+            "stopped_all": manager.stopped_all,
+            "stopped_all_reason": manager.stopped_all_reason,
             "heartbeat": {
                 "ticks": engine.get("ticks", 0),
                 "last_tick_at": engine.get("last_tick_at"),
@@ -1166,6 +1252,40 @@ def _live_readiness() -> dict[str, Any]:
         "Strategy running" if not manager.paused
         else f"Strategy paused ({manager.paused_reason or 'PAUSED'})",
     )
+    # The emergency latch outranks every other check: while it is engaged the
+    # bot will refuse every entry, so arming LIVE would produce a bot that looks
+    # live and never trades. Reported as blocking so the operator clears it
+    # deliberately rather than wondering why nothing fires.
+    # getattr: tests and older callers stub the manager with a partial namespace,
+    # and a missing attribute must not break the whole report.
+    stopped_all = bool(getattr(manager, "stopped_all", False))
+    add(
+        "stop_all",
+        not stopped_all,
+        "Emergency STOP ALL is not engaged" if not stopped_all
+        else f"STOP ALL engaged ({getattr(manager, 'stopped_all_reason', '') or 'emergency'}); "
+             "clear it first",
+    )
+    # The daily loss cap. A day that has already hit its limit must not be armed
+    # for LIVE, because every entry would be refused and the operator would read
+    # that as a strategy that had stopped working. A disabled cap (0) adds no
+    # check at all, so an unconfigured limit cannot read as a passing one.
+    try:
+        daily = risk.daily_loss_state(LIVE)
+        if daily["enabled"]:
+            add(
+                "daily_loss",
+                not daily["breached"],
+                (
+                    f"Today's realised P&L Rs {daily['realised_pnl']:,.0f} "
+                    f"(limit Rs {daily['limit']:,.0f})"
+                    if not daily["breached"]
+                    else f"Daily loss limit reached: Rs {daily['loss']:,.0f} lost "
+                         f"(limit Rs {daily['limit']:,.0f})"
+                ),
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        add("daily_loss", False, f"Could not check the daily loss limit: {exc}")
     # The strategy itself, not just the process. The rules are identical in both
     # modes - strategy.py and risk.py never read the mode - so what can differ is
     # whether the books are actually evaluating. A LIVE arm with a warming-up or
@@ -1778,6 +1898,59 @@ def api_panic(request: PanicRequest) -> dict[str, Any]:
 
     log.warning("PANIC via API: ok=%s %s", result.ok, result.reason)
     return payload
+
+
+class StopAllRequest(BaseModel):
+    confirm: bool = Field(False, description="Must be true; this halts all new entries")
+    reason: str = Field("STOP ALL", description="Why trading is being halted")
+
+
+@app.post("/api/stop-all", tags=["control"])
+def api_stop_all(request: StopAllRequest) -> dict[str, Any]:
+    """Emergency halt: block new entries in every book, close nothing.
+
+    Deliberately separate from PANIC. PANIC tries to flatten everything, which
+    is the right action when the bot can see the broker. STOP ALL is for when it
+    cannot: it stops the bot opening anything new and leaves existing positions
+    to their protective stops and to a human, rather than assuming a square-off
+    succeeded. The latch is persisted, so a restart does not resume trading.
+    """
+    if not request.confirm:
+        raise HTTPException(status_code=400, detail="STOP ALL requires confirm=true")
+    manager = get_order_manager()
+    manager.stop_all(request.reason or "STOP ALL")
+    log.critical("STOP ALL via API: %s", request.reason)
+    return {
+        "ok": True,
+        "stopped_all": manager.stopped_all,
+        "reason": manager.stopped_all_reason,
+        "paused_books": manager.paused_books(),
+        "note": (
+            "New entries are blocked in every book. Open positions are NOT closed "
+            "and keep their protective stops; square off manually if required."
+        ),
+    }
+
+
+@app.post("/api/stop-all/clear", tags=["control"])
+def api_stop_all_clear() -> dict[str, Any]:
+    """Lift the STOP ALL latch so entries can resume."""
+    manager = get_order_manager()
+    manager.clear_stop_all()
+    return {"ok": True, "stopped_all": manager.stopped_all}
+
+
+@app.post("/api/orders/reconcile", tags=["control"])
+def api_orders_reconcile() -> dict[str, Any]:
+    """Resolve unresolved orders against the Zerodha order book now.
+
+    Exposed so an operator can clear a stuck "Unresolved order" block without
+    restarting, and so the readiness report can be re-run after a manual fix.
+    """
+    manager = get_order_manager()
+    summary = manager.reconcile_orders()
+    log.warning("Manual order reconciliation: %s", summary)
+    return summary
 
 
 # ---------------------------------------------------------------------------

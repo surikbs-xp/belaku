@@ -33,6 +33,8 @@ const ENDPOINTS = {
   toggle:    '/api/toggle-mode',
   pause:     '/api/pause',
   panic:     '/api/panic',
+  stopAll:   '/api/stop-all',
+  stopAllClear: '/api/stop-all/clear',
 };
 
 /** The one book the dashboard reads. Both strategies execute on the NIFTY
@@ -347,6 +349,21 @@ function renderStatus(status) {
 
   const pauseBtn = $('btn-pause');
   pauseBtn.textContent = strategy.paused ? 'Resume' : 'Pause';
+
+  // STOP ALL is a latch, not a toggle: the button reflects the latched state and
+  // clearing it is a separate, deliberate action. Showing it as a toggle would
+  // invite a second click that silently resumes trading.
+  const stopAllBtn = $('btn-stop-all');
+  if (stopAllBtn) {
+    const stopped = !!strategy.stopped_all;
+    stopAllBtn.textContent = stopped ? 'STOP ALL ✓' : 'STOP ALL';
+    stopAllBtn.classList.toggle('btn-danger', !stopped);
+    stopAllBtn.classList.toggle('btn-neutral', stopped);
+    stopAllBtn.title = stopped
+      ? `STOP ALL engaged (${strategy.stopped_all_reason || 'emergency'}) — click to clear`
+      : 'Emergency halt: block new entries in every book without closing positions';
+    stopAllBtn.dataset.stopped = stopped ? '1' : '0';
+  }
 
   const modeToggle = $('btn-mode-toggle');
   const isLive = mode === 'LIVE';
@@ -1776,6 +1793,64 @@ async function initAuth() {
   }
 }
 
+async function stopAll() {
+  const btn = $('btn-stop-all');
+  // Already latched: this click clears it, which is a different confirmation.
+  if (btn && btn.dataset.stopped === '1') {
+    const ok = await confirmDialog({
+      title: 'Clear STOP ALL',
+      body: 'This allows <strong>new entries</strong> in every strategy again. '
+        + 'Only clear it once you are satisfied the problem is resolved.',
+      okLabel: 'Resume trading',
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    await withBusy(async () => {
+      try {
+        const result = await api(ENDPOINTS.stopAllClear, { method: 'POST' });
+        toast(result.stopped_all ? 'STOP ALL still engaged' : 'STOP ALL cleared',
+          result.stopped_all ? 'err' : 'ok');
+        setActionStatus('STOP ALL cleared', 'ok');
+      } catch (error) {
+        toast(`Clear failed: ${error.message}`, 'err');
+        setActionStatus(error.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    return;
+  }
+
+  const ok = await confirmDialog({
+    title: '🛑 STOP ALL',
+    body: 'This blocks <strong>new entries in every strategy</strong> immediately and '
+      + 'latches until you clear it, including across a restart. Open positions are '
+      + '<strong>not</strong> closed and keep their protective stops — use Square off '
+      + 'if you also want them closed.',
+    okLabel: 'Stop all trading',
+  });
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Stopping…';
+  await withBusy(async () => {
+    try {
+      const result = await api(ENDPOINTS.stopAll, {
+        method: 'POST',
+        body: JSON.stringify({ confirm: true, reason: 'STOP_ALL_UI' }),
+      });
+      toast(result.note || 'STOP ALL engaged', 'ok');
+      setActionStatus(result.note || 'STOP ALL engaged', 'ok');
+    } catch (error) {
+      toast(`STOP ALL failed: ${error.message}`, 'err');
+      setActionStatus(error.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'STOP ALL';
+    }
+  });
+}
+
 async function panic() {
   const ok = await confirmDialog({
     title: '🚨 Panic square-off',
@@ -2681,6 +2756,7 @@ function init() {
   $('btn-pause').addEventListener('click', togglePause);
   $('btn-resume').addEventListener('click', togglePause);
   $('btn-panic').addEventListener('click', panic);
+  $('btn-stop-all').addEventListener('click', stopAll);
   $('btn-logout').addEventListener('click', signOut);
   $('btn-risk-clear').addEventListener('click', clearRiskBreach);
 

@@ -279,6 +279,39 @@ class Watchdog:
                 )
             )
 
+        # The emergency latch. Critical, not a warning: it is engaged only when
+        # something is wrong, and it blocks every entry until a human clears it.
+        if engine.get("stopped_all"):
+            alerts.append(
+                _alert(
+                    "STOP_ALL",
+                    f"Emergency STOP ALL is engaged: "
+                    f"{engine.get('stopped_all_reason') or 'no reason given'}. "
+                    f"No new entry will be taken in any book until it is cleared.",
+                    severity="critical",
+                    reason=engine.get("stopped_all_reason") or "no reason given",
+                    action_required="Resolve the incident, then clear STOP ALL from the dashboard.",
+                )
+            )
+
+        # The daily loss cap. Reported once it trips, because from that moment
+        # the bot will refuse every entry and otherwise look like a strategy that
+        # has simply stopped firing.
+        daily = engine.get("daily_loss") or {}
+        if isinstance(daily, dict) and daily.get("breached"):
+            alerts.append(
+                _alert(
+                    "DAILY_LOSS_LIMIT",
+                    f"Daily loss limit reached: Rs {float(daily.get('loss') or 0):,.0f} "
+                    f"lost today (limit Rs {float(daily.get('limit') or 0):,.0f}). "
+                    f"New entries are blocked until the next session.",
+                    severity="critical",
+                    loss=f"Rs {float(daily.get('loss') or 0):,.0f}",
+                    limit=f"Rs {float(daily.get('limit') or 0):,.0f}",
+                    action_required="No action needed to protect capital; review the day's trades.",
+                )
+            )
+
         error_text = str(engine.get("last_error") or "")
         # An unconfirmed exit is reported by its own critical alert below. It
         # also lands in last_error, so without this exclusion one event pages

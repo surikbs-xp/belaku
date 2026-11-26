@@ -64,6 +64,7 @@ your machine, anyone who can send a request can panic the account.
 | `DEFAULT_LOTS` | `1` | Lots per entry |
 | `NIFTY_LOT_SIZE` | `65` | Fallback when Kite instruments are unavailable |
 | `MAX_OPEN_LOTS` | `4` | Hard cap on concurrent lots |
+| `MAX_DAILY_LOSS` | `0` | Daily realised-loss cap in rupees; blocks new entries once reached. `0` disables it. Never flattens a position. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
 | `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT` |

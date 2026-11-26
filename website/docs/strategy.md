@@ -54,10 +54,17 @@ agrees with the previous one is not a new signal, so it cannot open a trade:
 | Positioned | NO_SIGNAL **becomes** true | **Hold** — the pair disagreeing is not an exit |
 | Positioned | NO_SIGNAL already true | **Hold** |
 
-**The pair flipping against the position is the exit.** There is no stop-loss, no
-trailing stop, and no profit target: a position is held until SuperTrend and PSAR
-turn the *other* way, and then closed in full. A `NO_SIGNAL` bar says nothing
-about a position already on, so it is carried rather than cut.
+**The pair flipping against the position is the primary exit.** A position is
+held until SuperTrend and PSAR turn the *other* way, and then closed in full. A
+`NO_SIGNAL` bar says nothing about a position already on, so it is carried rather
+than cut. There is no profit target.
+
+Each book also carries a **protective stop-loss and trailing stop**, measured on
+the futures execution price and configured per strategy (see
+[Running multiple strategies](./multi-strategy.md#the-two-strategies)). The stop
+is a backstop that caps a single loss; it does not change when a winning trend is
+closed. The initial stop is in force from the fill, and the trail only takes over
+once the position is in profit — it never widens.
 
 The exit is a **transition**, exactly like the entry. A run of opposite bars is
 one exit, not one per bar — otherwise every bar of the new trend would be a no-op

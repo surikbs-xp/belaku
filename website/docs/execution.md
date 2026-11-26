@@ -146,10 +146,10 @@ the rule is three-way:
 | Positioned | opposes | **Exit** — close the whole position |
 | Positioned | NO_SIGNAL | **Hold** — the pair disagreeing is not an exit |
 
-**The pair flipping against the position is the exit.** There is no stop-loss and
-no profit target, so a position is held until SuperTrend and PSAR turn the other
-way. The exit is a transition too, so a run of opposite bars is one exit rather
-than one per bar.
+**The pair flipping against the position is the primary exit.** There is no
+profit target, so a position is held until SuperTrend and PSAR turn the other way
+— or until its protective stop is hit. The exit is a transition too, so a run of
+opposite bars is one exit rather than one per bar.
 
 A `NO_SIGNAL` bar is *held*, not closed. The pair disagreeing says nothing about
 a position already on, and cutting there exits trades that were merely pausing.

@@ -9466,3 +9466,457 @@ def test_the_two_configured_strategies_are_gift_15m_and_nifty_60m(monkeypatch) -
     assert configs["gift-15m"].interval == "15minute"
     assert configs["nifty-60m"].source == "nifty"
     assert configs["nifty-60m"].interval == "60minute"
+
+
+# ---------------------------------------------------------------------------
+# Order lifecycle: unresolved orders must resolve, not block for ever
+# ---------------------------------------------------------------------------
+def test_a_pending_order_can_be_resolved_so_it_stops_blocking(monkeypatch, tmp_path) -> None:
+    """The block on a symbol must be releasable.
+
+    Before ``update_order_status`` existed, an order recorded as OPEN stayed
+    OPEN for ever: ``get_pending_orders`` kept returning it and every later
+    entry for that symbol was refused with "Unresolved order". One timed-out
+    order permanently stopped the bot from trading, and nothing in the codebase
+    could clear it.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    order_id = db.record_order(
+        symbol="TEST", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X1",
+    )
+    assert db.get_pending_orders(LIVE, "TEST")
+
+    changed = db.update_order_status(order_id, "CANCELLED", message="reconciled")
+
+    assert changed is True
+    assert db.get_pending_orders(LIVE, "TEST") == []
+
+
+def test_reconciliation_books_a_late_fill_exactly_once(monkeypatch, tmp_path) -> None:
+    """A fill discovered after the timeout is booked, and only once.
+
+    The order row is the idempotency key: a second reconcile pass must not open
+    a second position for the same fill.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.record_order(
+        symbol="NIFTY26DECFUT", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X1",
+        strategy_id="gift-15m",
+    )
+
+    class FakeClient:
+        mode = LIVE
+
+        def order_book(self, force=False):
+            return [{
+                "order_id": "X1", "status": "COMPLETE", "filled_quantity": 65,
+                "average_price": 101.5, "tradingsymbol": "NIFTY26DECFUT",
+            }]
+
+    manager = OrderManager(FakeClient())
+    first = manager.reconcile_orders(LIVE)
+    second = manager.reconcile_orders(LIVE)
+
+    assert first["filled"] == 1
+    positions = db.get_open_positions(mode=LIVE)
+    assert len(positions) == 1
+    assert positions[0]["quantity"] == 65
+    assert positions[0]["entry_price"] == 101.5
+    assert positions[0]["strategy_id"] == "gift-15m"
+    # The second pass finds nothing pending, so it cannot double-book.
+    assert second["checked"] == 0
+    assert len(db.get_open_positions(mode=LIVE)) == 1
+
+
+def test_reconciliation_closes_a_rejected_order(monkeypatch, tmp_path) -> None:
+    """A rejection that arrived after the bot stopped polling releases the block."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.record_order(
+        symbol="NIFTY26DECFUT", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X2",
+    )
+
+    class FakeClient:
+        mode = LIVE
+
+        def order_book(self, force=False):
+            return [{"order_id": "X2", "status": "REJECTED", "filled_quantity": 0,
+                     "status_message": "insufficient margin"}]
+
+    summary = OrderManager(FakeClient()).reconcile_orders(LIVE)
+
+    assert summary["closed"] == 1
+    assert db.get_pending_orders(LIVE, "NIFTY26DECFUT") == []
+    assert db.get_open_positions(mode=LIVE) == []
+
+
+def test_reconciliation_leaves_a_genuinely_live_order_alone(monkeypatch, tmp_path) -> None:
+    """An order still working at the exchange must keep blocking new entries."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.record_order(
+        symbol="NIFTY26DECFUT", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X3",
+    )
+
+    class FakeClient:
+        mode = LIVE
+
+        def order_book(self, force=False):
+            return [{"order_id": "X3", "status": "OPEN", "filled_quantity": 0}]
+
+    summary = OrderManager(FakeClient()).reconcile_orders(LIVE)
+
+    assert summary["still_open"] == 1
+    assert len(db.get_pending_orders(LIVE, "NIFTY26DECFUT")) == 1
+
+
+def test_reconciliation_does_not_assume_an_unknown_order_is_dead(monkeypatch, tmp_path) -> None:
+    """An order missing from the broker book is reported, never guessed at.
+
+    A lost acknowledgement looks exactly like this. Treating it as cancelled
+    would let the bot open a second position beside one that may exist.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.record_order(
+        symbol="NIFTY26DECFUT", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X4",
+    )
+
+    class FakeClient:
+        mode = LIVE
+
+        def order_book(self, force=False):
+            return []
+
+    summary = OrderManager(FakeClient()).reconcile_orders(LIVE)
+
+    assert summary["unknown"] == 1
+    assert summary["errors"]
+    assert len(db.get_pending_orders(LIVE, "NIFTY26DECFUT")) == 1
+
+
+def test_reconciliation_reports_an_unreadable_order_book(monkeypatch, tmp_path) -> None:
+    """A broker read failure must not be mistaken for "no orders"."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.record_order(
+        symbol="NIFTY26DECFUT", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X5",
+    )
+
+    class FakeClient:
+        mode = LIVE
+
+        def order_book(self, force=False):
+            raise RuntimeError("network down")
+
+    summary = OrderManager(FakeClient()).reconcile_orders(LIVE)
+
+    assert summary["errors"]
+    assert summary["checked"] == 0
+    assert len(db.get_pending_orders(LIVE, "NIFTY26DECFUT")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Daily loss limit
+# ---------------------------------------------------------------------------
+def test_daily_loss_limit_blocks_entries_once_reached(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        risk, "settings", SimpleNamespace(max_daily_loss=10_000.0, max_open_lots=4)
+    )
+    # A losing round trip of 65 units * 200 points = Rs 13,000, past the cap.
+    position_id = db.open_position("TEST", 65, 100.0, mode=PAPER)
+    db.close_position(position_id, 100.0 - (13_000 / 65))
+
+    state = risk.daily_loss_state(PAPER)
+
+    assert state["enabled"] is True
+    assert state["breached"] is True
+    assert risk.daily_loss_breach(PAPER) is not None
+
+
+def test_daily_loss_limit_is_disabled_at_zero(monkeypatch, tmp_path) -> None:
+    """A zero cap must read as disabled, not as "breached by 0"."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        risk, "settings", SimpleNamespace(max_daily_loss=0.0, max_open_lots=4)
+    )
+    position_id = db.open_position("TEST", 65, 100.0, mode=PAPER)
+    db.close_position(position_id, 50.0)
+
+    state = risk.daily_loss_state(PAPER)
+
+    assert state["enabled"] is False
+    assert state["breached"] is False
+    assert risk.daily_loss_breach(PAPER) is None
+
+
+def test_daily_loss_is_scoped_to_the_mode(monkeypatch, tmp_path) -> None:
+    """A paper loss must never trip a live daily limit."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        risk, "settings", SimpleNamespace(max_daily_loss=1_000.0, max_open_lots=4)
+    )
+    position_id = db.open_position("TEST", 65, 100.0, mode=PAPER)
+    db.close_position(position_id, 50.0)
+
+    assert risk.daily_loss_state(PAPER)["breached"] is True
+    assert risk.daily_loss_state(LIVE)["breached"] is False
+
+
+# ---------------------------------------------------------------------------
+# Emergency STOP ALL
+# ---------------------------------------------------------------------------
+def test_stop_all_blocks_entries_in_every_book(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    manager = OrderManager()
+
+    manager.stop_all("incident")
+
+    assert manager.stopped_all is True
+    assert manager.book_paused("gift-15m") is True
+    assert manager.book_paused("nifty-60m") is True
+    assert "STOP ALL" in manager.book_paused_reason("gift-15m")
+
+
+def test_stop_all_survives_a_restart(monkeypatch, tmp_path) -> None:
+    """The latch is persisted: a crash must not come back trading."""
+    use_test_database(monkeypatch, tmp_path)
+    OrderManager().stop_all("incident")
+
+    fresh = OrderManager()
+
+    assert fresh.stopped_all is True
+    assert fresh.stopped_all_reason == "incident"
+    assert fresh.book_paused("gift-15m") is True
+
+
+def test_stop_all_can_be_cleared(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    manager = OrderManager()
+    manager.stop_all("incident")
+
+    manager.clear_stop_all()
+
+    assert manager.stopped_all is False
+    assert manager.book_paused("gift-15m") is False
+    assert OrderManager().stopped_all is False
+
+
+def test_stop_all_does_not_close_positions(monkeypatch, tmp_path) -> None:
+    """STOP ALL halts entries; it must never assume a position was closed."""
+    use_test_database(monkeypatch, tmp_path)
+    db.open_position("TEST", 65, 100.0, mode=PAPER)
+    manager = OrderManager()
+
+    manager.stop_all("incident")
+
+    assert len(db.get_open_positions(mode=PAPER)) == 1
+
+
+def test_stop_all_blocks_a_manual_entry(monkeypatch, tmp_path) -> None:
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    manager = OrderManager()
+    manager.stop_all("incident")
+
+    result = manager.process_signal(
+        {"action": "BUY", "qty_lots": 1}, strategy_id="gift-15m", mode=PAPER
+    )
+
+    assert result.ok is False
+    assert "STOP ALL" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# A breached stop must not be blocked by a reconciliation failure
+# ---------------------------------------------------------------------------
+def test_a_stop_out_is_attempted_even_when_reconciliation_fails(monkeypatch, tmp_path) -> None:
+    """A breached stop must close even if the ledger disagrees with the broker.
+
+    Refusing the exit because the *ledger* is out of sync leaves the one
+    position that most needs closing open and unprotected.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.open_position("NIFTY26DECFUT", 65, 100.0, mode=LIVE, strategy_id="gift-15m")
+
+    placed: list[dict] = []
+
+    class FakeClient:
+        mode = LIVE
+
+        def positions(self, force=False):
+            return []  # broker disagrees with the ledger
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+        def get_ltp(self, symbol, max_age=None):
+            return 90.0
+
+        def place_order(self, **kwargs):
+            placed.append(kwargs)
+            return {"order_id": "EXIT1", "status": "COMPLETE",
+                    "filled_quantity": kwargs["quantity"], "average_price": 90.0}
+
+    manager = OrderManager(FakeClient())
+    result = manager.square_off(
+        "STOP_LOSS", mode=LIVE, mark_price=90.0, position_id=1, strategy_id="gift-15m"
+    )
+
+    assert placed, "the exit order must still be sent"
+    assert result.ok is True
+    assert db.get_open_positions(mode=LIVE) == []
+
+
+def test_a_routine_exit_is_still_blocked_by_a_reconciliation_failure(monkeypatch, tmp_path) -> None:
+    """Only protective exits bypass the sync gate; a manual one does not."""
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
+    db.open_position("NIFTY26DECFUT", 65, 100.0, mode=LIVE, strategy_id="gift-15m")
+
+    class FakeClient:
+        mode = LIVE
+
+        def positions(self, force=False):
+            return []
+
+        def nifty_future_instruments(self):
+            return [{"tradingsymbol": "NIFTY26DECFUT"}]
+
+    result = OrderManager(FakeClient()).square_off(
+        "MANUAL", mode=LIVE, strategy_id="gift-15m"
+    )
+
+    assert result.ok is False
+    assert "mismatch" in result.reason.lower()
+    assert len(db.get_open_positions(mode=LIVE)) == 1
+
+
+def test_a_live_book_is_marked_and_stopped_while_the_process_is_in_paper(
+    monkeypatch, tmp_path
+) -> None:
+    """A live book's stop must not be skipped because the process is in PAPER.
+
+    ``price_map`` used to price only the process-wide mode's positions, while
+    ``check_stops`` iterated every open position. With one book live and the
+    other in paper, the live leg got no mark, so its protective stop was
+    silently skipped - an unprotected position the bot believed was protected.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    # A live long that has already breached its 50-point stop.
+    db.open_position(
+        "NIFTY26DECFUT", 65, 20_000.0, mode=LIVE, strategy_id="gift-15m",
+        sl_price=19_950.0, initial_sl_price=19_950.0, trailing_stop=19_950.0,
+        best_price=20_000.0,
+    )
+
+    class FakeClient:
+        mode = PAPER
+
+        def get_ltp(self, symbol, max_age=None):
+            return 19_900.0
+
+    manager = OrderManager(FakeClient())
+
+    prices = manager.price_map()
+
+    assert prices.get("NIFTY26DECFUT") == 19_900.0, (
+        "a live position must be priced even while the process is in PAPER"
+    )
+
+
+def test_the_initial_stop_is_in_force_at_entry_not_the_trail() -> None:
+    """The configured initial stop must be the protection before any profit.
+
+    The trail used to be computed from a best price seeded at the entry, so at
+    zero profit it implied ``entry - trail_points`` - which is *tighter* than the
+    configured initial stop and silently replaced it. The GIFT book's 50-point
+    stop was really 5 points, and the 60-minute book's 200-point stop was really
+    100. Every configured number now means what it says.
+    """
+    import stops
+
+    gift, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=25_000.0, rules=_gift_rules(),
+    )
+    assert not breached
+    assert gift.current == 24_950.0, "the 50-point initial stop must be in force at entry"
+
+    nifty, _ = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.LONG, mark=25_000.0, rules=_nifty_rules(),
+    )
+    assert nifty.current == 24_800.0, "the 200-point initial stop must be in force at entry"
+
+
+def test_a_short_initial_stop_is_in_force_at_entry() -> None:
+    import stops
+
+    state, breached = stops.evaluate(
+        entry_price=25_000.0, position_key=stops.SHORT, mark=25_000.0, rules=_gift_rules(),
+    )
+    assert not breached
+    assert state.current == 25_050.0
+
+
+def test_the_trail_never_loosens_across_the_wider_band_transition() -> None:
+    """Crossing TRAIL_AFTER must not widen the stop.
+
+    The GIFT trail goes from 5 to 30 points at +50 profit. A naive recompute
+    would move the stop from ``best - 5`` to ``best - 30``, i.e. 25 points
+    *backwards*. The never-widen clamp holds the tighter level until the wider
+    trail catches up.
+    """
+    import stops
+
+    rules = _gift_rules()
+    current, best = None, None
+    levels: list[float] = []
+    for profit in range(0, 121, 5):
+        state, _ = stops.evaluate(
+            entry_price=25_000.0, position_key=stops.LONG, mark=25_000.0 + profit,
+            rules=rules, current_stop=current, best_price=best,
+        )
+        current, best = state.current, state.best_price
+        levels.append(current)
+
+    assert levels == sorted(levels), f"the stop widened somewhere: {levels}"
+    assert levels[0] == 24_950.0
+
+
+def test_booking_a_reconciled_fill_is_idempotent(monkeypatch, tmp_path) -> None:
+    """The position and the order status move together, exactly once.
+
+    A crash between "open the position" and "mark the order complete" would
+    leave the order unresolved, and the next reconcile pass would book the same
+    fill again. Both writes share one transaction, and the order's own
+    ``position_id`` is the idempotency key.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    order_row_id = db.record_order(
+        symbol="NIFTY26DECFUT", transaction_type="BUY", quantity=65, price=100.0,
+        status="OPEN", mode=LIVE, exchange_order_id="X9", strategy_id="gift-15m",
+    )
+
+    first = db.book_reconciled_fill(
+        order_row_id, symbol="NIFTY26DECFUT", signed_quantity=65, price=101.0,
+        mode=LIVE, strategy_id="gift-15m", exchange_order_id="X9",
+    )
+    second = db.book_reconciled_fill(
+        order_row_id, symbol="NIFTY26DECFUT", signed_quantity=65, price=101.0,
+        mode=LIVE, strategy_id="gift-15m", exchange_order_id="X9",
+    )
+
+    assert first is not None
+    assert second is None, "a second booking must be a no-op"
+    assert len(db.get_open_positions(mode=LIVE)) == 1
+    assert db.get_pending_orders(LIVE, "NIFTY26DECFUT") == []

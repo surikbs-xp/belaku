@@ -136,23 +136,28 @@ Each strategy's `STRATEGY_<n>_INTERVAL` must match the timeframe it was tuned on
 | Duplicate/replayed signals rejected | `order_manager._already_processed` |
 | Stale signals rejected (default 300 s) | `order_manager._signal_age_seconds` |
 | `MAX_OPEN_LOTS` and `LOT_MARGIN` enforced before every entry | `order_manager._execute_directional` |
+| `MAX_DAILY_LOSS` blocks new entries once the day's realised loss reaches it | `risk.daily_loss_breach`, checked in `engine.evaluate_run` |
+| Per-strategy protective stop and trailing stop, on the futures fill | `stops`, applied in `engine.check_stops` |
 | LIVE orders only placed inside the NSE F&O session; after-hours PAPER uses the GIFT close | `engine.StrategyEngine.execute` |
-| Unresolved orders and broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
+| Unresolved orders are reconciled against the Zerodha order book, not assumed | `order_manager.OrderManager.reconcile_orders` |
+| Broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
+| A breached stop still closes when reconciliation fails | `order_manager.OrderManager.square_off` |
 | Panic reports partial or failed square-offs instead of claiming success | `order_manager.OrderManager.square_off` |
-| Panic pauses new entries | `order_manager.pause` / `OrderManager.paused` |
+| Emergency STOP ALL latches across restarts and blocks every entry | `order_manager.OrderManager.stop_all` |
+| Dashboard requires a password when `DASHBOARD_PASSWORD` is set | `dashboard_auth`, enforced in `bot.security_middleware` |
 
 ### Known limitations
 
-* **No stop-loss, no profit target.** The Pine strategy defines entries only.
-  Positions stay open until an opposite entry or a manual square-off. Size
-  positions accordingly — this is a property of the strategy, not a missing
-  feature.
-* **The dashboard is unauthenticated.** Keep it on loopback or behind an
-  authenticating proxy.
-* **`bot/.env` is tracked in git.** Any credentials in it are in the repository
-  history. Move it out of version control and rotate the keys before treating
-  this as production. `.gitignore` already excludes `*.env*s`; the file was
-  added before that rule.
+* **The signal is the primary exit.** Each book also carries a protective
+  stop-loss and trailing stop (see [Strategy](https://surikbs-xp.github.io/belaku/strategy)),
+  but there is no profit target: a winning trend is closed by the signal, not by
+  a fixed level.
+* **The dashboard is open when `DASHBOARD_PASSWORD` is empty.** Set it for any
+  deployment that is not on loopback; the Lightsail deploy refuses to build a
+  spec without it.
+* **`bot/.env` is not tracked in git.** `.gitignore` excludes `*.env*s` and only
+  `bot/.env.example` is committed. If an older clone ever committed a real
+  `.env`, rotate those keys — see `scripts/purge-secrets-from-history.sh`.
 
 ## Building the docs
 

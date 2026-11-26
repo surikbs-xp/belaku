@@ -119,8 +119,9 @@ sequenceDiagram
 
 The engine drives the position to the **verdict** — flat and `BULL` opens,
 agreeing holds, and opposing closes. A `NO_SIGNAL` bar holds: the exit is the pair
-*flipping*, not the pair disagreeing. There is no stop-loss and no profit target,
-so a position runs until the trend it was taken on actually reverses. It is not gated on a one-bar transition,
+*flipping*, not the pair disagreeing. There is no profit target, so a position
+runs until the trend it was taken on actually reverses — or until its protective
+stop is hit, which caps a single loss without changing the trend exit. It is not gated on a one-bar transition,
 because a signal that arrives while the NSE is shut is deferred rather than
 placed, and a transition gate would then treat every later bar as unchanged and
 never enter. A run of bullish bars still produces exactly one entry: once the
