@@ -5308,18 +5308,37 @@ def test_operational_knobs_are_still_overridable(monkeypatch) -> None:
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("STRATEGY_1_LOTS", "3")
     monkeypatch.setenv("STRATEGY_1_LIVE", "1")
-    monkeypatch.setenv("STRATEGY_1_NAME", "GIFT book")
     monkeypatch.setenv("STRATEGY_1_FILTER_ADX", "15")
 
     gift = config.strategy_configs()[0]
 
     assert gift.lots == 3
     assert gift.live is True
-    assert gift.name == "GIFT book"
     assert gift.filter_adx == 15.0
-    # ...but the identity is untouched.
+    # ...but the identity is untouched, including the name the dashboard shows.
+    assert gift.name == "GIFT NIFTY 15m"
     assert gift.interval == "15minute"
     assert gift.stop_rules.initial_points == 50.0
+
+
+def test_a_stale_name_cannot_mislabel_a_book(monkeypatch) -> None:
+    """The display name is part of the identity, not a per-deployment knob.
+
+    A stale STRATEGY_2_NAME in a deployment's environment labelled the NIFTY book
+    "GIFT 60m" - a GIFT-sourced name on a NIFTY-sourced book, which is exactly the
+    confusion the two-panel layout exists to prevent.
+    """
+    import config
+
+    for key in list(os.environ):
+        if key.startswith("STRATEGY_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("STRATEGY_2_NAME", "GIFT 60m")
+
+    nifty = config.strategy_configs()[1]
+
+    assert nifty.name == "NIFTY 60m"
+    assert nifty.source == "nifty"
 
 
 def test_a_second_strategy_is_purely_configuration(monkeypatch) -> None:

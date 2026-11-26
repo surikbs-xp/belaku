@@ -524,10 +524,15 @@ DEFAULT_STRATEGIES: tuple[dict[str, Any], ...] = (
 def _default_strategy(spec: dict[str, Any]) -> StrategyConfig:
     """One of the two strategies, with its operational knobs overridable.
 
-    The identity - source, timeframe, exit rule, stop and trail - is the
-    specification and is not read from the environment. Only the knobs an operator
-    legitimately varies per deployment are: the ledger id, the display name, the
-    size, whether it starts, its initial mode, and the entry filters.
+    The identity - source, timeframe, exit rule, stop, trail and display name - is
+    the specification and is not read from the environment. Only the knobs an
+    operator legitimately varies per deployment are: the ledger id, the size,
+    whether it starts, its initial mode, and the entry filters.
+
+    The name is part of the identity because it is what the dashboard shows. A
+    stale ``STRATEGY_2_NAME`` in a deployment's environment labelled the NIFTY
+    book "GIFT 60m" - a GIFT-sourced name on a NIFTY-sourced book, which is
+    exactly the confusion the two-panel layout exists to prevent.
     """
     prefix = f"STRATEGY_{spec['index']}_"
     return StrategyConfig(
@@ -538,7 +543,7 @@ def _default_strategy(spec: dict[str, Any]) -> StrategyConfig:
         exit=spec["exit"],
         lots=_env_int(prefix + "LOTS", settings.default_lots),
         enabled=_env_bool(prefix + "ENABLED", True),
-        name=_env(prefix + "NAME") or spec["name"],
+        name=spec["name"],
         filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
         filter_ma=_env_int(prefix + "FILTER_MA", 0),
         live=_env_bool(prefix + "LIVE", False),

@@ -26,8 +26,8 @@ never be filled at, and the index/future basis would silently move the stop.
 
 ## These are the specification, not defaults
 
-The source, timeframe, exit rule and stop parameters come from the code, not from
-the environment. A `.env` that omitted `STRATEGY_<n>_STOP_LOSS` used to leave that
+The source, timeframe, exit rule, stop parameters and display name come from the
+code, not from the environment. A `.env` that omitted `STRATEGY_<n>_STOP_LOSS` used to leave that
 book with **no stop at all** — the one state a trading bot must never reach by
 omission — and one that set `STRATEGY_3_INTERVAL=60minute` silently moved the
 15-minute book onto 60-minute bars.
@@ -37,7 +37,6 @@ omission — and one that set `STRATEGY_3_INTERVAL=60minute` silently moved the
 | Key | Meaning |
 |---|---|
 | `STRATEGY_<n>_ID` | The ledger book. Must be unique — see below. |
-| `STRATEGY_<n>_NAME` | Display name only. |
 | `STRATEGY_<n>_LOTS` | Position size for this book. |
 | `STRATEGY_<n>_ENABLED` | `0` leaves it configured but not started. |
 | `STRATEGY_<n>_LIVE` | Initial LIVE/PAPER choice. Default `0`; the dashboard toggle persists the operator's choice. |
