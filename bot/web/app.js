@@ -1369,7 +1369,6 @@ function renderDashPositions() {
                   ${cell('Qty', row.quantity)}
                   ${cell('Entry', level(entry))}
                   ${cell('LTP', level(mark))}
-                  ${cell('Stop', level(num(row.stop_price)))} 
                   ${cell('Points', signedPoints(points), points === null ? '' : (points >= 0 ? 'pos' : 'neg'))}
                   ${cell('P&L', signedInr(legPnl), pnlClass(legPnl))}
                   <td class="text-slate-400" data-label="Opened">${escapeHtml(istClock(row.entry_time) || '—')}</td>
@@ -1957,7 +1956,7 @@ async function stopAll() {
     title: '🛑 STOP ALL',
     body: 'This blocks <strong>new entries in every strategy</strong> immediately and '
       + 'latches until you clear it, including across a restart. Open positions are '
-      + '<strong>not</strong> closed and keep their protective stops — use Square off '
+      + '<strong>not</strong> closed and have no stop — use Square off '
       + 'if you also want them closed.',
     okLabel: 'Stop all trading',
   });
@@ -2189,219 +2188,6 @@ async function manualBookOrder(event) {
   } catch (error) {
     toast(`Could not place ${action} for ${strategyId}: ${error.message}`, 'err');
     button.disabled = false;
-  }
-}
-
-/**
- * Move one book's protective stop.
- *
- * The engine's trail only ever tightens, so the dialog states the direction and
- * the server refuses a looser level. The operator is asked for a price rather
- * than a distance because the level is what the engine stores and what the
- * position card shows - a distance would have to be converted, and a conversion
- * is a place for the two to disagree.
- */
-/**
- * Open the stop editor for one book.
- *
- * A dedicated form rather than ``window.prompt``: the operator needs to see the
- * entry, the live price, the current level and the resulting level *as they
- * type*, and a prompt can show none of that. It also removes the "type d40 for
- * points" syntax, which was a parser disguised as a text field.
- */
-function editBookStop(event) {
-  const button = event.target.closest('[data-book-stopedit]');
-  if (!button || button.disabled) return;
-  const parse = (raw) => {
-    const n = Number(raw);
-    return raw !== '' && raw !== undefined && Number.isFinite(n) ? n : null;
-  };
-  openStopEditor({
-    strategyId: button.dataset.bookStopedit,
-    side: button.dataset.bookSlSide || '',
-    mode: button.dataset.bookSlMode || 'PAPER',
-    entry: parse(button.dataset.bookSlEntry),
-    current: parse(button.dataset.bookSlCurrent),
-    mark: parse(button.dataset.bookSlMark),
-    distance: parse(button.dataset.bookSlGap),
-  });
-}
-
-/** The stop editor's live state, while it is open. */
-const slState = {
-  open: false,
-  strategyId: '',
-  side: '',
-  mode: 'PAPER',
-  entry: null,
-  current: null,
-  mark: null,
-  byPoints: false,
-};
-
-function openStopEditor(opts) {
-  // A plain parameter rather than a destructured one: the static analyser that
-  // guards against undefined names cannot see names bound by destructuring, so
-  // a destructured signature reads as a call to an undefined function.
-  const { strategyId, side, mode, entry, current, mark, distance } = opts;
-  const isLong = side === 'LONG';
-  Object.assign(slState, {
-    open: true, strategyId, side, mode, entry, current, mark, byPoints: false,
-  });
-
-  setText('sl-title', `Modify stop-loss · ${strategyId}`);
-  setText('sl-sub', `${side} position. The stop may only move ${isLong ? 'up' : 'down'} - never back.`);
-  setText('sl-entry', entry === null ? '—' : level(entry));
-  setText('sl-mark', mark === null ? '—' : level(mark));
-  setText('sl-current', current === null ? '—' : level(current));
-  setText('sl-room', distance === null ? '—' : `${Math.abs(distance).toFixed(1)} pts`);
-
-  // Default to the current level so a small nudge is one edit, not a retype.
-  const input = $('sl-input');
-  input.value = current === null ? '' : current.toFixed(2);
-  input.min = '0';
-  input.step = '0.05';
-
-  setStopMode(false);
-  // Validate the seeded value immediately. Opening with "—" and a disabled
-  // button made the dialog look broken until the operator typed something,
-  // even though the field already held a valid level.
-  updateStopPreview();
-  $('sl-modal').classList.remove('hidden');
-  input.focus();
-  input.select();
-}
-
-function closeStopEditor() {
-  slState.open = false;
-  $('sl-modal').classList.add('hidden');
-}
-
-/** Switch between entering a price and entering a distance in points. */
-function setStopMode(byPoints) {
-  slState.byPoints = byPoints;
-  const priceBtn = $('sl-mode-price');
-  const pointsBtn = $('sl-mode-points');
-  priceBtn.classList.toggle('is-active', !byPoints);
-  pointsBtn.classList.toggle('is-active', byPoints);
-  priceBtn.setAttribute('aria-selected', String(!byPoints));
-  pointsBtn.setAttribute('aria-selected', String(byPoints));
-
-  setText('sl-input-label', byPoints ? 'Distance from the live price' : 'New stop price');
-  setText('sl-input-unit', byPoints ? 'points' : 'price');
-  const input = $('sl-input');
-  input.step = byPoints ? '1' : '0.05';
-  // Seed the field with the value that means "no change", so switching modes
-  // does not leave a number that reads as a different level.
-  if (byPoints) {
-    input.value = slState.distance === null || slState.distance === undefined
-      ? ''
-      : Math.abs(slState.distance).toFixed(1);
-  } else {
-    input.value = slState.current === null ? '' : slState.current.toFixed(2);
-  }
-  updateStopPreview();
-  input.focus();
-  input.select();
-}
-
-/** Resolve the typed value to a price and validate it, live. */
-function updateStopPreview() {
-  const isLong = slState.side === 'LONG';
-  const raw = $('sl-input').value.trim();
-  const value = Number(raw);
-  const error = $('sl-error');
-  const apply = $('sl-apply');
-  const preview = $('sl-preview');
-  const note = $('sl-preview-note');
-
-  const fail = (message) => {
-    error.textContent = message;
-    error.classList.remove('hidden');
-    preview.textContent = '—';
-    note.textContent = '';
-    apply.disabled = true;
-  };
-
-  if (!raw || !Number.isFinite(value) || value <= 0) {
-    fail(slState.byPoints ? 'Enter a distance in points.' : 'Enter a stop price.');
-    return;
-  }
-
-  let resolved;
-  if (slState.byPoints) {
-    if (slState.mark === null) {
-      fail('No live price to measure from. Use "By price" instead.');
-      return;
-    }
-    resolved = Math.round((slState.mark - (isLong ? 1 : -1) * value) * 100) / 100;
-  } else {
-    resolved = Math.round(value * 100) / 100;
-  }
-
-  // The engine's own invariant: a stop may tighten, never widen.
-  if (slState.current !== null) {
-    const tightens = (resolved - slState.current) * (isLong ? 1 : -1);
-    if (tightens < 0) {
-      fail(
-        `That would widen the stop. A ${isLong ? 'long' : 'short'} stop may only move `
-          + `${isLong ? 'up' : 'down'} from ${level(slState.current)}.`,
-      );
-      return;
-    }
-    if (tightens === 0) {
-      // Not an error: the field is seeded with the current level so a small
-      // nudge is one edit. Say what to do rather than flagging red on open.
-      error.classList.add('hidden');
-      preview.textContent = level(resolved);
-      note.textContent = 'unchanged - enter a new level';
-      apply.disabled = true;
-      return;
-    }
-  }
-
-  error.classList.add('hidden');
-  preview.textContent = level(resolved);
-  const moved = slState.current === null ? null : (resolved - slState.current) * (isLong ? 1 : -1);
-  note.textContent = moved === null
-    ? 'first stop on this position'
-    : `tightens by ${moved.toFixed(1)} pts`;
-  apply.disabled = false;
-  apply.dataset.resolved = String(resolved);
-}
-
-/** Apply the stop the editor has resolved. */
-async function applyStopEditor() {
-  const apply = $('sl-apply');
-  if (apply.disabled || !slState.open) return;
-  const resolved = Number(apply.dataset.resolved);
-  if (!Number.isFinite(resolved)) return;
-
-  apply.disabled = true;
-  apply.textContent = 'Moving…';
-  try {
-    const result = await api('/api/books/stop', {
-      method: 'POST',
-      body: JSON.stringify({
-        strategy_id: slState.strategyId,
-        stop: resolved,
-        confirm: true,
-        reason: 'MANUAL_SL',
-      }),
-    });
-    closeStopEditor();
-    toast(
-      `${slState.strategyId}: stop ${result.previous_stop === null ? 'set' : 'moved'} to ${result.stop.toFixed(2)}`,
-      'ok',
-    );
-    await poll();
-  } catch (error) {
-    const box = $('sl-error');
-    box.textContent = error.message;
-    box.classList.remove('hidden');
-    apply.disabled = false;
-  } finally {
-    apply.textContent = 'Move stop';
   }
 }
 
@@ -2717,86 +2503,11 @@ function renderBookBand(run, perf, accounts, columnKey) {
       : `Holding ${open > 0 ? 'long' : 'short'} ${Math.abs(open)}; exits at ${level(singleFlip)} `
         + 'or on the next flip.';
 
-  // The protective stop, from the open position's own row. A flat book has no
-  // stop to show; a book with stops disabled says so rather than showing a dash
-  // that reads as "missing data".
+  // There is no stop. The signal is the only exit, so the tile shows the level
+  // the signal would close at rather than a stop that does not exist.
   const openRow = (state.positions || []).find(
     (p) => p.status === 'OPEN' && (p.strategy_id || '') === run.id,
   );
-  // The API publishes the stop as ``stop_price`` / ``initial_stop_price`` (the
-  // enriched names), not the raw ledger columns ``trailing_stop`` /
-  // ``initial_sl_price``. Reading the raw names returned undefined for every
-  // position, so the tile showed "—" and the Edit button never appeared - the
-  // feature was there but unreachable.
-  const stopLevel = openRow ? num(openRow.stop_price) : null;
-  const initialStop = openRow ? num(openRow.initial_stop_price) : null;
-  // Points between the live mark and the stop: how much room is left before the
-  // position is out. This is the number a trader watches, so it is shown beside
-  // the level rather than left to be worked out from two prices.
-  const stopDistance = openRow ? num(openRow.stop_distance_points) : null;
-  const stopText = stopLevel === null
-    ? (run.stop_loss ? '—' : 'off')
-    : level(stopLevel);
-  const stopDistanceText = stopDistance === null
-    ? ''
-    : `${stopDistance >= 0 ? '' : '+'}${Math.abs(stopDistance).toFixed(1)} pts`;
-  const stopTitle = stopLevel === null
-    ? (run.stop_loss ? 'No open position to protect' : 'Stops are disabled for this book')
-    : `Initial ${initialStop === null ? '—' : level(initialStop)} · now ${level(stopLevel)}`
-      + (stopDistance === null ? '' : ` · ${stopDistance.toFixed(1)} pts from the mark`);
-
-  // Whether the exchange is holding a stop, not just whether the engine is
-  // watching one. The two are different facts and only the first survives this
-  // process dying, so a LIVE position with no resting SL-M is called out rather
-  // than shown as protected.
-  const protection = openRow ? String(openRow.protection || '') : '';
-  const protectiveStop = openRow ? num(openRow.protective_stop) : null;
-  const protectionBadge = (() => {
-    if (!openRow) return '';
-    if (protection === 'PAPER') return '';
-    if (protection === 'PROTECTED') {
-      return `<span class="book-protect is-ok" title="${escapeHtml(
-        `Zerodha is holding an SL-M at ${protectiveStop === null ? '—' : level(protectiveStop)}. `
-        + 'It fires even if this bot stops running.')}">SL-M</span>`;
-    }
-    if (protection === 'LAGGING') {
-      return `<span class="book-protect is-warn" title="${escapeHtml(
-        `The exchange is still holding ${protectiveStop === null ? 'an older level' : level(protectiveStop)} `
-        + `while the engine has moved to ${stopLevel === null ? '—' : level(stopLevel)}. `
-        + 'The position is protected, just not as tightly as shown. The next reconcile retries.')}">SL-M lag</span>`;
-    }
-    if (protection === 'STALE') {
-      return `<span class="book-protect is-bad" title="${escapeHtml(
-        `The protective order is ${openRow.protective_status || 'not resting'}. `
-        + 'It is not protecting this position.')}">SL-M ${escapeHtml(String(openRow.protective_status || 'stale'))}</span>`;
-    }
-    return `<span class="book-protect is-bad" title="${escapeHtml(
-      'No exchange-held stop on this LIVE position. Only the software stop protects it, '
-      + 'so a crash or an API outage would leave it unprotected.')}">NO SL-M</span>`;
-  })();
-
-  // The stop editor, built outside the tile template. A nested template literal
-  // here is unreadable and the static analyser that guards against undefined
-  // names cannot parse it, so the markup is assembled first.
-  // The control is always rendered, disabled when there is nothing to protect.
-  // Hiding it on a flat book made the feature undiscoverable: an operator
-  // looking for "where do I move the stop" found no control at all and
-  // concluded it did not exist. A disabled button with a reason answers that
-  // question instead of raising it.
-  const stopEditButton = openRow
-    ? '<button class="book-stop-edit" type="button"'
-      + ` data-book-stopedit="${escapeHtml(run.id)}"`
-      + ` data-book-sl-current="${escapeHtml(stopLevel === null ? '' : stopLevel)}"`
-      + ` data-book-sl-entry="${escapeHtml(openRow.entry_price)}"`
-      + ` data-book-sl-side="${escapeHtml(openRow.side || '')}"`
-      + ` data-book-sl-mode="${escapeHtml(bookMode)}"`
-      + ` data-book-sl-gap="${escapeHtml(stopDistance === null ? '' : stopDistance)}"`
-      + ` data-book-sl-mark="${escapeHtml(openRow.mark_price === undefined ? '' : openRow.mark_price)}"`
-      + ` title="${escapeHtml('Move the stop for ' + (run.name || run.id) + '. It may only tighten, never widen.')}"`
-      + ' aria-label="Modify stop-loss">Edit</button>'
-    : '<button class="book-stop-edit is-disabled" type="button" disabled'
-      + ` title="${escapeHtml('No open position on ' + (run.name || run.id) + ' to protect. The stop becomes editable once a trade is on.')}"`
-      + ' aria-label="Modify stop-loss (no open position)">Edit</button>';
 
   const detail = err || st.last_detail || 'no evaluation yet';
   const counts = signal === 'BEAR' ? `${sellN}/${total} short`
@@ -2895,14 +2606,10 @@ function renderBookBand(run, perf, accounts, columnKey) {
           <span class="book-band-foot-label">Position</span>
           <span class="book-band-foot-value ${open === 0 ? 'is-flat' : ''}">${escapeHtml(positionText)}</span>
         </span>
-        <span class="book-band-foot-item book-band-stop${openRow ? ' is-editable' : ''}"
-          title="${escapeHtml(stopTitle)}">
-          <span class="book-band-foot-label">Stop</span>
-          <span class="book-band-foot-value">${escapeHtml(stopText)}</span>
-          ${stopDistanceText ? `<span class="book-band-stop-distance" title="${escapeHtml(
-            'Points between the live mark and the stop - how much room is left before the position is out')}">${escapeHtml(stopDistanceText)}</span>` : ''}
-          ${protectionBadge}
-          ${stopEditButton}
+        <span class="book-band-foot-item" title="${escapeHtml(
+          'The signal is the only exit. There is no stop-loss and no trailing stop.')}">
+          <span class="book-band-foot-label">Exit</span>
+          <span class="book-band-foot-value">${escapeHtml(run.exit === 'flat' ? 'NO_SIGNAL' : 'flip')}</span>
         </span>
         <span class="book-band-foot-item">
           <span class="book-band-foot-label">P&amp;L</span>
@@ -3267,25 +2974,6 @@ function init() {
   $('book-bands').addEventListener('click', toggleBookMode);
   $('book-bands').addEventListener('click', squareOffBook);
   $('book-bands').addEventListener('click', manualBookOrder);
-  $('book-bands').addEventListener('click', editBookStop);
-
-  // Stop editor wiring. The preview updates on every keystroke so the operator
-  // sees the resulting level before committing, and Enter applies it.
-  $('sl-mode-price').addEventListener('click', () => setStopMode(false));
-  $('sl-mode-points').addEventListener('click', () => setStopMode(true));
-  $('sl-input').addEventListener('input', updateStopPreview);
-  $('sl-input').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); applyStopEditor(); }
-    if (event.key === 'Escape') { event.preventDefault(); closeStopEditor(); }
-  });
-  $('sl-apply').addEventListener('click', applyStopEditor);
-  $('sl-cancel').addEventListener('click', closeStopEditor);
-  $('sl-modal').addEventListener('click', (event) => {
-    if (event.target === $('sl-modal')) closeStopEditor();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && slState.open) closeStopEditor();
-  });
   $('btn-alerts-test').addEventListener('click', sendTestAlert);
   $('btn-alert-toggle').addEventListener('click', toggleAlerting);
 

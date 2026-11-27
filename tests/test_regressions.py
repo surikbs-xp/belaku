@@ -19,6 +19,7 @@ import gift_nifty
 import kite_auth
 import kite_client
 import order_manager
+import portfolio
 import pytest
 import risk
 import strategy
@@ -1016,7 +1017,10 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
         seconds = 300
 
         def __init__(self):
-            self.rows = [{"time": "2026-11-05T22:10:00+05:30"}]
+            # In-session bars: the signal series is gated to the hours the
+            # futures leg can trade, so an overnight bar would never reach the
+            # strategy at all.
+            self.rows = [{"time": "2026-11-05T10:00:00+05:30"}]
 
         def candles(self):
             return self.rows
@@ -1058,9 +1062,9 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
     )
 
     assert runner.evaluate_now()["action"] is None
-    feed.rows.append({"time": "2026-11-05T22:15:00+05:30"})
+    feed.rows.append({"time": "2026-11-05T10:05:00+05:30"})
     assert runner.evaluate_now()["action"] is None
-    feed.rows.append({"time": "2026-11-05T22:20:00+05:30"})
+    feed.rows.append({"time": "2026-11-05T10:10:00+05:30"})
     assert runner.evaluate_now()["action"] == "SELL"
     assert actions == ["SELL"]
 
@@ -1073,7 +1077,7 @@ def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog
 
         def candles(self):
             return [{
-                "time": "2026-11-05T22:10:00+05:30",
+                "time": "2026-11-05T10:00:00+05:30",
                 "open": 100.0,
                 "high": 101.0,
                 "low": 99.0,
@@ -1112,7 +1116,7 @@ def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog
     )
     assert "source=NSEIX:GIFT NIFTY" in message
     assert "interval_seconds=300" in message
-    assert "candle_at=2026-11-05T22:10:00+05:30" in message
+    assert "candle_at=2026-11-05T10:00:00+05:30" in message
     assert '"close": 100.5' in message
     assert '"psar": 98.75' in message
     assert '"st_14_3": 99.25' in message
@@ -1138,7 +1142,7 @@ def test_engine_exits_an_opposing_paper_position_on_startup(monkeypatch, tmp_pat
         seconds = 300
 
         def candles(self):
-            return [{"time": "2026-11-05T22:50:00+05:30"}]
+            return [{"time": "2026-11-05T10:00:00+05:30"}]
 
     feed = FakeFeed()
     # A transition into BEAR, so the bar is a fresh signal and the opposing long
@@ -3558,6 +3562,15 @@ def _overnight_env(monkeypatch, tmp_path, *, mode=PAPER):
         engine, "settings",
         SimpleNamespace(default_lots=1, max_open_lots=4, lot_margin=150_000.0),
     )
+    # The portfolio aggregator reads ``settings`` directly rather than through the
+    # engine, so stubbing the engine's copy is not enough: a developer running
+    # MAX_OPEN_LOTS=1 in .env would otherwise see every two-book test refuse the
+    # second entry. Pin the budget the tests are written against.
+    monkeypatch.setattr(
+        portfolio, "settings",
+        SimpleNamespace(max_open_lots=4, lot_margin=150_000.0),
+    )
+    portfolio.reset_aggregator()
     # Pin the strategy list to the single default book. Without this the engine
     # builds whatever the developer's .env happens to configure, so adding a
     # second strategy to .env silently rewrites the behaviour of every test here.
@@ -3827,10 +3840,12 @@ def test_evaluate_now_closes_an_opposing_overnight_leg_without_reversing(
         lambda: {"is_open": state["open"], "reason": "Pre-market - opens 09:15 IST"},
     )
 
-    # The 08:45 bar (closed 09:00, pre-open) then the 09:00 bar (closed 09:15).
+    # Both bars close in-session, so the source's session gate keeps them. The
+    # hold is driven by the market clock instead, which is the reachable path:
+    # the source can no longer hand the engine an overnight bar at all.
     bars = [
-        {"time": "2026-11-16T08:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-16T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
     ]
     # BEAR on both bars: the state has not changed, so this is not a fresh signal.
     verdict = SimpleNamespace(
@@ -3884,14 +3899,15 @@ def test_evaluate_now_holds_the_position_when_the_morning_bar_agrees(
     eng, manager, client = _overnight_env(monkeypatch, tmp_path)
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
 
-    state = {"open": True}
+    # Starts shut so the first bar is held, then opens for the morning bar.
+    state = {"open": False}
     monkeypatch.setattr(
         engine, "market_status",
         lambda: {"is_open": state["open"], "reason": "Market open"},
     )
     bars = [
-        {"time": "2026-11-16T08:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-16T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
     ]
     verdict = SimpleNamespace(
         signal=strategy.BULL, previous_signal=strategy.BULL, fresh=False,
@@ -3924,6 +3940,7 @@ def test_evaluate_now_holds_the_position_when_the_morning_bar_agrees(
     eng.evaluate_now()
     assert eng._overnight_pending is True
 
+    state["open"] = True
     feed.n = 2
     result = eng.evaluate_now()
 
@@ -3954,11 +3971,14 @@ def test_evaluate_now_enters_when_the_signal_arrived_while_the_market_was_shut(
         engine, "market_status",
         lambda: {"is_open": state["open"], "reason": "Market open" if state["open"] else "Post-market"},
     )
+    # In-session bars throughout: the latch is driven by the market clock, which
+    # is the only way a signal can now be deferred, since the source no longer
+    # yields overnight bars.
     bars = [
-        {"time": "2026-11-16T15:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T15:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-17T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-17T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-17T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-17T09:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
     ]
     # The BULL *starts* on the deferred bar and persists. Only the first of those
     # bars is a transition, so only it can latch the owed entry.
@@ -5250,19 +5270,16 @@ def test_the_two_strategies_are_the_built_in_default(monkeypatch) -> None:
     assert gift.source == "gift"
     assert gift.interval == "15minute"
     assert gift.exit == "flat"
-    assert gift.stop_rules.initial_points == 50.0
-    assert gift.stop_rules.trail_points == 5.0
-    assert gift.stop_rules.trail_after == 50.0
-    assert gift.stop_rules.trail_points_after == 30.0
+    # No stop and no trail: the signal is the only exit.
+    assert not hasattr(gift, "stop_rules")
+    assert not hasattr(gift, "stop_loss")
 
-    # NIFTY 60m: flip exit, 200-pt stop, 100-pt trail at +200.
+    # NIFTY 60m: flip exit, no stop, no trail.
     assert nifty.source == "nifty"
     assert nifty.interval == "60minute"
     assert nifty.exit == "flip"
-    assert nifty.stop_rules.initial_points == 200.0
-    assert nifty.stop_rules.trail_points == 100.0
-    assert nifty.stop_rules.trail_after == 200.0
-    assert nifty.stop_rules.trail_points_after == 100.0
+    assert not hasattr(nifty, "stop_rules")
+    assert not hasattr(nifty, "stop_loss")
 
     # Filters are off unless asked for.
     assert gift.filter_adx == 0.0
@@ -5295,8 +5312,7 @@ def test_the_specification_survives_a_stale_environment(monkeypatch) -> None:
     gift = configs[0]
     assert gift.interval == "15minute", "the 15-minute book must stay on 15 minutes"
     assert gift.exit == "flat"
-    assert gift.stop_rules.initial_points == 50.0
-    assert configs[1].stop_rules.initial_points == 200.0
+    assert not hasattr(gift, "stop_rules")
 
 
 def test_operational_knobs_are_still_overridable(monkeypatch) -> None:
@@ -5318,7 +5334,7 @@ def test_operational_knobs_are_still_overridable(monkeypatch) -> None:
     # ...but the identity is untouched, including the name the dashboard shows.
     assert gift.name == "GIFT NIFTY 15m"
     assert gift.interval == "15minute"
-    assert gift.stop_rules.initial_points == 50.0
+    assert not hasattr(gift, "stop_rules")
 
 
 def test_a_stale_name_cannot_mislabel_a_book(monkeypatch) -> None:
@@ -5411,7 +5427,7 @@ def test_a_stray_key_renames_a_book_but_never_adds_one(monkeypatch) -> None:
     assert configs[1].id == "typo"
     # The identity is still the specification, not the environment.
     assert configs[1].interval == "60minute"
-    assert configs[1].stop_rules.initial_points == 200.0
+    assert not hasattr(configs[1], "stop_rules")
 
 
 def test_a_disabled_strategy_is_not_started(monkeypatch) -> None:
@@ -5533,13 +5549,17 @@ def test_nifty_source_yields_closed_bars_the_strategy_accepts(monkeypatch) -> No
 
     rows = []
     start = datetime(2026, 11, 10, 9, 15, tzinfo=IST)
-    for i in range(60):
-        opened = start + timedelta(hours=i)
-        rows.append({
-            "date": opened.replace(tzinfo=None),
-            "open": 25_000.0 + i, "high": 25_010.0 + i,
-            "low": 24_990.0 + i, "close": 25_005.0 + i,
-        })
+    # A real NSE-hours series: six 60-minute bars a day, not 60 consecutive
+    # hours. The source gates its series to the session, so a fixture that ran
+    # through the night would be testing a series the exchange never produces.
+    for day in range(10):
+        for hour in (9, 10, 11, 12, 13, 14):
+            opened = start + timedelta(days=day, hours=hour - 9)
+            rows.append({
+                "date": opened.replace(tzinfo=None),
+                "open": 25_000.0 + len(rows), "high": 25_010.0 + len(rows),
+                "low": 24_990.0 + len(rows), "close": 25_005.0 + len(rows),
+            })
 
     class FakeClient:
         def historical_data(self, instrument_token, from_date, to_date, interval):
@@ -9011,22 +9031,89 @@ def test_the_newest_closed_bar_survives_a_refresh(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Protective stops: initial stop, trailing activation, never-widen
+# Session-gated signal series
 #
-# Two strategies trade the same future with different stops. The rules are the
-# same shape and differ only in numbers, so they are pinned here once against
-# both configurations. Every level is measured on the futures price, and the two
-# invariants - only move in the profitable direction, never widen - are what make
-# a trailing stop a stop rather than a suggestion.
+# GIFT Nifty quotes ~20 hours a day; the NFO future does not. A bar that closes
+# outside 09:15-15:30 can only ever produce a signal that has to be latched
+# until the next open, by which time the market has usually moved past the level
+# the signal was taken at. Measured over three years of 60-minute GIFT bars,
+# half of all fresh signals fired out of session and the median drift between
+# the signal bar's close and the first in-session fill was 60 points - against a
+# 50-point stop on the 15-minute book. So the gate belongs on the *signal*, not
+# only on execution.
 # ---------------------------------------------------------------------------
-def _gift_rules():
-    import stops
+def test_session_gate_keeps_both_edge_bars_and_drops_the_night() -> None:
+    """The overlap rule, at both ends of the session.
 
-    return stops.StopRules(
-        initial_points=50, trail_points=5, trail_after=50, trail_points_after=30
-    )
+    A close-only test would drop the 15:15 bar on 60-minute bars (its bucket runs
+    to 16:15 because the exchange shuts at 15:30); an open-only test would drop
+    the 09:00 bar on 15-minute bars (it opens pre-market but closes at 09:15,
+    which is the morning decision's own bar). Both must survive.
+    """
+    from bar_source import bar_in_session
+
+    # 15-minute bars: 09:00 closes 09:15 (first in-session close), 15:15 closes
+    # 15:30 (last), 08:45 and 15:30 are outside.
+    assert bar_in_session("2026-11-05T09:00:00", 900) is True
+    assert bar_in_session("2026-11-05T15:15:00", 900) is True
+    assert bar_in_session("2026-11-05T08:45:00", 900) is False
+    assert bar_in_session("2026-11-05T15:30:00", 900) is False
+
+    # 60-minute bars: 15:00 opens in session and its bucket runs past the close,
+    # so it is the last bar of the day and must be kept.
+    assert bar_in_session("2026-11-05T09:00:00", 3600) is True
+    assert bar_in_session("2026-11-05T15:00:00", 3600) is True
+    assert bar_in_session("2026-11-05T08:00:00", 3600) is False
+    assert bar_in_session("2026-11-05T16:00:00", 3600) is False
+
+    # The overnight session is what the gate exists for.
+    for hour in (0, 2, 6, 18, 21, 23):
+        assert bar_in_session(f"2026-11-05T{hour:02d}:00:00", 3600) is False
 
 
+def test_session_gate_keeps_a_bar_it_cannot_place_in_time() -> None:
+    """An unparseable timestamp is a bug to surface, not a bar to discard."""
+    from bar_source import bar_in_session
+
+    assert bar_in_session(None, 900) is True
+    assert bar_in_session("not-a-timestamp", 900) is True
+
+
+def test_gift_source_hides_overnight_bars_from_the_strategy() -> None:
+    """The feed builds bars around the clock; the strategy may only see the day.
+
+    This is the whole point of the gate: the engine's decision is made on the
+    series the source hands it, so filtering at the source is what stops an
+    overnight bar from shaping the indicator state or latching an entry.
+    """
+    from bar_source import GiftBarSource
+
+    class FakeFeed:
+        seconds = 3600
+
+        def candles(self):
+            return [
+                {"time": "2026-11-05T02:00:00", "open": 1, "high": 1, "low": 1, "close": 1},
+                {"time": "2026-11-05T09:00:00", "open": 2, "high": 2, "low": 2, "close": 2},
+                {"time": "2026-11-05T14:00:00", "open": 3, "high": 3, "low": 3, "close": 3},
+                {"time": "2026-11-05T15:00:00", "open": 4, "high": 4, "low": 4, "close": 4},
+                {"time": "2026-11-05T21:00:00", "open": 5, "high": 5, "low": 5, "close": 5},
+            ]
+
+    source = GiftBarSource(FakeFeed(), interval="60minute")
+    times = [bar["time"] for bar in source.candles()]
+
+    assert times == [
+        "2026-11-05T09:00:00",
+        "2026-11-05T14:00:00",
+        "2026-11-05T15:00:00",
+    ], f"overnight bars leaked into the signal series: {times}"
+    assert source.bar_count() == 3
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy LIVE/PAPER, pause and square-off
+# ---------------------------------------------------------------------------
 def _pin_two_books(monkeypatch) -> None:
     """Pin the engine's strategy list to the two books these tests exercise.
 
@@ -9043,292 +9130,15 @@ def _pin_two_books(monkeypatch) -> None:
             config.StrategyConfig(
                 index=1, id="gift-15m", source="gift", interval="15minute",
                 exit="flat", lots=1, enabled=True, name="GIFT NIFTY 15m",
-                stop_loss=50, trail_points=5, trail_after=50,
-                trail_points_after=30,
             ),
             config.StrategyConfig(
                 index=2, id="nifty-60m", source="nifty", interval="60minute",
                 exit="flip", lots=1, enabled=True, name="NIFTY 60m",
-                stop_loss=200, trail_points=100, trail_after=200,
-                trail_points_after=100,
             ),
         ],
     )
 
 
-def _nifty_rules():
-    import stops
-
-    return stops.StopRules(
-        initial_points=200, trail_points=100, trail_after=200, trail_points_after=100
-    )
-
-
-def test_initial_stop_sits_the_configured_distance_from_the_fill() -> None:
-    import stops
-
-    assert stops.initial_stop(25_000.0, stops.LONG, _gift_rules()) == 24_950.0
-    assert stops.initial_stop(25_000.0, stops.SHORT, _gift_rules()) == 25_050.0
-    assert stops.initial_stop(25_000.0, stops.LONG, _nifty_rules()) == 24_800.0
-    assert stops.initial_stop(25_000.0, stops.SHORT, _nifty_rules()) == 25_200.0
-
-
-def test_a_disabled_stop_places_nothing() -> None:
-    import stops
-
-    assert stops.initial_stop(25_000.0, stops.LONG, stops.StopRules(0)) is None
-
-
-def test_gift_trail_uses_five_points_until_fifty_then_thirty() -> None:
-    import stops
-
-    rules = _gift_rules()
-    # 40 points of profit: still the 5-point trail.
-    assert rules.trail_for(40) == 5
-    # 50 points: the wider 30-point trail takes over.
-    assert rules.trail_for(50) == 30
-    assert rules.trail_for(120) == 30
-
-
-def test_nifty_trail_is_one_hundred_points_once_two_hundred_in_profit() -> None:
-    import stops
-
-    rules = _nifty_rules()
-    assert rules.trail_for(150) == 100
-    assert rules.trail_for(200) == 100
-
-
-def test_a_long_stop_only_rises_and_never_widens() -> None:
-    import stops
-
-    rules = _gift_rules()
-    # Entry 25,000, stop 24,950. Price runs to 25,060: 60 points of profit, so
-    # the 30-point trail puts the stop at 25,030 - above the initial 24,950.
-    state, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=25_060.0, rules=rules,
-    )
-    assert not breached
-    assert state.current == 25_030.0
-
-    # Price falls back to 25,040. The trail would imply 25,010, which is *lower*
-    # than the 25,030 already in force - the never-widen rule keeps 25,030.
-    state2, breached2 = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=25_040.0, rules=rules,
-        current_stop=state.current, best_price=state.best_price,
-    )
-    assert not breached2
-    assert state2.current == 25_030.0, "the stop must not widen"
-
-
-def test_a_short_stop_only_falls_and_never_widens() -> None:
-    import stops
-
-    rules = _gift_rules()
-    # Short at 25,000, stop 25,050. Price falls to 24,940: 60 points of profit,
-    # so the 30-point trail puts the stop at 24,970 - below the initial 25,050.
-    state, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.SHORT, mark=24_940.0, rules=rules,
-    )
-    assert not breached
-    assert state.current == 24_970.0
-
-    # Price rises back to 24,960. The trail would imply 24,990, which is *higher*
-    # than 24,970 - the never-widen rule keeps 24,970.
-    state2, _ = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.SHORT, mark=24_960.0, rules=rules,
-        current_stop=state.current, best_price=state.best_price,
-    )
-    assert state2.current == 24_970.0, "the stop must not widen"
-
-
-def test_a_long_breaches_when_the_mark_reaches_the_stop() -> None:
-    import stops
-
-    rules = _gift_rules()
-    # Initial stop 24,950; a mark at or below it is a breach.
-    _, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=24_950.0, rules=rules,
-    )
-    assert breached
-    _, breached_below = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=24_900.0, rules=rules,
-    )
-    assert breached_below
-
-
-def test_a_short_breaches_when_the_mark_reaches_the_stop() -> None:
-    import stops
-
-    rules = _gift_rules()
-    _, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.SHORT, mark=25_050.0, rules=rules,
-    )
-    assert breached
-
-
-def test_a_mark_inside_the_stop_does_not_breach() -> None:
-    import stops
-
-    rules = _gift_rules()
-    _, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=24_960.0, rules=rules,
-    )
-    assert not breached
-
-
-def test_the_breach_is_judged_against_the_stop_in_force_before_the_update() -> None:
-    """A mark that both advances the trail and sits beyond it is a breach.
-
-    The stop the position was actually protected by is the one that decides, not
-    the tightened level this same tick would produce.
-    """
-    import stops
-
-    rules = _gift_rules()
-    # Long at 25,000 with the stop already trailed to 25,030. A mark at 25,020 is
-    # below that stop, so it breaches even though the trail would recompute.
-    _, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=25_020.0, rules=rules,
-        current_stop=25_030.0, best_price=25_060.0,
-    )
-    assert breached
-
-
-def test_the_two_strategies_keep_independent_stops_on_one_contract(monkeypatch, tmp_path) -> None:
-    """Both books hold the same future; each is stopped by its own rules.
-
-    A single shared stop would let the tighter book's level close the looser
-    book's position - the exact cross-strategy interference the per-book stop
-    exists to prevent.
-    """
-    import stops
-
-    use_test_database(monkeypatch, tmp_path)
-    # Two longs in the same contract, one per book, at the same fill.
-    gift_id = db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
-    )
-    nifty_id = db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="nifty-60m", trailing_stop=24_800.0, best_price=25_000.0,
-    )
-
-    # A mark of 24,940 breaches the GIFT book's 50-point stop but not the NIFTY
-    # book's 200-point stop.
-    gift_state, gift_breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=24_940.0,
-        rules=_gift_rules(), current_stop=24_950.0, best_price=25_000.0,
-    )
-    nifty_state, nifty_breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=24_940.0,
-        rules=_nifty_rules(), current_stop=24_800.0, best_price=25_000.0,
-    )
-    assert gift_breached is True
-    assert nifty_breached is False
-
-    # And the ledger rows are independent.
-    rows = {r["id"]: r for r in db.get_open_positions(mode=PAPER)}
-    assert rows[gift_id]["strategy_id"] == "gift-15m"
-    assert rows[nifty_id]["strategy_id"] == "nifty-60m"
-
-
-def test_the_engine_closes_only_the_breaching_books_position(monkeypatch, tmp_path) -> None:
-    """A stop-out is scoped to the position that breached, not the contract.
-
-    Both books hold a long in the same future. The GIFT book's stop is hit; the
-    NIFTY book's position must survive untouched.
-    """
-    _pin_two_books(monkeypatch)
-    use_test_database(monkeypatch, tmp_path)
-    gift_id = db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
-    )
-    nifty_id = db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="nifty-60m", trailing_stop=24_800.0, best_price=25_000.0,
-    )
-
-    eng = engine.StrategyEngine()
-    # Give each run its own rules without rebuilding the engine's sources.
-    for run in eng.runs:
-        if run.id == "gift-15m":
-            run.stop_rules = _gift_rules()
-        elif run.id == "nifty-60m":
-            run.stop_rules = _nifty_rules()
-
-    reports = eng.check_stops({"NIFTY26NOVFUT": 24_940.0})
-
-    assert [r["strategy_id"] for r in reports] == ["gift-15m"]
-    assert reports[0]["confirmed"] is True
-    open_ids = {r["id"] for r in db.get_open_positions(mode=PAPER)}
-    assert gift_id not in open_ids, "the breaching book's position must be closed"
-    assert nifty_id in open_ids, "the other book's position must be untouched"
-
-
-def test_a_stop_out_does_not_need_the_pause_switch(monkeypatch, tmp_path) -> None:
-    """Pausing blocks entries; it must never disarm a protective stop."""
-    _pin_two_books(monkeypatch)
-    use_test_database(monkeypatch, tmp_path)
-    db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
-    )
-    from order_manager import get_order_manager
-
-    eng = engine.StrategyEngine()
-    for run in eng.runs:
-        if run.id == "gift-15m":
-            run.stop_rules = _gift_rules()
-    get_order_manager().pause_book("gift-15m", "PAUSED")
-
-    reports = eng.check_stops({"NIFTY26NOVFUT": 24_940.0})
-
-    assert [r["strategy_id"] for r in reports] == ["gift-15m"]
-    assert db.get_open_positions(mode=PAPER, strategy_id="gift-15m") == []
-
-
-def test_a_book_without_stop_rules_is_left_alone(monkeypatch, tmp_path) -> None:
-    """An unconfigured book keeps the signal-only exit it had before."""
-    use_test_database(monkeypatch, tmp_path)
-    db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="gift-15m", trailing_stop=None, best_price=25_000.0,
-    )
-    eng = engine.StrategyEngine()
-    for run in eng.runs:
-        run.stop_rules = None
-
-    reports = eng.check_stops({"NIFTY26NOVFUT": 20_000.0})
-
-    assert reports == []
-    assert len(db.get_open_positions(mode=PAPER, strategy_id="gift-15m")) == 1
-
-
-def test_the_stop_advances_on_every_mark_and_persists(monkeypatch, tmp_path) -> None:
-    """The trail is written to the ledger, so a restart resumes it."""
-    _pin_two_books(monkeypatch)
-    use_test_database(monkeypatch, tmp_path)
-    position_id = db.open_position(
-        "NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE",
-        strategy_id="gift-15m", trailing_stop=24_950.0, best_price=25_000.0,
-    )
-    eng = engine.StrategyEngine()
-    for run in eng.runs:
-        if run.id == "gift-15m":
-            run.stop_rules = _gift_rules()
-
-    eng.check_stops({"NIFTY26NOVFUT": 25_060.0})
-
-    row = [p for p in db.get_open_positions(mode=PAPER) if p["id"] == position_id][0]
-    assert row["trailing_stop"] == 25_030.0
-    assert row["best_price"] == 25_060.0
-
-
-# ---------------------------------------------------------------------------
-# Per-strategy LIVE/PAPER, pause and square-off
-# ---------------------------------------------------------------------------
 def test_a_books_mode_is_persisted_across_a_restart(monkeypatch, tmp_path) -> None:
     """The operator's per-book choice survives a restart."""
     from config import LIVE, PAPER
@@ -9519,51 +9329,6 @@ def test_a_manual_order_is_refused_while_the_book_is_paused(monkeypatch, tmp_pat
     assert db.get_open_positions(mode=PAPER, strategy_id="gift-15m") == []
 
 
-def test_a_manual_order_carries_the_books_own_stop_rules(monkeypatch, tmp_path) -> None:
-    """A manual entry must be protected exactly like an automated one.
-
-    The stop is placed at the fill from the book's own rules, so a manual
-    position without them would run unprotected - the one thing the operator
-    cannot see from the dashboard.
-    """
-    from fastapi.testclient import TestClient
-
-    from engine import get_engine
-
-    _pin_two_books(monkeypatch)
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "is_market_open", lambda: True)
-    monkeypatch.setattr(
-        order_manager, "market_status", lambda: {"reason": "Market open", "is_open": True}
-    )
-
-    captured: dict = {}
-    real = order_manager.OrderManager.process_signal
-
-    def spy(self, payload, source="WEBHOOK", strategy_id=None, mode=None):
-        captured["payload"] = payload
-        captured["strategy_id"] = strategy_id
-        return order_manager.ExecutionResult(
-            True, payload.get("action", "BUY"), mode or PAPER, "NIFTY26NOVFUT"
-        )
-
-    monkeypatch.setattr(order_manager.OrderManager, "process_signal", spy)
-
-    response = TestClient(bot_app.app, base_url="http://localhost").post(
-        "/api/books/manual-order",
-        json={"strategy_id": "gift-15m", "action": "BUY", "confirm": True},
-    )
-
-    assert response.status_code == 200
-    assert captured["strategy_id"] == "gift-15m"
-    rules = captured["payload"]["stop_rules"]
-    run = next(r for r in get_engine().runs if r.id == "gift-15m")
-    assert rules == run.stop_rules.to_dict()
-    assert rules["initial_points"] == 50.0
-    # Not a bar signal, so it must not be aged out by the staleness check.
-    assert captured["payload"]["max_age_seconds"] == 0
-
-
 def test_a_manual_order_never_touches_the_other_book(monkeypatch, tmp_path) -> None:
     """The strategy id scopes the order; the other book's leg is untouched."""
     from fastapi.testclient import TestClient
@@ -9634,6 +9399,105 @@ def test_the_configured_exit_rules_are_flat_for_gift_and_flip_for_nifty(
     configs = {cfg.id: cfg for cfg in strategy_configs()}
     assert configs["gift-15m"].exit == "flat"
     assert configs["nifty-60m"].exit == "flip"
+
+
+def test_no_stop_loss_architecture_remains() -> None:
+    """The stop-loss subsystem is gone, not merely disabled.
+
+    The signal is the only exit on both books, so there is no stop arithmetic, no
+    trailing stop, no broker-side SL-M and no operator stop endpoint. This pins
+    the removal: a reintroduced ``stops`` module, a ``stop_rules`` field on the
+    config, or a protective-stop method on the order manager would all mean the
+    old architecture had crept back in and could compete with the signal exit.
+    """
+    import importlib
+
+    import pytest
+
+    with pytest.raises(ImportError):
+        importlib.import_module("stops")
+
+    import config
+    import order_manager
+
+    for cfg in config.strategy_configs():
+        for gone in ("stop_rules", "stop_loss", "trail_points", "trail_after"):
+            assert not hasattr(cfg, gone), f"{cfg.id} still carries {gone}"
+
+    manager = order_manager.OrderManager.__dict__
+    for gone in (
+        "place_protective_stop",
+        "move_protective_stop",
+        "cancel_protective_stop",
+        "reconcile_protective_stops",
+    ):
+        assert gone not in manager, f"OrderManager still has {gone}"
+
+    import engine
+
+    assert not hasattr(engine.StrategyEngine, "check_stops"), (
+        "the engine still runs a stop check"
+    )
+
+    import database
+
+    for gone in (
+        "update_position_stops",
+        "set_position_stop",
+        "set_position_protective_order",
+        "positions_needing_protection",
+    ):
+        assert not hasattr(database, gone), f"database still has {gone}"
+
+
+def test_a_position_is_opened_with_no_stop_level(monkeypatch, tmp_path) -> None:
+    """An entry records no stop, and no SL-M is placed behind it.
+
+    The old path derived an initial stop from the book's rules and placed an
+    exchange-held SL-M at the fill. Both are gone: a position now carries only
+    what the signal needs, and nothing at the broker can close it except the
+    bot's own exit.
+    """
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
+    monkeypatch.setattr(
+        order_manager, "settings",
+        SimpleNamespace(
+            default_lots=1, max_open_lots=4, lot_margin=150_000.0,
+            product="NRML", order_type="MARKET", slippage_ticks=1,
+            tick_size=0.05, virtual_balance=200_000.0, lot_size=65,
+        ),
+    )
+
+    class FakeClient:
+        mode = PAPER
+
+        def place_order(self, **kwargs):
+            return {
+                "order_id": "P1", "status": "COMPLETE",
+                "average_price": 25_000.0, "filled_quantity": 65,
+            }
+
+        def data_source(self):
+            return "stub"
+
+        def get_ltp(self, symbol, max_age=None):
+            return 25_000.0
+
+    manager = order_manager.OrderManager(FakeClient())
+    result = manager.process_signal(
+        {"action": "BUY", "symbol": "NIFTY26DECFUT", "qty_lots": 1,
+         "strategy": "gift-15m"},
+        source="TEST", strategy_id="gift-15m", mode=PAPER,
+    )
+
+    assert result.ok is True
+    position = db.get_open_positions(mode=PAPER)[0]
+    for column in ("sl_price", "initial_sl_price", "trailing_stop", "best_price",
+                   "protective_order_id", "protective_stop"):
+        assert column not in position.keys(), (
+            f"the ledger still records {column}; the stop architecture is not gone"
+        )
 
 
 def test_pausing_one_book_does_not_pause_the_other(monkeypatch, tmp_path) -> None:
@@ -9933,64 +9797,10 @@ def test_stop_all_blocks_a_manual_entry(monkeypatch, tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A breached stop must not be blocked by a reconciliation failure
+# A panic exit must not be blocked by a reconciliation failure
 # ---------------------------------------------------------------------------
-def test_a_stop_out_is_attempted_even_when_reconciliation_fails(monkeypatch, tmp_path) -> None:
-    """A breached stop must close even if the ledger disagrees with the broker.
-
-    Refusing the exit because the *ledger* is out of sync leaves the one
-    position that most needs closing open and unprotected.
-    """
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
-    db.open_position("NIFTY26DECFUT", 65, 100.0, mode=LIVE, strategy_id="gift-15m")
-
-    placed: list[dict] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def positions(self, force=False):
-            return []  # broker disagrees with the ledger
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": "NIFTY26DECFUT"}]
-
-        def instrument_for_symbol(self, symbol):
-            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
-
-        def front_month_symbol(self, now=None):
-            return "NIFTY26DECFUT"
-
-        def required_margin(self, *args, **kwargs):
-            return 150_000.0
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "kite"
-
-        def get_ltp(self, symbol, max_age=None):
-            return 90.0
-
-        def place_order(self, **kwargs):
-            placed.append(kwargs)
-            return {"order_id": "EXIT1", "status": "COMPLETE",
-                    "filled_quantity": kwargs["quantity"], "average_price": 90.0}
-
-    manager = OrderManager(FakeClient())
-    result = manager.square_off(
-        "STOP_LOSS", mode=LIVE, mark_price=90.0, position_id=1, strategy_id="gift-15m"
-    )
-
-    assert placed, "the exit order must still be sent"
-    assert result.ok is True
-    assert db.get_open_positions(mode=LIVE) == []
-
-
 def test_a_routine_exit_is_still_blocked_by_a_reconciliation_failure(monkeypatch, tmp_path) -> None:
-    """Only protective exits bypass the sync gate; a manual one does not."""
+    """Only a panic exit bypasses the sync gate; a manual one does not."""
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
     db.open_position("NIFTY26DECFUT", 65, 100.0, mode=LIVE, strategy_id="gift-15m")
@@ -10030,23 +9840,19 @@ def test_a_routine_exit_is_still_blocked_by_a_reconciliation_failure(monkeypatch
     assert len(db.get_open_positions(mode=LIVE)) == 1
 
 
-def test_a_live_book_is_marked_and_stopped_while_the_process_is_in_paper(
+def test_a_live_book_is_marked_while_the_process_is_in_paper(
     monkeypatch, tmp_path
 ) -> None:
-    """A live book's stop must not be skipped because the process is in PAPER.
+    """A live book must not go unmarked because the process is in PAPER.
 
-    ``price_map`` used to price only the process-wide mode's positions, while
-    ``check_stops`` iterated every open position. With one book live and the
-    other in paper, the live leg got no mark, so its protective stop was
-    silently skipped - an unprotected position the bot believed was protected.
+    ``price_map`` used to price only the process-wide mode's positions. With one
+    book live and the other in paper, the live leg got no mark, so its P&L was
+    silently stale.
     """
     use_test_database(monkeypatch, tmp_path)
     monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-    # A live long that has already breached its 50-point stop.
     db.open_position(
         "NIFTY26DECFUT", 65, 20_000.0, mode=LIVE, strategy_id="gift-15m",
-        sl_price=19_950.0, initial_sl_price=19_950.0, trailing_stop=19_950.0,
-        best_price=20_000.0,
     )
 
     class FakeClient:
@@ -10062,64 +9868,6 @@ def test_a_live_book_is_marked_and_stopped_while_the_process_is_in_paper(
     assert prices.get("NIFTY26DECFUT") == 19_900.0, (
         "a live position must be priced even while the process is in PAPER"
     )
-
-
-def test_the_initial_stop_is_in_force_at_entry_not_the_trail() -> None:
-    """The configured initial stop must be the protection before any profit.
-
-    The trail used to be computed from a best price seeded at the entry, so at
-    zero profit it implied ``entry - trail_points`` - which is *tighter* than the
-    configured initial stop and silently replaced it. The GIFT book's 50-point
-    stop was really 5 points, and the 60-minute book's 200-point stop was really
-    100. Every configured number now means what it says.
-    """
-    import stops
-
-    gift, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=25_000.0, rules=_gift_rules(),
-    )
-    assert not breached
-    assert gift.current == 24_950.0, "the 50-point initial stop must be in force at entry"
-
-    nifty, _ = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.LONG, mark=25_000.0, rules=_nifty_rules(),
-    )
-    assert nifty.current == 24_800.0, "the 200-point initial stop must be in force at entry"
-
-
-def test_a_short_initial_stop_is_in_force_at_entry() -> None:
-    import stops
-
-    state, breached = stops.evaluate(
-        entry_price=25_000.0, position_key=stops.SHORT, mark=25_000.0, rules=_gift_rules(),
-    )
-    assert not breached
-    assert state.current == 25_050.0
-
-
-def test_the_trail_never_loosens_across_the_wider_band_transition() -> None:
-    """Crossing TRAIL_AFTER must not widen the stop.
-
-    The GIFT trail goes from 5 to 30 points at +50 profit. A naive recompute
-    would move the stop from ``best - 5`` to ``best - 30``, i.e. 25 points
-    *backwards*. The never-widen clamp holds the tighter level until the wider
-    trail catches up.
-    """
-    import stops
-
-    rules = _gift_rules()
-    current, best = None, None
-    levels: list[float] = []
-    for profit in range(0, 121, 5):
-        state, _ = stops.evaluate(
-            entry_price=25_000.0, position_key=stops.LONG, mark=25_000.0 + profit,
-            rules=rules, current_stop=current, best_price=best,
-        )
-        current, best = state.current, state.best_price
-        levels.append(current)
-
-    assert levels == sorted(levels), f"the stop widened somewhere: {levels}"
-    assert levels[0] == 24_950.0
 
 
 def test_booking_a_reconciled_fill_is_idempotent(monkeypatch, tmp_path) -> None:
@@ -10412,291 +10160,6 @@ def test_repeated_bar_close_events_do_not_re_evaluate_the_same_bar() -> None:
 # ---------------------------------------------------------------------------
 # Manual stop-loss modification
 # ---------------------------------------------------------------------------
-def test_a_stop_can_be_tightened_but_never_widened(monkeypatch, tmp_path) -> None:
-    """The engine's trail only tightens, so an override must obey the same rule.
-
-    Accepting a looser level would show the operator a stop that is not actually
-    protecting the position - the engine would re-tighten it on the next mark.
-    """
-    use_test_database(monkeypatch, tmp_path)
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
-        sl_price=25_830.0, initial_sl_price=25_750.0,
-        trailing_stop=25_830.0, best_price=25_860.0,
-    )
-
-    # Towards the market: accepted.
-    result = db.set_position_stop(position_id, 25_880.0)
-    assert result["stop"] == 25_880.0
-    assert result["previous_stop"] == 25_830.0
-    assert result["initial_stop"] == 25_750.0
-    assert result["side"] == "LONG"
-
-    # Away from the market: refused, and the stored level is unchanged.
-    with pytest.raises(ValueError, match="widen"):
-        db.set_position_stop(position_id, 25_800.0)
-    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_880.0
-
-
-def test_a_short_stop_only_moves_down(monkeypatch, tmp_path) -> None:
-    use_test_database(monkeypatch, tmp_path)
-    # A negative quantity opens a short, so the stop sits above the entry.
-    position_id = db.open_position(
-        "NIFTY26DECFUT", -65, 26_000.0, mode=PAPER, strategy_id="nifty-60m",
-        sl_price=26_200.0, initial_sl_price=26_200.0,
-        trailing_stop=26_200.0, best_price=26_000.0,
-    )
-
-    result = db.set_position_stop(position_id, 26_100.0)
-    assert result["stop"] == 26_100.0
-    assert result["side"] == "SHORT"
-
-    with pytest.raises(ValueError, match="widen"):
-        db.set_position_stop(position_id, 26_150.0)
-
-
-def test_a_stop_cannot_be_set_on_a_closed_position(monkeypatch, tmp_path) -> None:
-    use_test_database(monkeypatch, tmp_path)
-    position_id = db.open_position("NIFTY26DECFUT", 65, 25_800.0, mode=PAPER)
-    db.close_position(position_id, 25_900.0)
-
-    with pytest.raises(ValueError, match="not open"):
-        db.set_position_stop(position_id, 25_850.0)
-
-
-def test_the_stop_endpoint_requires_confirmation_and_an_open_position(
-    monkeypatch, tmp_path
-) -> None:
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
-
-    class FakeRun:
-        id = "gift-15m"
-
-        def mode(self):
-            return PAPER
-
-    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
-
-    # No position: refused with a clear reason rather than a silent no-op.
-    with pytest.raises(bot_app.HTTPException) as excinfo:
-        bot_app.api_book_stop(
-            bot_app.BookStopRequest(strategy_id="gift-15m", stop=25_800.0, confirm=True)
-        )
-    assert excinfo.value.status_code == 409
-    assert "no open position" in excinfo.value.detail.lower()
-
-    # With a position but no confirmation: refused.
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
-        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
-    )
-    with pytest.raises(bot_app.HTTPException) as excinfo:
-        bot_app.api_book_stop(
-            bot_app.BookStopRequest(strategy_id="gift-15m", stop=25_880.0)
-        )
-    assert excinfo.value.status_code == 400
-
-
-def test_the_stop_endpoint_moves_the_level_the_engine_reads(monkeypatch, tmp_path) -> None:
-    """The override must be a real change, not a display-only annotation."""
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
-
-    class FakeRun:
-        id = "gift-15m"
-
-        def mode(self):
-            return PAPER
-
-    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
-        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
-    )
-
-    payload = bot_app.api_book_stop(
-        bot_app.BookStopRequest(strategy_id="gift-15m", stop=25_880.0, confirm=True)
-    )
-
-    assert payload["ok"] is True
-    assert payload["stop"] == 25_880.0
-    assert payload["previous_stop"] == 25_830.0
-    # The ledger row the engine's stop check reads now carries the new level.
-    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_880.0
-
-
-def test_the_tile_reads_the_stop_field_the_api_actually_publishes() -> None:
-    """The tile must read ``stop_price``, not the raw ledger column.
-
-    ``_enrich_positions`` publishes the stop as ``stop_price`` /
-    ``initial_stop_price``. The tile read ``trailing_stop`` / ``initial_sl_price``
-    - the raw column names - so it got ``undefined`` for every position: the
-    stop showed "—" and the Edit button never rendered, leaving the manual
-    stop-loss feature present in the code but unreachable in the UI.
-    """
-    from pathlib import Path
-
-    app_js = (
-        Path(__file__).resolve().parent.parent / "bot" / "web" / "app.js"
-    ).read_text(encoding="utf-8")
-
-    assert "openRow.stop_price" in app_js, (
-        "the tile must read the enriched stop_price field"
-    )
-    assert "openRow.initial_stop_price" in app_js
-    # The raw column names must not be read off an API row anywhere.
-    assert "openRow.trailing_stop" not in app_js
-    assert "openRow.initial_sl_price" not in app_js
-
-
-def test_the_stop_editor_is_always_rendered_but_disabled_when_flat() -> None:
-    """The control must be discoverable even with nothing to protect.
-
-    It used to be omitted entirely on a flat book, which made the feature
-    undiscoverable: an operator looking for "where do I move the stop" found no
-    control and concluded it did not exist. It is now always rendered, disabled
-    with a reason, and becomes active once a position is open.
-    """
-    from pathlib import Path
-
-    app_js = (
-        Path(__file__).resolve().parent.parent / "bot" / "web" / "app.js"
-    ).read_text(encoding="utf-8")
-
-    assert "const stopEditButton = openRow" in app_js
-    # The flat branch renders a disabled button rather than an empty string.
-    assert "is-disabled" in app_js
-    assert "disabled" in app_js
-    assert "data-book-stopedit" in app_js
-    assert "editBookStop" in app_js
-
-
-def test_a_stop_can_be_set_by_distance_from_the_mark(monkeypatch, tmp_path) -> None:
-    """A distance is resolved against the live mark, not the entry.
-
-    "40 points away" means 40 from where the market is now, which is the number
-    the operator is looking at. The mark comes from the same price map the stop
-    check uses, so the level this produces is the level the engine will test.
-    """
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
-
-    class FakeRun:
-        id = "gift-15m"
-
-        def mode(self):
-            return PAPER
-
-    class FakeClient:
-        def get_ltp(self, symbol, max_age=None):
-            return 25_937.0
-
-    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
-    monkeypatch.setattr(
-        bot_app, "get_order_manager", lambda: OrderManager(FakeClient())
-    )
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
-        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
-    )
-
-    payload = bot_app.api_book_stop(
-        bot_app.BookStopRequest(strategy_id="gift-15m", distance=40, confirm=True)
-    )
-
-    # A long's stop sits below the mark: 25,937 - 40 = 25,897.
-    assert payload["stop"] == 25_897.0
-    assert payload["mark"] == 25_937.0
-    assert payload["distance"] == 40
-    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_897.0
-
-
-def test_a_distance_that_would_widen_the_stop_is_refused(monkeypatch, tmp_path) -> None:
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
-
-    class FakeRun:
-        id = "gift-15m"
-
-        def mode(self):
-            return PAPER
-
-    class FakeClient:
-        def get_ltp(self, symbol, max_age=None):
-            return 25_937.0
-
-    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
-    monkeypatch.setattr(
-        bot_app, "get_order_manager", lambda: OrderManager(FakeClient())
-    )
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
-        sl_price=25_900.0, initial_sl_price=25_750.0, trailing_stop=25_900.0,
-    )
-
-    # 200 points from the mark is 25,737 - far below the 25,900 in force.
-    with pytest.raises(bot_app.HTTPException) as excinfo:
-        bot_app.api_book_stop(
-            bot_app.BookStopRequest(strategy_id="gift-15m", distance=200, confirm=True)
-        )
-    assert excinfo.value.status_code == 409
-    assert "widen" in excinfo.value.detail
-    assert db.get_open_positions(mode=PAPER)[0]["trailing_stop"] == 25_900.0
-
-
-def test_a_stop_request_must_supply_exactly_one_of_price_or_distance(
-    monkeypatch, tmp_path
-) -> None:
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(bot_app, "get_execution_mode", lambda: PAPER)
-
-    class FakeRun:
-        id = "gift-15m"
-
-        def mode(self):
-            return PAPER
-
-    monkeypatch.setattr(bot_app, "_find_run", lambda sid: FakeRun())
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=PAPER, strategy_id="gift-15m",
-        sl_price=25_830.0, initial_sl_price=25_750.0, trailing_stop=25_830.0,
-    )
-
-    with pytest.raises(bot_app.HTTPException) as excinfo:
-        bot_app.api_book_stop(
-            bot_app.BookStopRequest(strategy_id="gift-15m", confirm=True)
-        )
-    assert excinfo.value.status_code == 400
-    assert "either" in excinfo.value.detail.lower()
-
-    with pytest.raises(bot_app.HTTPException) as excinfo:
-        bot_app.api_book_stop(
-            bot_app.BookStopRequest(
-                strategy_id="gift-15m", stop=25_900.0, distance=40, confirm=True
-            )
-        )
-    assert excinfo.value.status_code == 400
-    assert "not both" in excinfo.value.detail.lower()
-
-
-def test_the_tile_shows_the_distance_from_the_mark() -> None:
-    """The distance is the number a trader watches, so it is shown, not implied."""
-    from pathlib import Path
-
-    app_js = (
-        Path(__file__).resolve().parent.parent / "bot" / "web" / "app.js"
-    ).read_text(encoding="utf-8")
-
-    assert "openRow.stop_distance_points" in app_js
-    assert "book-band-stop-distance" in app_js
-    # The editor offers a points mode as well as a price mode, and resolves the
-    # distance against the live mark rather than the entry.
-    assert "setStopMode" in app_js
-    assert "sl-mode-points" in app_js
-    assert "slState.mark" in app_js
-
-
 def test_no_native_browser_dialogs_remain() -> None:
     """Confirmations are in-page dialogs, not ``window.confirm``.
 
@@ -10735,530 +10198,19 @@ def test_no_native_browser_dialogs_remain() -> None:
         assert f'id="{element}"' in html, f"#{element} is missing from index.html"
 
 
-# ---------------------------------------------------------------------------
-# Exchange-held protective stops
-#
-# The engine's stop is a software check on a mark loop. If the process dies, the
-# container is killed or the API is unreachable, nothing evaluates it and the
-# position sits at the exchange with no stop at all. These tests cover the SL-M
-# that closes that gap.
-# ---------------------------------------------------------------------------
-
-def _live_manager(monkeypatch, tmp_path, client):
-    """An OrderManager in LIVE with a stub client, on a fresh ledger."""
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: LIVE)
-    monkeypatch.setattr(
-        order_manager, "settings",
-        SimpleNamespace(
-            protective_stops=True, product="NRML", order_type="MARKET",
-            tick_size=0.05, slippage_ticks=1.0, lot_size=65, max_open_lots=4,
-            default_lots=1, lot_margin=150_000.0, virtual_balance=1_000_000.0,
-            db_path=str(tmp_path / "test.db"),
-        ),
-    )
-    return OrderManager(client)
-
-
-def test_protective_stop_is_placed_after_a_live_entry(monkeypatch, tmp_path) -> None:
-    """A LIVE entry must leave an SL-M resting at the exchange, not just a row."""
-    placed: list[dict] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def positions(self, force=False):
-            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": "NIFTY26DECFUT"}]
-
-        def instrument_for_symbol(self, symbol):
-            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
-
-        def front_month_symbol(self, now=None):
-            return "NIFTY26DECFUT"
-
-        def required_margin(self, *args, **kwargs):
-            return 150_000.0
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "kite"
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_800.0
-
-        def place_order(self, **kwargs):
-            return {
-                "order_id": "entry-1", "status": "COMPLETE",
-                "average_price": 25_800.0, "filled_quantity": 65,
-            }
-
-        def place_protective_stop(self, **kwargs):
-            placed.append(kwargs)
-            return {"order_id": "slm-1", "status": "TRIGGER_PENDING", "mode": LIVE}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    payload = {
-        "stop_rules": {
-            "enabled": True, "initial_points": 50.0, "trail_points": 5.0,
-            "trail_after": 50.0, "trail_points_after": 30.0,
-        },
-    }
-    result = manager._execute_directional(
-        payload, "BUY", "NIFTY26DECFUT", LIVE, "SIGNAL", strategy_id=db.DEFAULT_STRATEGY_ID
-    )
-
-    assert result.ok, result.reason
-    assert len(placed) == 1
-    # A long is protected by a SELL stop, 50 points below the fill.
-    assert placed[0]["position_key"] == 1
-    assert placed[0]["trigger_price"] == 25_750.0
-    assert placed[0]["quantity"] == 65
-    position = db.get_open_positions(mode=LIVE)[0]
-    assert position["protective_order_id"] == "slm-1"
-    assert position["protective_stop"] == 25_750.0
-    assert position["protective_status"] == "TRIGGER_PENDING"
-
-
-def test_a_short_is_protected_by_a_buy_stop(monkeypatch, tmp_path) -> None:
-    """The side is derived from the position, never passed in.
-
-    A caller that got it backwards would place a stop that doubles the position
-    instead of closing it - the worst possible failure for this order.
-    """
-    placed: list[dict] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def positions(self, force=False):
-            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": "NIFTY26DECFUT"}]
-
-        def instrument_for_symbol(self, symbol):
-            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
-
-        def front_month_symbol(self, now=None):
-            return "NIFTY26DECFUT"
-
-        def required_margin(self, *args, **kwargs):
-            return 150_000.0
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "kite"
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_800.0
-
-        def place_order(self, **kwargs):
-            return {
-                "order_id": "entry-1", "status": "COMPLETE",
-                "average_price": 25_800.0, "filled_quantity": 65,
-            }
-
-        def place_protective_stop(self, **kwargs):
-            placed.append(kwargs)
-            return {"order_id": "slm-1", "status": "TRIGGER_PENDING", "mode": LIVE}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    payload = {"stop_rules": {"enabled": True, "initial_points": 200.0}}
-    result = manager._execute_directional(
-        payload, "SELL", "NIFTY26DECFUT", LIVE, "SIGNAL", strategy_id=db.DEFAULT_STRATEGY_ID
-    )
-
-    assert result.ok, result.reason
-    assert placed[0]["position_key"] == -1
-    # A short's stop sits above the fill.
-    assert placed[0]["trigger_price"] == 26_000.0
-
-
-def test_a_failed_protective_stop_is_reported_not_swallowed(monkeypatch, tmp_path) -> None:
-    """The trade still opens, but the operator is told it is only software-protected."""
-    class FakeClient:
-        mode = LIVE
-
-        def positions(self, force=False):
-            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": "NIFTY26DECFUT"}]
-
-        def instrument_for_symbol(self, symbol):
-            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
-
-        def front_month_symbol(self, now=None):
-            return "NIFTY26DECFUT"
-
-        def required_margin(self, *args, **kwargs):
-            return 150_000.0
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "kite"
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_800.0
-
-        def place_order(self, **kwargs):
-            return {
-                "order_id": "entry-1", "status": "COMPLETE",
-                "average_price": 25_800.0, "filled_quantity": 65,
-            }
-
-        def place_protective_stop(self, **kwargs):
-            return {"order_id": None, "status": "REJECTED", "message": "trigger on wrong side"}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    payload = {"stop_rules": {"enabled": True, "initial_points": 50.0}}
-    result = manager._execute_directional(
-        payload, "BUY", "NIFTY26DECFUT", LIVE, "SIGNAL", strategy_id=db.DEFAULT_STRATEGY_ID
-    )
-
-    assert result.ok
-    assert "no exchange-held stop" in result.reason.lower()
-    assert result.details["protective_ok"] is False
-    position = db.get_open_positions(mode=LIVE)[0]
-    assert position["protective_order_id"] is None
-
-
-def test_exit_cancels_the_protective_stop_first(monkeypatch, tmp_path) -> None:
-    """An SL-M left resting while the bot exits would reverse the position.
-
-    The stop fires against a flat book and opens a new position in the opposite
-    direction, so cancelling is part of the exit rather than an optimisation.
-    """
-    calls: list[str] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def positions(self, force=False):
-            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": "NIFTY26DECFUT"}]
-
-        def instrument_for_symbol(self, symbol):
-            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
-
-        def front_month_symbol(self, now=None):
-            return "NIFTY26DECFUT"
-
-        def required_margin(self, *args, **kwargs):
-            return 150_000.0
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "kite"
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_900.0
-
-        def cancel_protective_stop(self, order_id, mode=None):
-            calls.append(f"cancel:{order_id}")
-            return {"order_id": order_id, "status": "CANCELLED", "mode": LIVE}
-
-        def place_order(self, **kwargs):
-            calls.append("exit")
-            return {
-                "order_id": "exit-1", "status": "COMPLETE",
-                "average_price": 25_900.0, "filled_quantity": 65,
-            }
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        initial_sl_price=25_750.0, strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-
-    result = manager.square_off("MANUAL", mode=LIVE, strategy_id=db.DEFAULT_STRATEGY_ID)
-
-    assert result.ok, result.reason
-    # The cancel must come before the exit, or the stop can fire into it.
-    assert calls == ["cancel:slm-1", "exit"]
-    assert db.get_open_positions(mode=LIVE) == []
-
-
-def test_an_exit_is_refused_when_the_stop_cannot_be_cancelled(monkeypatch, tmp_path) -> None:
-    """A live stop that cannot be removed must not be exited into.
-
-    Leaving the position open and protected is the safe failure; closing it while
-    an SL-M still rests would let the stop reverse the book.
-    """
-    class FakeClient:
-        mode = LIVE
-
-        def positions(self, force=False):
-            return [{"tradingsymbol": "NIFTY26DECFUT", "quantity": 65, "product": "NRML"}]
-
-        def nifty_future_instruments(self):
-            return [{"tradingsymbol": "NIFTY26DECFUT"}]
-
-        def instrument_for_symbol(self, symbol):
-            return {"tradingsymbol": symbol, "lot_size": 65, "instrument_type": "FUT"}
-
-        def front_month_symbol(self, now=None):
-            return "NIFTY26DECFUT"
-
-        def required_margin(self, *args, **kwargs):
-            return 150_000.0
-
-        def available_cash(self):
-            return 1_000_000.0
-
-        def data_source(self):
-            return "kite"
-
-        def get_ltp(self, symbol, max_age=None):
-            return 25_900.0
-
-        def cancel_protective_stop(self, order_id, mode=None):
-            return {"order_id": order_id, "status": "OPEN", "message": "cancel rejected"}
-
-        def place_order(self, **kwargs):
-            raise AssertionError("must not exit while the protective stop is still live")
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-
-    result = manager.square_off("MANUAL", mode=LIVE, strategy_id=db.DEFAULT_STRATEGY_ID)
-
-    assert not result.ok
-    assert "could not cancel the protective stop" in result.reason.lower()
-    assert len(db.get_open_positions(mode=LIVE)) == 1
-
-
-def test_the_trail_moves_the_exchange_stop(monkeypatch, tmp_path) -> None:
-    """Zerodha has no native trailing stop, so a trail is a modify per step."""
-    moved: list[float] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def modify_protective_stop(self, order_id, trigger_price, quantity=None, mode=None):
-            moved.append(trigger_price)
-            return {"order_id": order_id, "status": "TRIGGER_PENDING", "trigger_price": trigger_price}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-    position = db.get_open_positions(mode=LIVE)[0]
-
-    result = manager.move_protective_stop(position, 25_820.0)
-
-    assert result["ok"]
-    assert moved == [25_820.0]
-    assert db.get_open_positions(mode=LIVE)[0]["protective_stop"] == 25_820.0
-
-
-def test_a_failed_trail_modify_keeps_the_old_level_recorded(monkeypatch, tmp_path) -> None:
-    """The exchange still holds the older trigger, and that gap must stay visible.
-
-    Reporting the tighter level would show a stop the exchange is not holding.
-    """
-    class FakeClient:
-        mode = LIVE
-
-        def modify_protective_stop(self, order_id, trigger_price, quantity=None, mode=None):
-            return {"order_id": order_id, "status": "REJECTED", "message": "rate limited"}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-    position = db.get_open_positions(mode=LIVE)[0]
-
-    result = manager.move_protective_stop(position, 25_820.0)
-
-    assert not result["ok"]
-    stored = db.get_open_positions(mode=LIVE)[0]
-    # The order id survives - it is the only handle on an order that can still
-    # fire - and the level stays at what the exchange actually holds.
-    assert stored["protective_order_id"] == "slm-1"
-    assert stored["protective_stop"] == 25_750.0
-
-
-def test_restart_replaces_a_missing_protective_stop(monkeypatch, tmp_path) -> None:
-    """A position that survived a crash must get its stop back."""
-    placed: list[float] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def order_book(self, force=False):
-            return []
-
-        def place_protective_stop(self, **kwargs):
-            placed.append(kwargs["trigger_price"])
-            return {"order_id": "slm-new", "status": "TRIGGER_PENDING", "mode": LIVE}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-
-    summary = manager.reconcile_protective_stops(LIVE)
-
-    assert summary["placed"] == 1
-    assert placed == [25_750.0]
-    assert db.get_open_positions(mode=LIVE)[0]["protective_order_id"] == "slm-new"
-
-
-def test_restart_does_not_duplicate_a_healthy_stop(monkeypatch, tmp_path) -> None:
-    """A resting stop at the right level is left alone, not re-placed."""
-    class FakeClient:
-        mode = LIVE
-
-        def order_book(self, force=False):
-            return [{
-                "order_id": "slm-1", "status": "TRIGGER_PENDING",
-                "trigger_price": 25_750.0,
-            }]
-
-        def place_protective_stop(self, **kwargs):
-            raise AssertionError("a healthy stop must not be re-placed")
-
-        def modify_protective_stop(self, *args, **kwargs):
-            raise AssertionError("a healthy stop must not be modified")
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-
-    summary = manager.reconcile_protective_stops(LIVE)
-
-    assert summary["already_ok"] == 1
-    assert summary["placed"] == 0
-    assert summary["moved"] == 0
-
-
-def test_restart_tightens_a_lagging_stop(monkeypatch, tmp_path) -> None:
-    """A trail that moved in the ledger but not at the broker is caught here."""
-    moved: list[float] = []
-
-    class FakeClient:
-        mode = LIVE
-
-        def order_book(self, force=False):
-            return [{
-                "order_id": "slm-1", "status": "TRIGGER_PENDING",
-                "trigger_price": 25_750.0,
-            }]
-
-        def modify_protective_stop(self, order_id, trigger_price, quantity=None, mode=None):
-            moved.append(trigger_price)
-            return {"order_id": order_id, "status": "TRIGGER_PENDING"}
-
-    manager = _live_manager(monkeypatch, tmp_path, FakeClient())
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_820.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-
-    summary = manager.reconcile_protective_stops(LIVE)
-
-    assert summary["moved"] == 1
-    assert moved == [25_820.0]
-
-
-def test_paper_positions_get_no_broker_stop(monkeypatch, tmp_path) -> None:
-    """There is no exchange to hold one, and a paper stop must not hit the API."""
-    use_test_database(monkeypatch, tmp_path)
-    monkeypatch.setattr(order_manager, "get_execution_mode", lambda: PAPER)
-
-    class FakeClient:
-        mode = PAPER
-
-        def place_protective_stop(self, **kwargs):
-            raise AssertionError("paper mode must not place a broker-side stop")
-
-    manager = OrderManager(FakeClient())
-    db.open_position("TEST", 65, 100.0, mode=PAPER, trailing_stop=95.0)
-
-    summary = manager.reconcile_protective_stops(PAPER)
-
-    assert summary["checked"] == 0
-    assert summary["placed"] == 0
-
-
-def test_readiness_blocks_on_an_unprotected_live_position(monkeypatch, tmp_path) -> None:
-    """Arming LIVE with an unprotected position is the state the gate must refuse."""
-    use_test_database(monkeypatch, tmp_path)
-    db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-
-    unprotected = db.positions_needing_protection(LIVE)
-
-    assert len(unprotected) == 1
-    assert unprotected[0]["symbol"] == "NIFTY26DECFUT"
-
-
-def test_a_resting_stop_is_not_reported_as_needing_protection(monkeypatch, tmp_path) -> None:
-    use_test_database(monkeypatch, tmp_path)
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "TRIGGER_PENDING")
-
-    assert db.positions_needing_protection(LIVE) == []
-
-
-def test_a_rejected_stop_is_reported_as_needing_protection(monkeypatch, tmp_path) -> None:
-    """A recorded order id is not proof of protection; its status decides."""
-    use_test_database(monkeypatch, tmp_path)
-    position_id = db.open_position(
-        "NIFTY26DECFUT", 65, 25_800.0, mode=LIVE, trailing_stop=25_750.0,
-        strategy_id=db.DEFAULT_STRATEGY_ID,
-    )
-    db.set_position_protective_order(position_id, "slm-1", 25_750.0, "REJECTED")
-
-    assert len(db.positions_needing_protection(LIVE)) == 1
-
-
 def test_order_type_rejects_a_stop_order(monkeypatch) -> None:
     """ORDER_TYPE is used for entries and exits, and only LIMIT forwards a price.
 
     An SL or SL-M here would send an order with no trigger price, which the
-    exchange rejects - and the protective stop is placed separately as its own
-    SL-M, so there is no reason to configure one.
+    exchange rejects - and this bot places no stop orders at all, so there is no
+    reason to configure one.
     """
     import config
 
     monkeypatch.setattr(
         config, "settings",
         SimpleNamespace(
-            order_type="SL-M", protective_stops=True, is_live_configured=True,
+            order_type="SL-M", is_live_configured=True,
             execution_mode="PAPER", access_token="t",
         ),
     )
@@ -11274,7 +10226,7 @@ def test_order_type_accepts_market_and_limit(monkeypatch) -> None:
         monkeypatch.setattr(
             config, "settings",
             SimpleNamespace(
-                order_type=value, protective_stops=True, is_live_configured=True,
+                order_type=value, is_live_configured=True,
                 execution_mode="PAPER", access_token="t",
             ),
         )
@@ -11301,7 +10253,7 @@ def test_duplicate_strategy_ids_are_reported(monkeypatch) -> None:
     monkeypatch.setattr(
         config, "settings",
         SimpleNamespace(
-            order_type="MARKET", protective_stops=True, is_live_configured=True,
+            order_type="MARKET", is_live_configured=True,
             execution_mode="PAPER", access_token="t",
         ),
     )
@@ -11324,7 +10276,7 @@ def test_distinct_strategy_ids_are_not_reported(monkeypatch) -> None:
     monkeypatch.setattr(
         config, "settings",
         SimpleNamespace(
-            order_type="MARKET", protective_stops=True, is_live_configured=True,
+            order_type="MARKET", is_live_configured=True,
             execution_mode="PAPER", access_token="t",
         ),
     )
@@ -11340,92 +10292,6 @@ def test_distinct_strategy_ids_are_not_reported(monkeypatch) -> None:
 # level is the one that had drifted: the 60m book's 100-point trail engaged from
 # the first profitable tick and replaced its 200-point stop with a 100-point one.
 # ---------------------------------------------------------------------------
-
-def test_gift_15m_trail_waits_for_fifty_points() -> None:
-    """50-pt stop holds until +50, then a 30-pt trail takes over."""
-    import stops
-
-    rules = stops.StopRules(50, 5, 50, 30)
-    entry = 25_000.0
-    stop = stops.initial_stop(entry, stops.LONG, rules)
-    assert stop == 24_950.0
-
-    # Below +50 the initial stop is the protection - the 5-pt trail must not
-    # replace it, or the position would be protected at 5 points from entry.
-    for mark in (25_010.0, 25_030.0, 25_049.0):
-        state, breached = stops.evaluate(
-            entry_price=entry, position_key=stops.LONG, mark=mark,
-            rules=rules, current_stop=stop, best_price=entry,
-        )
-        assert state.current == 24_950.0, f"stop moved at +{mark - entry}"
-        assert not breached
-
-    # At +50 the trail activates at 30 points behind the best price.
-    state, _ = stops.evaluate(
-        entry_price=entry, position_key=stops.LONG, mark=25_050.0,
-        rules=rules, current_stop=24_950.0, best_price=entry,
-    )
-    assert state.current == 25_020.0
-
-
-def test_nifty_60m_trail_waits_for_two_hundred_points() -> None:
-    """200-pt stop holds until +200, then a 100-pt trail takes over."""
-    import stops
-
-    rules = stops.StopRules(200, 100, 200, 100)
-    entry = 25_000.0
-    stop = stops.initial_stop(entry, stops.LONG, rules)
-    assert stop == 24_800.0
-
-    # The 100-pt trail must not engage before +200. It used to, which halved the
-    # protection: the position was stopped 100 points from entry instead of 200.
-    for mark in (25_100.0, 25_150.0, 25_199.0):
-        state, breached = stops.evaluate(
-            entry_price=entry, position_key=stops.LONG, mark=mark,
-            rules=rules, current_stop=stop, best_price=entry,
-        )
-        assert state.current == 24_800.0, f"stop moved at +{mark - entry}"
-        assert not breached
-
-    # At +200 the trail activates, 100 points behind the best price.
-    state, _ = stops.evaluate(
-        entry_price=entry, position_key=stops.LONG, mark=25_200.0,
-        rules=rules, current_stop=24_800.0, best_price=entry,
-    )
-    assert state.current == 25_100.0
-
-
-def test_a_short_trails_in_the_profitable_direction_only() -> None:
-    """The same rules mirrored: a short's stop only ever falls."""
-    import stops
-
-    rules = stops.StopRules(50, 5, 50, 30)
-    entry = 25_000.0
-    stop = stops.initial_stop(entry, stops.SHORT, rules)
-    assert stop == 25_050.0
-
-    state, _ = stops.evaluate(
-        entry_price=entry, position_key=stops.SHORT, mark=24_950.0,
-        rules=rules, current_stop=stop, best_price=entry,
-    )
-    assert state.current == 24_980.0
-
-    # A mark that gives back profit must not loosen the stop. 24,975 is still
-    # below the 24,980 stop, so the position is protected but not yet out.
-    state, breached = stops.evaluate(
-        entry_price=entry, position_key=stops.SHORT, mark=24_975.0,
-        rules=rules, current_stop=24_980.0, best_price=24_950.0,
-    )
-    assert state.current == 24_980.0
-    assert not breached
-
-    # Trading back up through the stop is the breach.
-    _, breached = stops.evaluate(
-        entry_price=entry, position_key=stops.SHORT, mark=24_985.0,
-        rules=rules, current_stop=24_980.0, best_price=24_950.0,
-    )
-    assert breached
-
 
 def test_the_two_books_use_their_own_exit_rule() -> None:
     """GIFT 15m exits on NO_SIGNAL; NIFTY 60m holds through it."""

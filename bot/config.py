@@ -167,23 +167,13 @@ class Settings:
     # whose protection band is too wide. -1 lets Kite choose; empty leaves the
     # parameter off entirely so the broker's own default applies.
     market_protection: Optional[int] = _env_int_optional("MARKET_PROTECTION", -1)
-    # Whether to place an exchange-held SL-M behind every LIVE position. This is
-    # the difference between a stop that survives the bot dying and one that does
-    # not: the engine's stop is a software check on a mark loop, so a crash, a
-    # kill or an API outage leaves the position with no stop at all. On by
-    # default; turning it off is only reasonable for a broker account that cannot
-    # accept SL-M orders.
-    protective_stops: bool = _env_bool("PROTECTIVE_STOPS", True)
-
     # --- Risk / pricing ---------------------------------------------------
     lot_margin: float = _env_float("LOT_MARGIN", 150_000.0)
     # Stop opening new trades once the day's realised loss reaches this many
     # rupees. 0 disables the check. This is a portfolio-level circuit breaker,
-    # not a per-trade stop: the strategy's own signal plus each book's
-    # protective stop are the exits, and this only refuses *new* entries. Open
-    # positions are left alone - flattening them here would turn a bad day into
-    # a realised one at the worst possible moment, and they already carry their
-    # own stop.
+    # not a per-trade stop: the signal is the only exit, and this only refuses
+    # *new* entries. Open positions are left alone - flattening them here would
+    # turn a bad day into a realised one at the worst possible moment.
     max_daily_loss: float = _env_float("MAX_DAILY_LOSS", 0.0)
 
     # --- Alerting ---------------------------------------------------------
@@ -216,9 +206,8 @@ class Settings:
     # How often the mark loop reconciles unresolved orders against the Zerodha
     # order book. A late fill must be discovered while the bot is idle, not only
     # when it next tries to trade - otherwise a position can exist at the broker
-    # that the ledger does not know about, and its protective stop is never
-    # applied. 0 disables the periodic pass (startup and pre-order reconciliation
-    # still run).
+    # that the ledger does not know about. 0 disables the periodic pass (startup
+    # and pre-order reconciliation still run).
     reconcile_interval_seconds: float = _env_float("RECONCILE_INTERVAL_SECONDS", 60.0)
     instrument_refresh_seconds: int = _env_int("INSTRUMENT_REFRESH_SECONDS", 3600)
     quote_poll_seconds: int = _env_int("QUOTE_POLL_SECONDS", 5)
@@ -344,18 +333,13 @@ def validate() -> list[str]:
         warnings.append("EXECUTION_MODE=LIVE but Kite credentials are incomplete.")
     # ORDER_TYPE is used for entries *and* exits, and the client only forwards a
     # price for LIMIT. An SL or SL-M here would send an order with no trigger
-    # price - which the exchange rejects - and the protective stop is placed
-    # separately as its own SL-M, so there is no reason to configure one here.
+    # price, which the exchange rejects - and this bot places no stop orders at
+    # all, so there is no reason to configure one here.
     order_type = str(settings.order_type or "").upper()
     if order_type not in {"MARKET", "LIMIT"}:
         warnings.append(
             f"ORDER_TYPE={settings.order_type!r} is not supported for entries and exits; "
-            "use MARKET or LIMIT. Protective stops are placed as their own SL-M."
-        )
-    if not getattr(settings, "protective_stops", True) and mode == LIVE:
-        warnings.append(
-            "PROTECTIVE_STOPS is off: LIVE positions will have no exchange-held stop "
-            "and are protected only while this process is running."
+            "use MARKET or LIMIT."
         )
     # Two books sharing an id share one ledger, one account and one set of
     # positions. The engine would build both, the dashboard would show two bands
@@ -411,28 +395,6 @@ class StrategyConfig:
     # in paper, which is the safe direction: an unset flag must never be what
     # puts real money on a signal the operator has not thought about.
     live: bool = False
-    # Protective stop, in index points, measured on the *futures* execution
-    # price. ``stop_loss`` is the initial distance from the fill; the trail
-    # activates at ``trail_after`` points of open profit and then follows the
-    # best price at ``trail_points`` (or ``trail_points_after`` once the wider
-    # band is reached). Zero disables the corresponding piece, so a book with
-    # ``stop_loss=0`` keeps the signal-only exit it had before.
-    stop_loss: float = 0.0
-    trail_points: float = 0.0
-    trail_after: float = 0.0
-    trail_points_after: float = 0.0
-
-    @property
-    def stop_rules(self) -> Any:
-        """This book's stop configuration, as the ``stops`` module reads it."""
-        import stops
-
-        return stops.StopRules(
-            initial_points=self.stop_loss,
-            trail_points=self.trail_points,
-            trail_after=self.trail_after,
-            trail_points_after=self.trail_points_after,
-        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,10 +409,6 @@ class StrategyConfig:
             "filter_adx": self.filter_adx,
             "filter_ma": self.filter_ma,
             "live": self.live,
-            "stop_loss": self.stop_loss,
-            "trail_points": self.trail_points,
-            "trail_after": self.trail_after,
-            "trail_points_after": self.trail_points_after,
         }
 
     def strategy_params(self) -> dict[str, Any]:
@@ -470,19 +428,16 @@ class StrategyConfig:
 def strategy_configs() -> list[StrategyConfig]:
     """The two strategies this bot runs. There are no others.
 
-    * **GIFT NIFTY 15m** - reads ``NSEIX:GIFT NIFTY`` on 15 minutes, exits on a
-      confirmed ``NO_SIGNAL``, 50-point stop, 5-point trail widening to 30 once
-      the trade is 50 points up.
-    * **NIFTY 60m** - reads ``NSE:NIFTY 50`` on 60 minutes, exits on a flip,
-      200-point stop, 100-point trail once the trade is 200 points up.
+    * **GIFT NIFTY 15m** - reads ``NSEIX:GIFT NIFTY`` on 15 minutes, exits on the
+      first confirmed ``NO_SIGNAL`` bar.
+    * **NIFTY 60m** - reads ``NSE:NIFTY 50`` on 60 minutes, exits on a flip.
 
-    Both execute on the NFO NIFTY future. The source, timeframe, exit rule and
-    stop parameters are the specification, so they come from
+    Neither carries a stop-loss or a trailing stop: the signal is the only exit.
+    Both execute on the NFO NIFTY future. The source, timeframe and exit rule are
+    the specification, so they come from
     :data:`DEFAULT_STRATEGIES` rather than from the environment. A ``.env`` that
-    omitted ``STRATEGY_<n>_STOP_LOSS`` used to leave that book with **no stop at
-    all** - the one state a trading bot must never reach by omission - and one
-    that set ``STRATEGY_3_INTERVAL=60minute`` silently moved the 15-minute book
-    onto 60-minute bars.
+    set ``STRATEGY_3_INTERVAL=60minute`` silently moved the 15-minute book onto
+    60-minute bars.
 
     ``STRATEGY_<n>_*`` still tunes the operational knobs: ``ID``, ``NAME``,
     ``LOTS``, ``ENABLED``, ``LIVE`` and the entry filters. Anything numbered above
@@ -492,6 +447,23 @@ def strategy_configs() -> list[StrategyConfig]:
 
 
 # The two strategies, as specified. Order is the display order.
+#
+# There is no stop-loss and no trailing stop. The signal is the only exit:
+#
+#   * ``gift-15m`` closes on the first ``NO_SIGNAL`` bar - the pair disagreeing.
+#   * ``nifty-60m`` closes when the pair turns the *other* way, holding through
+#     ``NO_SIGNAL``.
+#
+# Both re-enter on the next fresh signal, with no manual step. A fixed or
+# trailing stop is a second exit rule competing with the signal, and it wins
+# that competition on most trades - it closes at a fixed distance from the best
+# price, so a trade that would have run to a full trend reversal is cut short.
+# Measured on three years of session-gated 60-minute GIFT bars with 10 points of
+# adverse slippage, every trail distance tested reduced net on both books.
+#
+# The cost is deliberate and must be understood before running this with money:
+# a trade can run to a large open profit and give all of it back, closing at the
+# signal instead. There is no level at which a single loss is capped.
 DEFAULT_STRATEGIES: tuple[dict[str, Any], ...] = (
     {
         "index": 1,
@@ -499,12 +471,8 @@ DEFAULT_STRATEGIES: tuple[dict[str, Any], ...] = (
         "name": "GIFT NIFTY 15m",
         "source": "gift",
         "interval": "15minute",
-        # ``flat`` closes on a confirmed NO_SIGNAL; ``flip`` holds through it.
+        # ``flat`` closes on the first confirmed NO_SIGNAL bar.
         "exit": "flat",
-        "stop_loss": 50.0,
-        "trail_points": 5.0,
-        "trail_after": 50.0,
-        "trail_points_after": 30.0,
     },
     {
         "index": 2,
@@ -512,11 +480,8 @@ DEFAULT_STRATEGIES: tuple[dict[str, Any], ...] = (
         "name": "NIFTY 60m",
         "source": "nifty",
         "interval": "60minute",
+        # ``flip`` holds through NO_SIGNAL and closes when the pair reverses.
         "exit": "flip",
-        "stop_loss": 200.0,
-        "trail_points": 100.0,
-        "trail_after": 200.0,
-        "trail_points_after": 100.0,
     },
 )
 
@@ -524,8 +489,8 @@ DEFAULT_STRATEGIES: tuple[dict[str, Any], ...] = (
 def _default_strategy(spec: dict[str, Any]) -> StrategyConfig:
     """One of the two strategies, with its operational knobs overridable.
 
-    The identity - source, timeframe, exit rule, stop, trail and display name - is
-    the specification and is not read from the environment. Only the knobs an
+    The identity - source, timeframe, exit rule and display name - is the
+    specification and is not read from the environment. Only the knobs an
     operator legitimately varies per deployment are: the ledger id, the size,
     whether it starts, its initial mode, and the entry filters.
 
@@ -547,10 +512,6 @@ def _default_strategy(spec: dict[str, Any]) -> StrategyConfig:
         filter_adx=_env_float(prefix + "FILTER_ADX", 0.0),
         filter_ma=_env_int(prefix + "FILTER_MA", 0),
         live=_env_bool(prefix + "LIVE", False),
-        stop_loss=spec["stop_loss"],
-        trail_points=spec["trail_points"],
-        trail_after=spec["trail_after"],
-        trail_points_after=spec["trail_points_after"],
     )
 
 

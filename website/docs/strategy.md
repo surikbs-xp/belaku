@@ -59,12 +59,9 @@ held until SuperTrend and PSAR turn the *other* way, and then closed in full. A
 `NO_SIGNAL` bar says nothing about a position already on, so it is carried rather
 than cut. There is no profit target.
 
-Each book also carries a **protective stop-loss and trailing stop**, measured on
-the futures execution price and configured per strategy (see
-[Running multiple strategies](./multi-strategy.md#the-two-strategies)). The stop
-is a backstop that caps a single loss; it does not change when a winning trend is
-closed. The initial stop is in force from the fill, and the trail only takes over
-once the position is in profit — it never widens.
+Neither book carries a **stop-loss or a trailing stop**. The signal is the only
+exit, so a single loss is not capped by a level and open profit can be given
+back. See [why there is no trail](./multi-strategy.md#why-there-is-no-trail).
 
 The exit is a **transition**, exactly like the entry. A run of opposite bars is
 one exit, not one per bar — otherwise every bar of the new trend would be a no-op
@@ -118,6 +115,17 @@ not generate or execute a trade outside the permitted session, and neither may
 the NIFTY 60m strategy. See
 [Execution](/execution#two-strategies-one-instrument) for how the two books
 differ.
+
+The session gate is applied to the **signal series itself**, not only to order
+placement. A bar that closes outside 09:15–15:30 never reaches the strategy, so
+it can neither shape the indicator state nor latch an entry for the next open.
+GIFT Nifty quotes ~20 hours a day while the NFO future trades 6¼, so without
+this gate half of all fresh signals fired out of session and had to be deferred
+to 09:15 — by which time the market had usually moved past the level the signal
+was taken at. Measured over three years of 60-minute GIFT bars, the median drift
+between the signal bar's close and the first in-session fill was **60 points**,
+against a 50-point stop on the 15-minute book. See
+[Backtesting](/backtesting#the-session-gate) for the measured effect.
 
 ## SuperTrend
 
@@ -179,14 +187,12 @@ identifiable after the fact rather than silently trusted.
 
 ## What the strategy does not have
 
-:::note[Signal exit plus a protective stop]
-The primary exit is the signal flipping, or a manual square-off. Each book also
-carries a protective stop-loss and trailing stop, measured on the **futures
-execution price** and configured per strategy — see
-[Running multiple strategies](./multi-strategy.md#the-two-strategies) for the
-levels. The stop is the backstop that caps a single loss; the signal is still what
-closes a winning trend. Performance is expressed in rupees and raw index points,
-not in R-multiples.
+:::note[The signal is the only exit]
+The exit is the signal flipping, or a manual square-off. There is **no stop-loss
+and no trailing stop**, so a single loss is not capped by a level and open profit
+can be given back. See
+[why there is no trail](./multi-strategy.md#why-there-is-no-trail). Performance is
+expressed in rupees and raw index points, not in R-multiples.
 :::
 
 :::note[What this costs]

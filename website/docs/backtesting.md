@@ -102,6 +102,45 @@ An earlier check on the futures overlap produced 55.6% win and +₹210,214 over
 trades is not a sample; it is an anecdote. The bootstrap interval on it included
 zero, which was the signal that it could not be trusted.
 
+## The session gate
+
+The signal series is restricted to bars that overlap the 09:15–15:30 NSE
+session. GIFT Nifty quotes ~20 hours a day; the NFO future trades 6¼. A bar that
+closes outside the session can only produce a signal that has to be latched until
+the next open, and by then the market has usually moved.
+
+Measured on the same three years of 60-minute GIFT bars (16,226 bars, of which
+**5,448 — 33.6% — are in session**):
+
+| | Fresh signals | Share |
+|---|---|---|
+| In session | 480 | 49.7% |
+| **Out of session (latched)** | **486** | **50.3%** |
+
+The drift between the signal bar's close and the first in-session fill:
+
+| Metric | Value |
+|---|---|
+| Median | **60.0 pt** |
+| Mean | 83.6 pt |
+| p90 | 177.5 pt |
+| Max | 717.5 pt |
+
+Against the 15-minute book's 50-point stop, **56.6% of latched entries were
+already past the stop before the position existed**.
+
+Gating the series changes the result materially. Shipped stop/trail settings,
+60-minute book, 10 points of adverse slippage on every stop fill:
+
+| Series | n | win | PF | net |
+|---|---|---|---|---|
+| All hours | 614 | 44.6% | 1.18 | −₹54,088 |
+| **Session-gated** | 281 | **50.9%** | **1.31** | **+₹242,793** |
+
+The gate is worth more than any stop or trail tuning tested, and it is a
+structural fix rather than a fitted parameter: it removes trades the execution
+venue could never have taken at the price the signal assumed.
+
 ## Conclusions to carry forward
 
 1. **The exit rule is not the problem.** Flip is modestly better than flat on the

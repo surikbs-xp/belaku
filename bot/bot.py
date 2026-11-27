@@ -377,8 +377,7 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
     # Reconciliation is a broker round-trip, so it runs on its own slower clock
     # than the mark. A late fill must be discovered while the bot is idle: the
     # startup and pre-order passes alone leave a window in which a position
-    # exists at the broker that the ledger does not know about, and an unknown
-    # position has no protective stop.
+    # exists at the broker that the ledger does not know about.
     reconcile_every = float(getattr(settings, "reconcile_interval_seconds", 60.0) or 0.0)
     last_reconcile = 0.0
     log.info("Mark loop started (every %.1fs)", period)
@@ -400,15 +399,6 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
                     summary = manager.reconcile_orders(LIVE)
                     if summary.get("filled") or summary.get("closed"):
                         log.warning("Periodic order reconciliation: %s", summary)
-                    # Then make sure every open LIVE position still has a resting
-                    # exchange-held stop at the right level. This is the pass that
-                    # catches a placement that failed, a modify the exchange
-                    # rejected, and a stop that fired while the bot was not
-                    # looking - none of which the order reconcile above can see,
-                    # because a protective order is not an entry or an exit.
-                    protection = manager.reconcile_protective_stops(LIVE)
-                    if protection.get("placed") or protection.get("moved") or protection.get("failed"):
-                        log.warning("Periodic protective stop reconcile: %s", protection)
             except Exception:  # pragma: no cover - network
                 log.exception("Periodic order reconciliation failed")
         try:
@@ -418,18 +408,11 @@ def mark_loop(stop: threading.Event, interval: Optional[float] = None) -> None:
             # limited and that would be ~16k calls a session.
             get_feed().refresh_exec_quote()
             # Every open position, across both ledgers: a book that is live
-            # while the process is in PAPER must still be marked, or its
-            # protective stop is silently skipped.
+            # while the process is in PAPER must still be marked, or its P&L is
+            # silently stale.
             prices = manager.price_map()
             if prices:
                 db.mark_open_positions(None, prices)
-                # Protective stops run on the live futures price, not on a bar
-                # close, and are not gated on the pause switch: pausing blocks
-                # entries, and a position already on must stay protected.
-                try:
-                    get_engine().check_stops(prices)
-                except Exception:  # pragma: no cover - defensive
-                    log.exception("Stop check failed")
         except Exception as exc:  # pragma: no cover - network
             log.warning("Execution quote refresh failed: %s", exc)
         try:
@@ -551,44 +534,6 @@ class BookManualOrderRequest(BaseModel):
     )
 
 
-class BookStopRequest(BaseModel):
-    """Move one book's protective stop.
-
-    The engine's trail only ever tightens, so an override is held to the same
-    rule: the new level must be on the protective side of the entry and no
-    further from the market than the level already in force. A looser stop is
-    refused rather than stored, because the engine would re-tighten it on the
-    next mark and the operator would be looking at a level that is not real.
-    """
-
-    strategy_id: str = Field(
-        ..., min_length=1, max_length=64, description="The book whose stop to move"
-    )
-    # Either a price or a distance, never both. A distance is what a trader
-    # actually thinks in ("give it 40 more points"), and converting it here
-    # rather than in the browser keeps one definition of the level: the price
-    # the engine stores.
-    stop: Optional[float] = Field(
-        default=None, gt=0, description="New stop price, in index points"
-    )
-    distance: Optional[float] = Field(
-        default=None,
-        gt=0,
-        description="Points between the current mark and the new stop. "
-        "Mutually exclusive with `stop`.",
-    )
-    confirm: bool = Field(
-        default=False,
-        description="Must be true; this changes the level protecting a real position.",
-    )
-    reason: str = Field(
-        default="MANUAL_SL",
-        max_length=200,
-        pattern=r"^[\w \-.:/@()\[\]]*$",
-        description="Audit label",
-    )
-
-
 class PanicRequest(BaseModel):
     confirm: bool = Field(
         default=False,
@@ -653,21 +598,6 @@ async def lifespan(app: FastAPI):
                 _lifecycle_alert(
                     "RECONCILE_FAILED",
                     f"Startup reconciliation failed: {sync_error}",
-                    "error",
-                )
-            # A restart is the case the exchange-held stop exists for. The
-            # position survived the crash; the SL-M may not have been placed yet,
-            # or may have been placed and then lost. Either way, until this pass
-            # runs, a LIVE position is protected only by a process that has just
-            # proved it can die.
-            protection = manager.reconcile_protective_stops(LIVE)
-            if protection.get("placed") or protection.get("moved") or protection.get("failed"):
-                log.warning("Startup protective stop reconcile: %s", protection)
-            if protection.get("failed"):
-                _lifecycle_alert(
-                    "UNPROTECTED_POSITION",
-                    f"{protection['failed']} LIVE position(s) have no exchange-held stop. "
-                    "Only the software stop protects them.",
                     "error",
                 )
     except Exception as exc:  # pragma: no cover - network
@@ -1209,77 +1139,25 @@ def _enrich_positions(
         # timestamps so it survives a restart and reads the same for a closed row.
         row["duration_seconds"] = _trade_duration_seconds(row)
         row["duration"] = _format_duration(row["duration_seconds"])
-        # The protective stop, straight from the ledger row the engine writes.
-        # These used to be hardcoded to None on the belief that the strategy had
-        # no stop - which stopped being true when per-book stops were added, and
-        # meant the dashboard could never show the level the engine was actually
-        # enforcing. The position card reads these, so a None here is a stop the
-        # operator cannot see.
-        entry_price = float(row["entry_price"])
-        initial_stop = row.get("initial_sl_price")
-        current_stop = row.get("trailing_stop")
-        row["initial_stop_price"] = initial_stop
-        row["stop_price"] = current_stop
-        row["trailing"] = current_stop
-        # How far the stop has moved from its initial level, in points. Zero
-        # means the trail has not engaged; a positive number is how much of the
-        # move the stop has locked in.
-        if initial_stop is not None and current_stop is not None:
-            row["stop_locked_points"] = round(
-                (float(current_stop) - float(initial_stop)) * key, 2
-            )
-            row["trailing_tightened"] = abs(float(current_stop) - float(initial_stop)) > 1e-9
-        else:
-            row["stop_locked_points"] = None
-            row["trailing_tightened"] = False
-        # Distance from the current mark to the stop, in points. This is the
-        # number that answers "how much room is left before I am out".
-        if current_stop is not None:
-            mark_for_stop = row.get("mark_price") or entry_price
-            row["stop_distance_points"] = round(
-                (float(mark_for_stop) - float(current_stop)) * key, 2
-            )
-        else:
-            row["stop_distance_points"] = None
-        row["stop_trailing"] = bool(row["trailing_tightened"])
-        row["initial_stop_distance"] = (
-            round((entry_price - float(initial_stop)) * key, 2)
-            if initial_stop is not None else None
-        )
+        # There is no stop. The signal is the only exit, so a position carries no
+        # stop level and no exchange-held SL-M. The keys are still published as
+        # None so a dashboard built against the older shape reads them without
+        # error rather than showing a stale level.
+        row["initial_stop_price"] = None
+        row["stop_price"] = None
+        row["trailing"] = None
+        row["stop_locked_points"] = None
+        row["trailing_tightened"] = False
+        row["stop_distance_points"] = None
+        row["stop_trailing"] = False
+        row["initial_stop_distance"] = None
         row["trailing_increment"] = None
-        row["trailing_distance"] = (
-            round((float(row.get("best_price") or entry_price) - float(current_stop)) * key, 2)
-            if current_stop is not None else None
-        )
-        row["best_price"] = row.get("best_price")
-        # The exchange-held stop. ``stop_price`` above is what the engine wants;
-        # this is what Zerodha is actually holding. They can differ when a trail
-        # moved in the ledger but the broker modify failed, and that difference is
-        # the whole point of showing it: a position whose broker stop is missing
-        # or stale is protected only by this process staying alive.
-        protective_id = row.get("protective_order_id")
-        protective_stop = row.get("protective_stop")
-        protective_status = row.get("protective_status")
-        row["protective_order_id"] = protective_id
-        row["protective_stop"] = protective_stop
-        row["protective_status"] = protective_status
-        if row["status"] != "OPEN":
-            row["protection"] = "CLOSED"
-        elif row.get("mode") != LIVE:
-            row["protection"] = "PAPER"
-        elif not protective_id:
-            row["protection"] = "NONE"
-        elif str(protective_status or "").upper() not in {"TRIGGER_PENDING", "OPEN"}:
-            row["protection"] = "STALE"
-        elif (
-            protective_stop is not None and current_stop is not None
-            and abs(float(protective_stop) - float(current_stop)) > 1e-9
-        ):
-            # Resting, but at a different level than the ledger. Still protecting,
-            # just not as tightly as the dashboard's stop says.
-            row["protection"] = "LAGGING"
-        else:
-            row["protection"] = "PROTECTED"
+        row["trailing_distance"] = None
+        row["best_price"] = None
+        row["protective_order_id"] = None
+        row["protective_stop"] = None
+        row["protective_status"] = None
+        row["protection"] = "SIGNAL_ONLY"
         row["exit_status"] = (
             "OPEN" if row["status"] == "OPEN"
             else (exit_reasons.get(row["id"]) or "CLOSED")
@@ -1522,37 +1400,6 @@ def _live_readiness() -> dict[str, Any]:
                     else f"Zerodha {sync['broker']} != ledger {sync['ledger']}"
                 ),
             )
-
-    # Is every open LIVE position backed by an exchange-held stop? This is the
-    # check that distinguishes "the bot is watching" from "the position is
-    # protected". The engine's stop is a software check on a mark loop, so a
-    # crash, a kill or an API outage leaves a position with no stop at all -
-    # which is exactly the state this report exists to refuse.
-    if getattr(settings, "protective_stops", True):
-        try:
-            unprotected = db.positions_needing_protection(LIVE)
-            add(
-                "protective_stops",
-                not unprotected,
-                (
-                    "Every open LIVE position has an exchange-held stop"
-                    if not unprotected
-                    else f"{len(unprotected)} LIVE position(s) have no resting SL-M: "
-                         + ", ".join(sorted({p['symbol'] for p in unprotected}))
-                ),
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            add("protective_stops", False, f"Could not check protective stops: {exc}")
-    else:
-        # Reported rather than omitted: an operator who turned the feature off
-        # should see that LIVE positions are software-protected only, not have the
-        # check silently disappear from the report.
-        add(
-            "protective_stops",
-            False,
-            "PROTECTIVE_STOPS is off: LIVE positions have no exchange-held stop",
-            blocking=False,
-        )
 
     # Can the account actually fund one lot? Every check above is about
     # configuration and reconciliation, and all of them pass just as happily on an
@@ -2015,12 +1862,7 @@ def api_book_manual_order(request: BookManualOrderRequest) -> dict[str, Any]:
         # A manual order is not a bar signal, so it carries no bar timestamp and
         # must not be aged out by the staleness check.
         "max_age_seconds": 0,
-        # The book's own stop rules, so a manual entry is protected exactly like
-        # an automated one. Without this the position would run unprotected.
-        "stop_rules": run.stop_rules.to_dict() if run.stop_rules else None,
     }
-    if not payload["stop_rules"]:
-        payload.pop("stop_rules")
 
     result = manager.process_signal(
         payload, source="MANUAL", strategy_id=run.id, mode=mode
@@ -2032,117 +1874,6 @@ def api_book_manual_order(request: BookManualOrderRequest) -> dict[str, Any]:
         action, run.id, mode, result.ok, result.reason,
     )
     return body
-
-
-@app.post("/api/books/stop", tags=["control"])
-def api_book_stop(request: BookStopRequest) -> dict[str, Any]:
-    """Move one book's protective stop, tightening only.
-
-    Scoped to ``strategy_id`` so it can never touch the other book's leg in the
-    same contract. The level is written to the ledger row the engine reads, so
-    the next mark continues the trail from the operator's level rather than
-    overwriting it - the override is a real change to the protection, not a
-    display-only annotation.
-    """
-    if not request.confirm:
-        raise HTTPException(
-            status_code=400,
-            detail="Changing a stop requires confirm=true - it alters the level protecting a position.",
-        )
-    if request.stop is None and request.distance is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Supply either `stop` (a price) or `distance` (points from the mark).",
-        )
-    if request.stop is not None and request.distance is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Supply `stop` or `distance`, not both - they would disagree.",
-        )
-    run = _find_run(request.strategy_id)
-    mode = run.mode()
-    positions = db.get_open_positions(mode=mode, strategy_id=run.id)
-    if not positions:
-        raise HTTPException(
-            status_code=409,
-            detail=f"{run.id} has no open position to protect.",
-        )
-
-    # A distance is resolved against the live mark, not the entry: "40 points
-    # away" means 40 from where the market is now, which is the number the
-    # operator is looking at. The mark comes from the same price map the stop
-    # check uses, so the level this produces is the level the engine will test.
-    resolved_stop = request.stop
-    mark_used: Optional[float] = None
-    if resolved_stop is None:
-        manager = get_order_manager()
-        prices = manager.price_map(mode)
-        mark_used = prices.get(positions[0]["symbol"])
-        if mark_used is None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "No live price for the position, so a distance cannot be "
-                    "resolved. Supply an explicit `stop` price instead."
-                ),
-            )
-        key = int(positions[0]["position_key"])
-        # A long's stop sits below the mark, a short's above it.
-        resolved_stop = round(float(mark_used) - key * float(request.distance), 2)
-
-    # One position per book in practice; if a partial fill left more than one,
-    # the stop is applied to each so none is left unprotected.
-    results: list[dict[str, Any]] = []
-    protection: list[dict[str, Any]] = []
-    for position in positions:
-        try:
-            results.append(db.set_position_stop(position["id"], resolved_stop))
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        # The exchange-held stop has to move with the ledger one, or the operator
-        # would tighten the level on screen while the broker kept protecting the
-        # old one - the dashboard would show a stop that is not the stop.
-        try:
-            protection.append(
-                get_order_manager().move_protective_stop(
-                    {**position, "trailing_stop": resolved_stop}, float(resolved_stop)
-                )
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            log.exception("Could not move the protective stop for %s", position["id"])
-            protection.append({"ok": False, "message": str(exc)})
-
-    log.warning(
-        "Manual stop %s (%s): %s -> %s (%s)%s",
-        run.id, mode,
-        results[0]["previous_stop"], results[0]["stop"], request.reason,
-        f" [from {request.distance:g} pts at mark {mark_used:.2f}]" if mark_used else "",
-    )
-    # Report the broker side separately from the ledger side. They can disagree -
-    # the ledger write succeeds and the exchange modify fails - and an operator
-    # who is told only "stop moved" would believe the exchange is protecting a
-    # level it is not.
-    protected = all(p.get("ok") for p in protection) if protection else None
-    return {
-        "ok": True,
-        "strategy_id": run.id,
-        "mode": mode,
-        "stop": results[0]["stop"],
-        "previous_stop": results[0]["previous_stop"],
-        "initial_stop": results[0]["initial_stop"],
-        "entry_price": results[0]["entry_price"],
-        "side": results[0]["side"],
-        "mark": mark_used,
-        "distance": request.distance,
-        "positions_updated": len(results),
-        "broker_stop_updated": protected,
-        "broker_stop_message": (
-            None if protected is None
-            else (protection[0].get("message") if protection else None)
-        ),
-    }
 
 
 @app.post("/api/risk/clear", tags=["control"])
@@ -2191,8 +1922,8 @@ def api_stop_all(request: StopAllRequest) -> dict[str, Any]:
     Deliberately separate from PANIC. PANIC tries to flatten everything, which
     is the right action when the bot can see the broker. STOP ALL is for when it
     cannot: it stops the bot opening anything new and leaves existing positions
-    to their protective stops and to a human, rather than assuming a square-off
-    succeeded. The latch is persisted, so a restart does not resume trading.
+    to a human, rather than assuming a square-off succeeded. The latch is
+    persisted, so a restart does not resume trading.
     """
     if not request.confirm:
         raise HTTPException(status_code=400, detail="STOP ALL requires confirm=true")
@@ -2206,7 +1937,7 @@ def api_stop_all(request: StopAllRequest) -> dict[str, Any]:
         "paused_books": manager.paused_books(),
         "note": (
             "New entries are blocked in every book. Open positions are NOT closed "
-            "and keep their protective stops; square off manually if required."
+            "and have no stop; square off manually if required."
         ),
     }
 

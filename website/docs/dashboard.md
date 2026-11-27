@@ -30,7 +30,7 @@ The trading view. Top to bottom:
   | **Indicators & rule checks** | One row per indicator. Each states its level, its own direction, the distance price must travel to flip it, and whether it agrees with the verdict. A gap under a quarter of the bar's own range turns amber. The close the verdict used sits above the rows |
   | **Account** | That book's own equity, net P&L, trade count, win rate and profit factor |
   | **Position** | What that book currently holds, or `Flat` |
-  | **Stop** | The initial and current trailing stop, from the open position's own row. When a position is open an **Edit** button moves the level, by price or by points from the live mark (`d40` = 40 points away). It may only tighten, never widen, matching the engine's own trail. The points between the mark and the stop are shown beside the level. A LIVE position also carries an **SL-M** badge for the exchange-held stop behind it — `SL-M` when it rests at the ledger's level, `SL-M lag` when the exchange still holds an older one, `NO SL-M` when there is none and only the software stop protects the position |
+  | **Exit** | Which signal event closes the book — `NO_SIGNAL` for the 15-minute book, `flip` for the 60-minute one. There is no stop-loss and no trailing stop, so there is no level to show or edit |
 
   Indicators and rule checks share one table because they are the same two
   numbers read two ways. A single `2 of 2 confirmed` count hides *which*

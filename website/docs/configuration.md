@@ -68,8 +68,7 @@ your machine, anyone who can send a request can panic the account.
 | `RECONCILE_INTERVAL_SECONDS` | `60` | How often the mark loop reconciles unresolved orders against the Zerodha order book. `0` disables the periodic pass. |
 | `VIRTUAL_BALANCE` | `200000` | PAPER starting capital |
 | `PRODUCT` | `NRML` | `NRML` or `MIS` |
-| `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT`. Not `SL`/`SL-M`: the protective stop is placed as its own SL-M, and an entry order type of `SL-M` would be sent with no trigger price. |
-| `PROTECTIVE_STOPS` | `true` | Place an exchange-held SL-M behind every LIVE position. See [Protective stops](#protective-stops). |
+| `ORDER_TYPE` | `MARKET` | `MARKET` or `LIMIT`. Not `SL`/`SL-M`: an entry order type of `SL-M` would be sent with no trigger price, and this bot places no stop orders at all. |
 | `MARKET_PROTECTION` | `-1` | Zerodha's market-protection band in ticks. `-1` lets Kite choose; empty omits the parameter. |
 | `SLIPPAGE_TICKS` | `1.0` | Adverse-tick fallback for a paper fill with no order-book depth |
 | `TICK_SIZE` | `0.05` | Nifty futures tick |
@@ -187,26 +186,13 @@ also explains why two strategies in one contract can cancel each other.
 | `STRATEGY_<n>_LOTS` | `1` | Position size for that run. |
 | `STRATEGY_<n>_ENABLED` | `1` | `0` configures it without starting it. |
 | `STRATEGY_<n>_LIVE` | `0` | Initial LIVE/PAPER choice; the dashboard toggle persists it. |
-| `STRATEGY_<n>_STOP_LOSS` | `0` | Initial stop, in index points, from the futures fill. `0` disables stops. |
-| `STRATEGY_<n>_TRAIL_POINTS` | `0` | Trail distance before the wider band. |
-| `STRATEGY_<n>_TRAIL_AFTER` | `0` | Open profit (points) at which the wider trail takes over. |
-| `STRATEGY_<n>_TRAIL_POINTS_AFTER` | `0` | Trail distance once `TRAIL_AFTER` is reached. |
 | `STRATEGY_<n>_FILTER_ADX` | *(off)* | Only enter when ADX(14) exceeds this. |
 | `STRATEGY_<n>_FILTER_MA` | *(off)* | Only enter on the trend's side of this SMA. |
 
-The shipped configuration sets the stops the two strategies are specified with:
-
-| | GIFT 15m | NIFTY 60m |
-|---|---|---|
-| `STOP_LOSS` | 50 | 200 |
-| `TRAIL_POINTS` | 5 | 100 |
-| `TRAIL_AFTER` | 50 | 200 |
-| `TRAIL_POINTS_AFTER` | 30 | 100 |
-
-Every stop is measured on the **futures execution price**, never on the signal
-index, and it only ever moves in the profitable direction — it never widens. It
-is checked on the live futures price every mark cycle, not on a bar close, and it
-stays active while the book is paused.
+There is no stop-loss to configure. Neither book carries an initial stop or a
+trailing stop: the signal is the only exit, so `STRATEGY_<n>_STOP_LOSS` and the
+`TRAIL_*` keys no longer exist. See
+[why there is no trail](./multi-strategy.md#why-there-is-no-trail).
 
 **Neither filter is recommended.** Measured on three years of NIFTY 60-minute
 bars, ADX makes the net monotonically worse — ADX>15 drops it from ₹160,318 to
@@ -295,18 +281,17 @@ when it falls back to this number. Set it conservatively.
 **There is no session loss cap.** It was removed: blocking new entries once the
 day's realised loss reached a limit sounds prudent, but it is a second, hidden
 strategy — it changes when the bot trades based on a number the strategy never
-looked at. Each book's protective stop and `MAX_OPEN_LOTS` are the exposure
-limits.
+looked at. `MAX_OPEN_LOTS` and `MAX_DAILY_LOSS` are the exposure limits.
 
-**`MAX_OPEN_LOTS` caps position size.** Each book also carries its own
-protective stop (`STRATEGY_<n>_STOP_LOSS` and the trail settings above), measured
-on the futures execution price. The signal is still the primary exit; the stop is
-the backstop that caps a single loss.
+**`MAX_OPEN_LOTS` caps position size.** There is no stop-loss: the signal is the
+only exit, so a single loss is not capped by a level. `MAX_DAILY_LOSS` blocks new
+entries once the day's settled loss reaches it, and never flattens an open
+position.
 
 `STOP_LOSS_POINTS`, `TRAILING_STOP_ENABLED`, `TRAILING_INITIAL_POINTS`,
 `TRAILING_STEP_POINTS`, `TRAILING_TIGHTEN_AT_POINTS`, `TRAILING_TIGHT_POINTS`,
 `LARGE_CANDLE_ATR_MULTIPLIER` and `LARGE_CANDLE_MAX_POINTS` are **no longer
-read**. Stops are configured per strategy with the `STRATEGY_<n>_*` keys above.
+read**. There is no stop-loss at all: the signal is the only exit.
 
 The signal exit is verified before it is reported: if the square-off did not
 fill, the position stays open and the exit is retried on the next bar rather than

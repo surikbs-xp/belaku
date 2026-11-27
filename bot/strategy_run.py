@@ -133,7 +133,6 @@ class StrategyRun:
         display_name: Optional[str] = None,
         enabled: bool = True,
         live: bool = False,
-        stop_rules: Any = None,
     ) -> None:
         self.id = (strategy_id or db.DEFAULT_STRATEGY_ID).strip() or db.DEFAULT_STRATEGY_ID
         self.source = source
@@ -145,9 +144,6 @@ class StrategyRun:
         # off for the same reason as the config default: an unset flag must not
         # be what arms a book.
         self.live = bool(live)
-        # This book's protective stop. ``None`` means the signal-only exit it had
-        # before stops existed, so an unconfigured book is unchanged.
-        self.stop_rules = stop_rules
         self.state = RunState()
 
         self._pending_signal: Optional[str] = None
@@ -362,10 +358,6 @@ class StrategyRun:
             # Which instruments carry this book's signals. The dashboard needs
             # this to show one card per strategy with a row per execution leg
             # rather than pretending each strategy is one position.
-            # The protective stop, so the dashboard can show the level and the
-            # rules behind it. ``stop_loss`` of zero means the book has no stop.
-            "stop_loss": getattr(self.stop_rules, "initial_points", 0.0) if self.stop_rules else 0.0,
-            "stop_rules": self.stop_rules.to_dict() if self.stop_rules else None,
             # The entry gates belong in the payload: a strategy labelled "ADX>15"
             # that is silently running unfiltered is worse than one with no
             # filter at all, because the label is what the operator trusts.

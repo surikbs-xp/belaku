@@ -2,8 +2,8 @@
 
 The strategy owns its own exit. A position is held for as long as SuperTrend and
 Parabolic SAR agree, and closed on the first bar they stop agreeing - so there is
-no per-trade stop-loss or profit target *in this module*. Those live in
-:mod:`stops`, which the engine applies per book.
+no per-trade stop-loss or profit target anywhere in the bot. The signal is the
+only exit.
 
 What remains here is the set of limits that are about the *portfolio* rather than
 about an individual trade:
@@ -15,7 +15,7 @@ about an individual trade:
 
 The daily cap blocks *entries* only. It never flattens an open position: doing so
 would turn a bad day into a realised one at the worst possible moment, and the
-position already has its own protective stop. ``MAX_DAILY_LOSS=0`` disables it.
+signal is what decides when a position ends. ``MAX_DAILY_LOSS=0`` disables it.
 """
 
 from __future__ import annotations
@@ -114,5 +114,5 @@ def limits() -> dict[str, Any]:
     return {
         "max_open_lots": settings.max_open_lots,
         "max_daily_loss": daily_loss_limit(),
-        "exit": "SIGNAL+STOP",
+        "exit": "SIGNAL",
     }

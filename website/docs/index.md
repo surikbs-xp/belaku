@@ -48,15 +48,15 @@ session rather than firing them late.
 | **Entry rule** | SuperTrend (14×3) agrees **and** price on the correct side of PSAR |
 | **Warm-up** | 15 closed bars (SuperTrend ATR length + 1) |
 | **Signal trigger** | First closed bar where the condition becomes true — not repeated while it holds |
-| **Exit** | The pair flips against the position, a protective stop, or manual. No profit target. |
+| **Exit** | The pair flips against the position, or manual. No stop-loss, no profit target. |
 | **Modes** | `PAPER` (simulated) and `LIVE` (real orders, explicit confirmation) |
 
 :::note[The signal is the primary exit]
 A position is held until SuperTrend and PSAR flip the *other* way and then closed
-in full; a bar where the pair merely disagrees is held, not cut. Each book also
-carries a **protective stop-loss and trailing stop** measured on the futures
-execution price (see [Strategy](./strategy.md)), which caps a single loss without
-changing when a winning trend is closed. There is no profit target.
+in full; a bar where the pair merely disagrees is held, not cut. There is **no
+stop-loss and no trailing stop** — the signal is the only exit, so a single loss
+is not capped by a level. See [Strategy](./strategy.md). There is no profit
+target.
 
 Exposure is bounded by `MAX_OPEN_LOTS` and, optionally, `MAX_DAILY_LOSS` — a
 daily realised-loss cap that blocks *new entries* once it is reached and never
@@ -106,6 +106,8 @@ These are real and worth knowing before you run it with money:
   not a default.
 - **Single writer.** SQLite allows one writer; this is a single-instance bot.
 - **No holiday-aware LIVE deferral for GIFT.** GIFT Nifty trades on NSEIX
-  holidays; the NSE F&O calendar gates *orders*, not signal evaluation.
+  holidays; the NSE F&O calendar gates *orders*, not signal evaluation. The
+  signal series is gated to the 09:15–15:30 session, so an NSEIX holiday simply
+  produces no bars to evaluate.
 - **`bot/.env` is tracked in git.** It should not be — see
   [Setup](/setup#credentials).

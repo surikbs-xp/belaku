@@ -15,22 +15,17 @@ pause switch, manual BUY/SELL and square-off.
 | Timeframe | 15 minutes | 60 minutes |
 | Execution | NFO NIFTY future | NFO NIFTY future |
 | Exit rule | `flat` — closes on a confirmed `NO_SIGNAL` | `flip` — holds through `NO_SIGNAL` |
-| Initial stop | 50 points | 200 points |
-| Trail activates at | +50 points | +200 points |
-| Trail distance | 5 points, widening to 30 at +50 | 100 points |
+| Stop-loss | none | none |
 
-Every level is measured on the **futures execution price** — the fill the broker
-gave and the live LTP the mark loop reads — never on the signal index. The signal
-series is an index; a stop measured on it would sit at a level the position can
-never be filled at, and the index/future basis would silently move the stop.
+Neither book carries a stop-loss or a trailing stop. The signal is the only exit,
+so nothing is placed at the broker to close a position and there is no level to
+measure. See [why there is no trail](#why-there-is-no-trail).
 
 ## These are the specification, not defaults
 
-The source, timeframe, exit rule, stop parameters and display name come from the
-code, not from the environment. A `.env` that omitted `STRATEGY_<n>_STOP_LOSS` used to leave that
-book with **no stop at all** — the one state a trading bot must never reach by
-omission — and one that set `STRATEGY_3_INTERVAL=60minute` silently moved the
-15-minute book onto 60-minute bars.
+The source, timeframe, exit rule and display name come from the code, not from
+the environment. A `.env` that set `STRATEGY_3_INTERVAL=60minute` silently moved
+the 15-minute book onto 60-minute bars.
 
 `STRATEGY_<n>_*` still tunes the operational knobs:
 
@@ -64,29 +59,32 @@ guess:
 Strategy books (2): gift-15m [GiftBarSource 15minute], nifty-60m [NiftyBarSource 60minute]
 ```
 
-## How the stops behave
+## Why there is no trail
 
-Each book computes its signal independently on its own series and timeframe.
+Both books ship with **no stop-loss and no trailing stop**. The initial stop is
+gone entirely; the exit rule is the only thing that closes a position.
 
-A stop only ever moves in the profitable direction and never widens. It is
-checked on the live futures price every mark cycle, not on a bar close, and it
-stays active while the book is paused: pausing blocks *entries*, and a position
-already on must stay protected.
+A trail is a second exit rule competing with the signal, and it wins that
+competition on most trades: it closes at a fixed distance from the best price, so
+a trade that would have run to a full trend reversal is cut short. Measured on
+three years of session-gated 60-minute GIFT bars, with 10 points of adverse
+slippage on every stop fill:
 
-The trail **activates** at the level in the table above — it does not merely widen
-there. Before activation the initial stop is the only protection:
+| Trail | `nifty-60m` net | `gift-15m` net |
+|---|---|---|
+| **none** | **+₹379,340** | **+₹260,481** |
+| 5 @ +200 | +₹320,095 | +₹258,329 |
+| 20 @ +200 | +₹277,228 | +₹208,962 |
+| 50 @ +200 | +₹245,215 | +₹180,167 |
+| 100 @ +200 | +₹153,396 | +₹106,782 |
 
-| GIFT 15m | | NIFTY 60m | |
-|---|---|---|---|
-| Entry | 25,000 | Entry | 25,000 |
-| Stop at +10 | 24,950 (initial) | Stop at +100 | 24,800 (initial) |
-| Stop at +49 | 24,950 (initial) | Stop at +199 | 24,800 (initial) |
-| Stop at +50 | 25,020 (trail on) | Stop at +200 | 25,100 (trail on) |
-| Stop at +80 | 25,050 | Stop at +300 | 25,200 |
+Every trail distance tested reduced net on both books. The trail converts the
+large winners that pay for the stop-outs into small ones.
 
-Without that gate the 60m book's 100-point trail engaged from the first profitable
-tick and replaced its 200-point stop with a 100-point one — the position was half
-as protected as configured, and the 200-point stop never applied at all.
+The cost is real and deliberate: a trade can run to a large open profit and give
+all of it back, and a single loss is not capped. That is the trade being made — a
+lower win rate (28–36%) for a higher profit factor (1.4–1.5), and it is the only
+configuration tested that was positive in every calendar year.
 
 ## Independent LIVE / PAPER
 
@@ -117,9 +115,8 @@ per book.
 
 Each book has its own **Pause**, **Resume** and **Square off** controls.
 
-- **Pause** stops new entries for that book only. Existing positions keep their
-  stop-loss and trailing stop, and are still closed by the signal or the stop.
-  Pausing one book never pauses the other.
+- **Pause** stops new entries for that book only. Existing positions are still
+  closed by the signal. Pausing one book never pauses the other.
 - **Resume** accepts the next valid signal. A signal that fired while paused is
   not replayed — the book waits for a fresh transition.
 - **Square off** closes only that book's positions, verifies the fill in LIVE,
