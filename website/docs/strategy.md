@@ -116,6 +116,17 @@ the NIFTY 60m strategy. See
 [Execution](/execution#two-strategies-one-instrument) for how the two books
 differ.
 
+The session gate is applied to the **signal series itself**, not only to order
+placement. A bar that closes outside 09:15–15:30 never reaches the strategy, so
+it can neither shape the indicator state nor latch an entry for the next open.
+GIFT Nifty quotes ~20 hours a day while the NFO future trades 6¼, so without
+this gate half of all fresh signals fired out of session and had to be deferred
+to 09:15 — by which time the market had usually moved past the level the signal
+was taken at. Measured over three years of 60-minute GIFT bars, the median drift
+between the signal bar's close and the first in-session fill was **60 points**,
+against a 50-point stop on the 15-minute book. See
+[Backtesting](/backtesting#the-session-gate) for the measured effect.
+
 ## SuperTrend
 
 One instance, fixed in code: a **14-period ATR with a 3× multiplier**

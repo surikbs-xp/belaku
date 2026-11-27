@@ -1316,7 +1316,7 @@ class StrategyEngine:
                     "ok": False, "action": action, "reason": daily.detail,
                     "risk": daily.to_dict(),
                 }
-            db.record_signal(action, detail, False, daily.detail, strategy_id=run.id)
+            db.record_signal(action, daily.detail, False, daily.detail, strategy_id=run.id)
             log.warning("Daily loss limit refused %s: %s", action, daily.detail)
             return decision(None, daily.detail, risk=daily.to_dict())
 
@@ -1343,7 +1343,7 @@ class StrategyEngine:
                     "portfolio": allowed.to_dict(),
                 }
             db.record_signal(
-                action, detail, False, allowed.reason,
+                action, allowed.reason, False, allowed.reason,
                 strategy_id=run.id,
             )
             log.warning("Portfolio refused %s: %s", action, allowed.reason)

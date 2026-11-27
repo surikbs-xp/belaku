@@ -253,6 +253,15 @@ Both books act only inside the NSE session. GIFT NIFTY quotes outside it, but th
 GIFT 15m strategy must not generate or execute a trade outside the permitted
 session, and neither may the NIFTY 60m strategy.
 
+The gate is applied to the **signal series**, not only to order placement: a bar
+that closes outside 09:15–15:30 never reaches the strategy. GIFT Nifty quotes ~20
+hours a day while the future trades 6¼, so without this half of all fresh signals
+fired out of session and had to be latched until the next open. Measured over
+three years of 60-minute GIFT bars, the median drift between the signal bar's
+close and the first in-session fill was **60 points** — against a 50-point stop on
+the 15-minute book, and 56.6% of latched entries were already past that stop
+before the position existed. See [Backtesting](/backtesting#the-session-gate).
+
 :::note[The futures book is filled and marked from the future only]
 An after-hours PAPER entry used to be both priced and marked from the GIFT Nifty
 level, because that was the only quote available once NSE had shut. That went

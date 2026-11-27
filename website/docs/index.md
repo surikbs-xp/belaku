@@ -106,6 +106,8 @@ These are real and worth knowing before you run it with money:
   not a default.
 - **Single writer.** SQLite allows one writer; this is a single-instance bot.
 - **No holiday-aware LIVE deferral for GIFT.** GIFT Nifty trades on NSEIX
-  holidays; the NSE F&O calendar gates *orders*, not signal evaluation.
+  holidays; the NSE F&O calendar gates *orders*, not signal evaluation. The
+  signal series is gated to the 09:15–15:30 session, so an NSEIX holiday simply
+  produces no bars to evaluate.
 - **`bot/.env` is tracked in git.** It should not be — see
   [Setup](/setup#credentials).
