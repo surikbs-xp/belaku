@@ -170,6 +170,13 @@ The indicator arithmetic itself was verified against the Pine reference on the
 same 16,226 bars: **PSAR is exact** (max difference 0.000000), and SuperTrend
 matches `ta.supertrend` to within 0.01 points after its 14-bar warm-up.
 
+A bar time without an offset is read as **exchange time**, never as the host's
+zone. Kite returns naive timestamps, and `datetime.timestamp()` on a naive value
+assumes the host's timezone — so the same bar floored to 09:15 on an IST machine
+and to 14:45 in a UTC container. That is a silent 5h30m shift in every bucket,
+and it is invisible to anyone developing in IST. The container runs in UTC, so
+this is the path that matters.
+
 ## Conclusions to carry forward
 
 1. **The exit rule is not the problem.** Flip is modestly better than flat on the
