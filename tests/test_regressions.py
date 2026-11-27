@@ -1016,7 +1016,10 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
         seconds = 300
 
         def __init__(self):
-            self.rows = [{"time": "2026-11-05T22:10:00+05:30"}]
+            # In-session bars: the signal series is gated to the hours the
+            # futures leg can trade, so an overnight bar would never reach the
+            # strategy at all.
+            self.rows = [{"time": "2026-11-05T10:00:00+05:30"}]
 
         def candles(self):
             return self.rows
@@ -1058,9 +1061,9 @@ def test_engine_primes_on_startup_then_acts_on_the_next_bar(monkeypatch, tmp_pat
     )
 
     assert runner.evaluate_now()["action"] is None
-    feed.rows.append({"time": "2026-11-05T22:15:00+05:30"})
+    feed.rows.append({"time": "2026-11-05T10:05:00+05:30"})
     assert runner.evaluate_now()["action"] is None
-    feed.rows.append({"time": "2026-11-05T22:20:00+05:30"})
+    feed.rows.append({"time": "2026-11-05T10:10:00+05:30"})
     assert runner.evaluate_now()["action"] == "SELL"
     assert actions == ["SELL"]
 
@@ -1073,7 +1076,7 @@ def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog
 
         def candles(self):
             return [{
-                "time": "2026-11-05T22:10:00+05:30",
+                "time": "2026-11-05T10:00:00+05:30",
                 "open": 100.0,
                 "high": 101.0,
                 "low": 99.0,
@@ -1112,7 +1115,7 @@ def test_engine_logs_closed_gift_candle_and_indicator_values(monkeypatch, caplog
     )
     assert "source=NSEIX:GIFT NIFTY" in message
     assert "interval_seconds=300" in message
-    assert "candle_at=2026-11-05T22:10:00+05:30" in message
+    assert "candle_at=2026-11-05T10:00:00+05:30" in message
     assert '"close": 100.5' in message
     assert '"psar": 98.75' in message
     assert '"st_14_3": 99.25' in message
@@ -1138,7 +1141,7 @@ def test_engine_exits_an_opposing_paper_position_on_startup(monkeypatch, tmp_pat
         seconds = 300
 
         def candles(self):
-            return [{"time": "2026-11-05T22:50:00+05:30"}]
+            return [{"time": "2026-11-05T10:00:00+05:30"}]
 
     feed = FakeFeed()
     # A transition into BEAR, so the bar is a fresh signal and the opposing long
@@ -3827,10 +3830,12 @@ def test_evaluate_now_closes_an_opposing_overnight_leg_without_reversing(
         lambda: {"is_open": state["open"], "reason": "Pre-market - opens 09:15 IST"},
     )
 
-    # The 08:45 bar (closed 09:00, pre-open) then the 09:00 bar (closed 09:15).
+    # Both bars close in-session, so the source's session gate keeps them. The
+    # hold is driven by the market clock instead, which is the reachable path:
+    # the source can no longer hand the engine an overnight bar at all.
     bars = [
-        {"time": "2026-11-16T08:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-16T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
     ]
     # BEAR on both bars: the state has not changed, so this is not a fresh signal.
     verdict = SimpleNamespace(
@@ -3884,14 +3889,15 @@ def test_evaluate_now_holds_the_position_when_the_morning_bar_agrees(
     eng, manager, client = _overnight_env(monkeypatch, tmp_path)
     db.open_position("NIFTY26NOVFUT", 65, 25_000.0, mode=PAPER, source="ENGINE")
 
-    state = {"open": True}
+    # Starts shut so the first bar is held, then opens for the morning bar.
+    state = {"open": False}
     monkeypatch.setattr(
         engine, "market_status",
         lambda: {"is_open": state["open"], "reason": "Market open"},
     )
     bars = [
-        {"time": "2026-11-16T08:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-16T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-16T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
     ]
     verdict = SimpleNamespace(
         signal=strategy.BULL, previous_signal=strategy.BULL, fresh=False,
@@ -3924,6 +3930,7 @@ def test_evaluate_now_holds_the_position_when_the_morning_bar_agrees(
     eng.evaluate_now()
     assert eng._overnight_pending is True
 
+    state["open"] = True
     feed.n = 2
     result = eng.evaluate_now()
 
@@ -3954,11 +3961,14 @@ def test_evaluate_now_enters_when_the_signal_arrived_while_the_market_was_shut(
         engine, "market_status",
         lambda: {"is_open": state["open"], "reason": "Market open" if state["open"] else "Post-market"},
     )
+    # In-session bars throughout: the latch is driven by the market clock, which
+    # is the only way a signal can now be deferred, since the source no longer
+    # yields overnight bars.
     bars = [
-        {"time": "2026-11-16T15:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
-        {"time": "2026-11-16T15:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-17T09:00:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
         {"time": "2026-11-17T09:15:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-17T09:30:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
+        {"time": "2026-11-17T09:45:00+05:30", "open": 1, "high": 1, "low": 1, "close": 1},
     ]
     # The BULL *starts* on the deferred bar and persists. Only the first of those
     # bars is a transition, so only it can latch the owed entry.
@@ -5533,13 +5543,17 @@ def test_nifty_source_yields_closed_bars_the_strategy_accepts(monkeypatch) -> No
 
     rows = []
     start = datetime(2026, 11, 10, 9, 15, tzinfo=IST)
-    for i in range(60):
-        opened = start + timedelta(hours=i)
-        rows.append({
-            "date": opened.replace(tzinfo=None),
-            "open": 25_000.0 + i, "high": 25_010.0 + i,
-            "low": 24_990.0 + i, "close": 25_005.0 + i,
-        })
+    # A real NSE-hours series: six 60-minute bars a day, not 60 consecutive
+    # hours. The source gates its series to the session, so a fixture that ran
+    # through the night would be testing a series the exchange never produces.
+    for day in range(10):
+        for hour in (9, 10, 11, 12, 13, 14):
+            opened = start + timedelta(days=day, hours=hour - 9)
+            rows.append({
+                "date": opened.replace(tzinfo=None),
+                "open": 25_000.0 + len(rows), "high": 25_010.0 + len(rows),
+                "low": 24_990.0 + len(rows), "close": 25_005.0 + len(rows),
+            })
 
     class FakeClient:
         def historical_data(self, instrument_token, from_date, to_date, interval):
@@ -9008,6 +9022,87 @@ def test_the_newest_closed_bar_survives_a_refresh(monkeypatch) -> None:
         f"the bar that closed at 16:15 was dropped from the series: {times}"
     )
     assert "2026-11-20 16:15:00" not in times, "the forming bar must not be kept"
+
+
+# ---------------------------------------------------------------------------
+# Session-gated signal series
+#
+# GIFT Nifty quotes ~20 hours a day; the NFO future does not. A bar that closes
+# outside 09:15-15:30 can only ever produce a signal that has to be latched
+# until the next open, by which time the market has usually moved past the level
+# the signal was taken at. Measured over three years of 60-minute GIFT bars,
+# half of all fresh signals fired out of session and the median drift between
+# the signal bar's close and the first in-session fill was 60 points - against a
+# 50-point stop on the 15-minute book. So the gate belongs on the *signal*, not
+# only on execution.
+# ---------------------------------------------------------------------------
+def test_session_gate_keeps_both_edge_bars_and_drops_the_night() -> None:
+    """The overlap rule, at both ends of the session.
+
+    A close-only test would drop the 15:15 bar on 60-minute bars (its bucket runs
+    to 16:15 because the exchange shuts at 15:30); an open-only test would drop
+    the 09:00 bar on 15-minute bars (it opens pre-market but closes at 09:15,
+    which is the morning decision's own bar). Both must survive.
+    """
+    from bar_source import bar_in_session
+
+    # 15-minute bars: 09:00 closes 09:15 (first in-session close), 15:15 closes
+    # 15:30 (last), 08:45 and 15:30 are outside.
+    assert bar_in_session("2026-11-05T09:00:00", 900) is True
+    assert bar_in_session("2026-11-05T15:15:00", 900) is True
+    assert bar_in_session("2026-11-05T08:45:00", 900) is False
+    assert bar_in_session("2026-11-05T15:30:00", 900) is False
+
+    # 60-minute bars: 15:00 opens in session and its bucket runs past the close,
+    # so it is the last bar of the day and must be kept.
+    assert bar_in_session("2026-11-05T09:00:00", 3600) is True
+    assert bar_in_session("2026-11-05T15:00:00", 3600) is True
+    assert bar_in_session("2026-11-05T08:00:00", 3600) is False
+    assert bar_in_session("2026-11-05T16:00:00", 3600) is False
+
+    # The overnight session is what the gate exists for.
+    for hour in (0, 2, 6, 18, 21, 23):
+        assert bar_in_session(f"2026-11-05T{hour:02d}:00:00", 3600) is False
+
+
+def test_session_gate_keeps_a_bar_it_cannot_place_in_time() -> None:
+    """An unparseable timestamp is a bug to surface, not a bar to discard."""
+    from bar_source import bar_in_session
+
+    assert bar_in_session(None, 900) is True
+    assert bar_in_session("not-a-timestamp", 900) is True
+
+
+def test_gift_source_hides_overnight_bars_from_the_strategy() -> None:
+    """The feed builds bars around the clock; the strategy may only see the day.
+
+    This is the whole point of the gate: the engine's decision is made on the
+    series the source hands it, so filtering at the source is what stops an
+    overnight bar from shaping the indicator state or latching an entry.
+    """
+    from bar_source import GiftBarSource
+
+    class FakeFeed:
+        seconds = 3600
+
+        def candles(self):
+            return [
+                {"time": "2026-11-05T02:00:00", "open": 1, "high": 1, "low": 1, "close": 1},
+                {"time": "2026-11-05T09:00:00", "open": 2, "high": 2, "low": 2, "close": 2},
+                {"time": "2026-11-05T14:00:00", "open": 3, "high": 3, "low": 3, "close": 3},
+                {"time": "2026-11-05T15:00:00", "open": 4, "high": 4, "low": 4, "close": 4},
+                {"time": "2026-11-05T21:00:00", "open": 5, "high": 5, "low": 5, "close": 5},
+            ]
+
+    source = GiftBarSource(FakeFeed(), interval="60minute")
+    times = [bar["time"] for bar in source.candles()]
+
+    assert times == [
+        "2026-11-05T09:00:00",
+        "2026-11-05T14:00:00",
+        "2026-11-05T15:00:00",
+    ], f"overnight bars leaked into the signal series: {times}"
+    assert source.bar_count() == 3
 
 
 # ---------------------------------------------------------------------------
