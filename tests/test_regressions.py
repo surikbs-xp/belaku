@@ -9087,6 +9087,30 @@ def test_bars_are_bucketed_from_the_session_open_not_the_epoch() -> None:
     assert start(15, 15, 900) == "15:15"
 
 
+def test_a_naive_bar_time_is_read_as_exchange_time_not_host_time() -> None:
+    """A bar timestamp without an offset means IST, whatever the host's zone is.
+
+    Kite returns bar times as naive strings, so this is the path production
+    actually takes. ``datetime.timestamp()`` on a naive value assumes the host's
+    zone, which floored 09:15 to 09:15 on an IST machine and to 14:45 in a UTC
+    container - a silent 5h30m shift in every bucket, invisible to anyone
+    developing in IST.
+    """
+    import gift_nifty
+
+    naive = datetime(2026, 11, 27, 9, 15)
+    assert gift_nifty.bucket_start(naive, 3600).strftime("%H:%M") == "09:15"
+    assert gift_nifty.bucket_start(naive, 900).strftime("%H:%M") == "09:15"
+
+    # And the aware and naive forms must agree, since they denote the same bar.
+    from kite_client import IST
+
+    aware = datetime(2026, 11, 27, 9, 15, tzinfo=IST)
+    assert gift_nifty.bucket_start(naive, 3600) == gift_nifty.bucket_start(
+        aware, 3600
+    )
+
+
 def test_a_full_session_re_buckets_into_the_seven_bars_a_chart_draws() -> None:
     """15-minute source bars aggregate onto 09:15, 10:15, ... 15:15.
 

@@ -175,7 +175,16 @@ def bucket_start(moment: datetime, seconds: int) -> datetime:
     Anchoring to the session open makes the bot's bars the same bars the chart
     draws. Outside the session the anchor still applies, so an overnight bar is
     a clean multiple of the interval from 09:15 rather than from the epoch.
+
+    A **naive** ``moment`` is read as IST, not as system-local time. Every bar
+    timestamp in this codebase is exchange time with the offset stripped, and
+    ``datetime.timestamp()`` on a naive value assumes the *host's* zone - so the
+    same bar floored to 09:15 on a developer's IST machine and to 14:45 in a UTC
+    container. That is a silent five-and-a-half-hour shift in every bucket, and
+    it only shows up where the two zones differ.
     """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=IST)
     epoch = int(moment.timestamp())
     anchor = int(
         moment.replace(
