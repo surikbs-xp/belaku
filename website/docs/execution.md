@@ -146,10 +146,10 @@ the rule is three-way:
 | Positioned | opposes | **Exit** — close the whole position |
 | Positioned | NO_SIGNAL | **Hold** — the pair disagreeing is not an exit |
 
-**The pair flipping against the position is the primary exit.** There is no
-profit target, so a position is held until SuperTrend and PSAR turn the other way
-— or until its protective stop is hit. The exit is a transition too, so a run of
-opposite bars is one exit rather than one per bar.
+**The pair flipping against the position is the only exit.** There is no profit
+target and no stop-loss, so a position is held until SuperTrend and PSAR turn the
+other way. The exit is a transition too, so a run of opposite bars is one exit
+rather than one per bar.
 
 A `NO_SIGNAL` bar is *held*, not closed. The pair disagreeing says nothing about
 a position already on, and cutting there exits trades that were merely pausing.
@@ -230,8 +230,7 @@ timeframe differ:
 | Timeframe | 15 minutes | 60 minutes |
 | Execution | `NFO:NIFTY…FUT` | `NFO:NIFTY…FUT` |
 | Exit rule | `flat` — closes on the first `NO_SIGNAL` | `flip` — holds through `NO_SIGNAL` |
-| Initial stop | 50 points | 200 points |
-| Trail | 5 points, widening to 30 after +50 | 100 points after +200 |
+| Stop-loss | none | none |
 | Modes | PAPER or LIVE | PAPER or LIVE |
 
 GIFT NIFTY is a non-tradeable index, so it is a **signal source only** — the only
@@ -390,79 +389,41 @@ any benefit from existing positions. When the API cannot answer, the check falls
 back to the static `LOT_MARGIN` estimate and **reports it as an estimate** rather
 than silently treating a guess as fact.
 
-## Protective stops
+## No stop-loss
 
-The engine's stop is a **software check on a mark loop**. It is evaluated against
-the live futures price every few seconds, which is what makes a trailing stop
-possible at all — but it only runs while this process is alive. If the bot
-crashes, the container is killed, or the Zerodha API is unreachable, nothing
-evaluates it and the position sits at the exchange with **no stop at all**.
+There is **no stop-loss and no trailing stop** on either book. The signal is the
+only exit:
 
-So every LIVE position is also backed by an **exchange-held SL-M**: a stop order
-that lives at Zerodha and fires whether or not this process is running.
-
-| | Software stop | Exchange-held SL-M |
+| Book | Exit rule | What closes a winner |
 |---|---|---|
-| Where it lives | This process | Zerodha |
-| Survives a crash | No | Yes |
-| Trails | Yes | Only when re-issued |
-| Evaluated against | The mark loop's price | The exchange's own feed |
+| `nifty-60m` | `flip` | the pair turning the other way |
+| `gift-15m` | `flat` | the first `NO_SIGNAL` bar |
 
-Both are kept. The software stop is what trails; the SL-M is what survives.
+Nothing is placed at the broker to close a position. There is no SL-M, no
+software stop check on the mark loop, and no operator endpoint to move a level.
 
-### The lifecycle
+### Why
 
-1. **On entry** — the SL-M is placed immediately after the fill, at the same
-   level the engine would have acted on. A long is protected by a SELL stop, a
-   short by a BUY stop; the side is derived from the position, never passed in,
-   because a caller that got it backwards would place a stop that *doubles* the
-   position instead of closing it.
-2. **As the trail moves** — Zerodha has no native trailing stop, so a trail is a
-   `modify_order` per step. Only a *tightened* level is pushed; re-issuing an
-   unchanged trigger would be a broker round-trip per mark for no gain.
-3. **Before every exit** — the SL-M is cancelled first. An SL-M left resting
-   while the bot closes the position becomes an order that opens a **new**
-   position in the opposite direction once the exit fills: the stop fires against
-   a flat book and sells into a short. An exit that cannot cancel its stop is
-   refused, leaving the position open and protected.
-4. **On restart and on the reconcile cadence** — every open LIVE position is
-   checked against the broker's book. A missing stop is re-placed, a lagging one
-   is tightened, and one that already fired is reported so the ledger can be
-   settled from the broker rather than left believing it is still open.
+A stop is a second exit rule competing with the signal, and it wins that
+competition on most trades: it closes at a fixed distance from the best price, so
+a trade that would have run to a full trend reversal is cut short. Measured on
+three years of session-gated 60-minute GIFT bars with 10 points of adverse
+slippage, every trail distance tested reduced net on both books — the trail
+converts the large winners that pay for the stop-outs into small ones.
 
-### When a step fails
+### What this costs
 
-A failed placement does **not** block the trade. The software stop is still
-watching, and refusing to hold a position because its backstop could not be
-placed would be worse than holding it with one layer of protection. It is logged
-at error level, surfaced on the dashboard as `NO SL-M`, and retried on the next
-reconcile.
+This is a real and deliberate trade, not an oversight:
 
-A failed *modify* is different: the exchange keeps the older trigger, so the
-position is still protected — just not as tightly as the dashboard's stop says.
-The ledger keeps the tighter level, `protective_stop` records what the exchange
-actually holds, and the tile shows `SL-M lag` until the next reconcile closes the
-gap. Collapsing the two into one column would hide exactly the discrepancy an
-operator most needs to see.
+- **A single loss is not capped.** A trade can run against the position until the
+  signal reverses, however far that is.
+- **Open profit can be given back.** A trade that runs to a large gain can return
+  all of it and close at the signal instead.
+- **Win rate falls** to roughly 28–36%, and the profit factor rises to 1.4–1.5.
 
-### What the dashboard shows
-
-| Badge | Meaning |
-|---|---|
-| `SL-M` | A stop is resting at the exchange at the ledger's level |
-| `SL-M lag` | Resting, but at an older level — protected, not as tightly |
-| `SL-M <status>` | The order is not resting (rejected, cancelled, expired) |
-| `NO SL-M` | No exchange-held stop: only the software stop protects this position |
-
-PAPER positions show no badge: there is no exchange to hold one.
-
-### Readiness
-
-`GET /api/live/readiness` includes a `protective_stops` check that **blocks**
-arming LIVE while any open LIVE position has no resting SL-M. With
-`PROTECTIVE_STOPS=false` the check is reported as non-blocking rather than
-omitted, so an operator who turned the feature off sees that LIVE positions are
-software-protected only.
+The only remaining protection is the **daily realised-loss cap**
+(`MAX_DAILY_LOSS`), which blocks *new entries* once the day's settled loss
+reaches it. It never flattens an open position.
 
 ## Panic
 

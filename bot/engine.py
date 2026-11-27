@@ -27,7 +27,6 @@ from typing import Any, Optional
 
 import database as db
 import risk
-import stops
 import strategy
 from config import (
     PAPER,
@@ -53,14 +52,6 @@ from order_manager import BUY, FLAT, SELL, ExecutionResult, get_order_manager
 from portfolio import get_aggregator
 
 log = logging.getLogger("engine")
-
-# How old a cached mark may be before the stop check refuses to trust it. The
-# mark loop refreshes the execution quote every ENGINE_INTERVAL_SECONDS (5s by
-# default), so a mark older than this means the quote path has failed - and a
-# stop evaluated against a stale price is a stop that reports "not breached" for
-# a position that may already be through it. Deliberately generous: a brief
-# network blip must not stop the check, only a sustained outage.
-STALE_MARK_SECONDS = 60.0
 
 
 def _trade_alert(
@@ -283,7 +274,6 @@ class StrategyEngine:
                     lots=cfg.lots,
                     display_name=cfg.name or cfg.id,
                     live=getattr(cfg, "live", False),
-                    stop_rules=getattr(cfg, "stop_rules", None),
                 )
             )
         if not runs:
@@ -559,198 +549,6 @@ class StrategyEngine:
         if not status["rolled"]:
             self._rollover_logged = False
         return status
-
-    def check_stops(self, prices: Optional[dict[str, float]] = None) -> list[dict[str, Any]]:
-        """Advance every open position's stop and close the ones that breached.
-
-        Runs on the mark cadence against **live futures prices**, not on a bar
-        close: a stop that waited for the candle would be a stop that lets the
-        market run through it for up to a whole bar. It is deliberately not gated
-        on the pause switch - pausing blocks *entries*, and a position that is
-        already on must stay protected.
-
-        Each position is evaluated against its own book's rules, so the two
-        strategies keep independent stops even though they hold the same
-        contract. A position whose book has no rules is left exactly as it was.
-
-        Returns one report per position that was closed, for the caller to log
-        and alert on. Never raises: a stop check that throws would leave the
-        position unprotected, which is the one outcome it must not produce.
-        """
-        reports: list[dict[str, Any]] = []
-        manager = get_order_manager()
-        if prices is None:
-            try:
-                prices = manager.price_map()
-            except Exception:  # pragma: no cover - defensive
-                log.exception("Could not price positions for the stop check")
-                return reports
-
-        rules_by_book = {
-            run.id: run.stop_rules for run in self.runs if getattr(run, "stop_rules", None)
-        }
-        if not any(rules is not None and rules.enabled for rules in rules_by_book.values()):
-            return reports
-
-        try:
-            positions = db.get_open_positions()
-        except Exception:  # pragma: no cover - defensive
-            log.exception("Could not read open positions for the stop check")
-            return reports
-
-        for position in positions:
-            book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID
-            rules = rules_by_book.get(book)
-            if rules is None or not rules.enabled:
-                continue
-            mark = prices.get(position["symbol"])
-            if mark is None:
-                continue
-            # A stale mark is not a live mark. ``get_ltp`` falls back to the last
-            # cached price when the quote endpoint fails, so a dead feed would
-            # otherwise have every stop evaluated against a price from minutes or
-            # hours ago - reported "not breached" and left unprotected. Skipping
-            # the evaluation is the honest answer: the position is not known to be
-            # safe, and the watchdog raises a stale-quote alert for it.
-            age = self._mark_age(position["symbol"])
-            if age is not None and age > STALE_MARK_SECONDS:
-                log.warning(
-                    "Stop check skipped for %s: mark is %.0fs old (limit %.0fs); "
-                    "the position is NOT known to be protected",
-                    position["symbol"], age, STALE_MARK_SECONDS,
-                )
-                continue
-            try:
-                report = self._check_one_stop(position, float(mark), rules)
-            except Exception:  # pragma: no cover - defensive
-                log.exception("Stop check failed for position %s", position.get("id"))
-                continue
-            if report is not None:
-                reports.append(report)
-        return reports
-
-    @staticmethod
-    def _mark_age(symbol: str) -> Optional[float]:
-        """Age of the cached price for ``symbol``, or ``None`` when unknown.
-
-        Read from the *order manager's* client, because that is the one whose
-        ``price_map`` produced the marks being evaluated. Reading the global
-        singleton instead would measure a different client's cache - the same
-        object in production, but not necessarily in a test or after a client
-        reset, and a mismatch there would silently disable the guard.
-
-        ``None`` (no timestamp available) is treated as fresh by the caller: a
-        test double or a client without the accessor must not disable stops.
-        """
-        try:
-            client = get_order_manager().client
-            age = getattr(client, "price_age", None)
-            return age(symbol) if callable(age) else None
-        except Exception:  # pragma: no cover - defensive
-            return None
-
-    def _check_one_stop(
-        self, position: dict[str, Any], mark: float, rules: stops.StopRules
-    ) -> Optional[dict[str, Any]]:
-        """Evaluate one position's stop at ``mark``; close it if it breached."""
-        position_key = int(position["position_key"])
-        entry = float(position["entry_price"])
-        state, breached = stops.evaluate(
-            entry_price=entry,
-            position_key=position_key,
-            mark=mark,
-            rules=rules,
-            current_stop=position.get("trailing_stop"),
-            best_price=position.get("best_price"),
-        )
-        if not breached:
-            db.update_position_stops(
-                position["id"], stop=state.current, best_price=state.best_price
-            )
-            # Keep the exchange-held stop in step with the trail. Zerodha has no
-            # native trailing stop, so a trail is a modify per step - and if that
-            # modify fails the position is still protected, just at the older
-            # level. The ledger keeps the tighter number, ``protective_stop``
-            # records what the exchange actually holds, and the next reconcile
-            # retries. Only a *tightened* level is pushed: re-issuing an unchanged
-            # trigger would be a broker round-trip per mark for no gain.
-            previous = position.get("trailing_stop")
-            if (
-                state.current is not None
-                and (previous is None or (float(state.current) - float(previous)) * position_key > 0)
-            ):
-                try:
-                    get_order_manager().move_protective_stop(
-                        {**position, "trailing_stop": state.current}, float(state.current)
-                    )
-                except Exception:  # pragma: no cover - defensive
-                    log.exception(
-                        "Could not move the protective stop for position %s",
-                        position.get("id"),
-                    )
-            return None
-
-        book = position.get("strategy_id") or db.DEFAULT_STRATEGY_ID
-        mode = position.get("mode") or get_execution_mode()
-        stop_level = position.get("trailing_stop")
-        points = (mark - entry) * position_key
-        detail = (
-            f"stop hit at {mark:.2f} (stop {stop_level if stop_level is not None else '—'}, "
-            f"{points:+.2f} pts)"
-        )
-        result = get_order_manager().square_off(
-            "STOP_LOSS",
-            source="STOP_LOSS",
-            mode=mode,
-            mark_price=mark,
-            position_id=position["id"],
-            strategy_id=book,
-        )
-        confirmed = bool(result.ok)
-        if confirmed:
-            db.update_position_stops(
-                position["id"], stop=state.current, best_price=state.best_price
-            )
-        with self._lock:
-            self._breach = risk.Breach(
-                kind="STOP_LOSS",
-                symbol=position["symbol"],
-                points=round(points, 2),
-                position_id=position["id"],
-                detail=detail,
-            )
-            if not confirmed:
-                self.state.last_error = f"stop-out unconfirmed: {result.reason}"
-        log.warning(
-            "Stop-out %s %s: %s (confirmed=%s)",
-            book, position["symbol"], detail, confirmed,
-        )
-        _trade_alert(
-            "STOP_OUT",
-            f"{position['symbol']} stopped out: {detail}",
-            severity="warning",
-            symbol=position["symbol"],
-            fields={
-                "strategy": book,
-                "venue": mode,
-                "symbol": position["symbol"],
-                "action": "EXIT",
-                "points": f"{points:+.2f}",
-                "stop": f"{stop_level:.2f}" if stop_level is not None else None,
-                "confirmed": confirmed,
-            },
-        )
-        return {
-            "kind": "STOP_LOSS",
-            "strategy_id": book,
-            "symbol": position["symbol"],
-            "position_id": position["id"],
-            "mark": mark,
-            "stop": stop_level,
-            "points": round(points, 2),
-            "confirmed": confirmed,
-            "reason": result.reason,
-        }
 
     def exit_on_signal(
         self,
@@ -1763,13 +1561,6 @@ class StrategyEngine:
             "signal_detail": detail,
             "max_age_seconds": max_age_seconds or self._signal_max_age(),
         }
-        # The protective stop, computed from the book's own rules. The order
-        # manager places it at the fill, so the level is relative to the price
-        # the broker actually gave rather than to the signal close. A book with
-        # no stop configured sends nothing and keeps the signal-only exit.
-        rules = getattr(run, "stop_rules", None) if run is not None else None
-        if rules is not None and rules.enabled:
-            payload["stop_rules"] = rules.to_dict()
         if signal_timestamp is not None:
             payload["timestamp"] = signal_timestamp.astimezone(IST).isoformat()
         # The completed signal bar, for the audit trail. Only the bar the signal

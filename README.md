@@ -16,8 +16,7 @@ Requires Python 3.12 or newer.
 | Signal source | `NSEIX:GIFT NIFTY` | `NSE:NIFTY 50` |
 | Timeframe | 15 minutes | 60 minutes |
 | Execution | NIFTY futures | NIFTY futures |
-| Initial stop | 50 points | 200 points |
-| Trail | 5 points, widening to 30 once +50 | 100 points once +200 |
+| Stop-loss | none — the signal is the only exit | none — the signal is the only exit |
 
 Each computes its signal independently on its own series and timeframe. Every
 stop is measured on the **futures execution price**, never on the signal index,
@@ -109,7 +108,6 @@ Docker volume layout, and health checks.
 | Setting | Effect |
 |---|---|
 | `BOT_NAME` | dashboard title and browser tab name (default `Belaku`) |
-| `STRATEGY_<n>_STOP_LOSS` / `_TRAIL_*` | per-strategy protective stop and trailing stop, in index points |
 | `ENGINE_INTERVAL_SECONDS` | how often the engine checks for a closed bar and marks PnL |
 | `STRATEGY_PSAR_START` / `_INCREMENT` / `_MAXIMUM` | Parabolic SAR inputs (default `0.02` / `0.02` / `0.2`) |
 
@@ -137,21 +135,19 @@ Each strategy's `STRATEGY_<n>_INTERVAL` must match the timeframe it was tuned on
 | Stale signals rejected (default 300 s) | `order_manager._signal_age_seconds` |
 | `MAX_OPEN_LOTS` and `LOT_MARGIN` enforced before every entry | `order_manager._execute_directional` |
 | `MAX_DAILY_LOSS` blocks new entries once the day's realised loss reaches it | `risk.daily_loss_breach`, checked in `engine.evaluate_run` |
-| Per-strategy protective stop and trailing stop, on the futures fill | `stops`, applied in `engine.check_stops` |
 | LIVE orders only placed inside the NSE F&O session; after-hours PAPER uses the GIFT close | `engine.StrategyEngine.execute` |
 | Unresolved orders are reconciled against the Zerodha order book, not assumed | `order_manager.OrderManager.reconcile_orders` |
 | Broker/ledger mismatches block further LIVE actions | `order_manager.OrderManager` |
-| A breached stop still closes when reconciliation fails | `order_manager.OrderManager.square_off` |
 | Panic reports partial or failed square-offs instead of claiming success | `order_manager.OrderManager.square_off` |
 | Emergency STOP ALL latches across restarts and blocks every entry | `order_manager.OrderManager.stop_all` |
 | Dashboard requires a password when `DASHBOARD_PASSWORD` is set | `dashboard_auth`, enforced in `bot.security_middleware` |
 
 ### Known limitations
 
-* **The signal is the primary exit.** Each book also carries a protective
-  stop-loss and trailing stop (see [Strategy](https://surikbs-xp.github.io/belaku/strategy)),
-  but there is no profit target: a winning trend is closed by the signal, not by
-  a fixed level.
+* **The signal is the only exit.** There is no stop-loss and no trailing stop
+  (see [Strategy](https://surikbs-xp.github.io/belaku/strategy)), so a single loss
+  is not capped by a level and there is no profit target: a winning trend is
+  closed by the signal, not by a fixed level.
 * **The dashboard is open when `DASHBOARD_PASSWORD` is empty.** Set it for any
   deployment that is not on loopback; the Lightsail deploy refuses to build a
   spec without it.

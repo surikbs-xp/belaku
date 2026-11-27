@@ -206,17 +206,15 @@ state is on `/api/status` under `watchdog`; channel config is on
 
 ## Risk limits
 
-The signal is the primary exit: a position is held for as long as SuperTrend and
-PSAR agree and closed on the first bar they stop. Each book also carries a
-**protective stop-loss and trailing stop** on the futures execution price, which
-caps a single loss without changing when a winning trend is closed. There is no
-profit target.
+The signal is the only exit: a position is held for as long as SuperTrend and
+PSAR agree and closed on the first bar they stop. There is **no stop-loss and no
+trailing stop**, so a single loss is not capped by a level. There is no profit
+target.
 
 | Setting | Effect |
 | --- | --- |
 | `MAX_OPEN_LOTS` | Reject any order that would exceed this many lots |
 | `MAX_DAILY_LOSS` | Block new entries once the day's realised loss reaches this many rupees. `0` disables it. Never flattens an open position. |
-| `STRATEGY_<n>_STOP_LOSS` / `_TRAIL_*` | Per-book protective stop and trailing stop, in index points |
 
 There is no session loss cap. It was removed because blocking entries on the day's
 realised loss is a second strategy the signal never looked at — it changes when

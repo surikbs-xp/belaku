@@ -47,16 +47,6 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_price           REAL NOT NULL,
     entry_time            TEXT NOT NULL,
     last_price            REAL,
-    -- Retained for schema compatibility with ledgers written before the exit
-    -- became signal-driven. Nothing writes these any more: there is no stop-loss
-    -- and no trailing stop, so a position has no level to record.
-    sl_price              REAL,
-    initial_sl_price      REAL,
-    trailing_stop         REAL,
-    -- The best favourable price reached since entry: the high for a long, the
-    -- low for a short. Kept for schema compatibility; nothing reads it now that
-    -- the exit is signal-driven.
-    best_price            REAL,
     status                TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
     exit_price            REAL,
     exit_time             TEXT,
@@ -65,19 +55,7 @@ CREATE TABLE IF NOT EXISTS positions (
     mode                  TEXT NOT NULL DEFAULT 'PAPER',
     source                TEXT NOT NULL DEFAULT 'WEBHOOK',
     strategy              TEXT,
-    notes                 TEXT,
-    -- The exchange-held protective order (a Zerodha SL-M) that backs this
-    -- position's stop. The software stop in ``trailing_stop`` is the level the
-    -- engine trails; this is the order that keeps protecting the position when
-    -- the engine is not running. NULL means no broker-side protection, which is
-    -- the normal state in PAPER and a reported fault in LIVE.
-    protective_order_id   TEXT,
-    -- The trigger price actually resting at the exchange. Kept separately from
-    -- ``trailing_stop`` because the two can disagree: a trail that moved in the
-    -- ledger but whose broker modify failed leaves the exchange protecting the
-    -- old level, and that gap must be visible rather than assumed away.
-    protective_stop       REAL,
-    protective_status     TEXT
+    notes                 TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions (status, symbol);
 
@@ -315,27 +293,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         conn.execute("DROP TABLE account_old")
 
-    position_columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
-    if "initial_sl_price" not in position_columns:
-        conn.execute("ALTER TABLE positions ADD COLUMN initial_sl_price REAL")
-    if "best_price" not in position_columns:
-        conn.execute("ALTER TABLE positions ADD COLUMN best_price REAL")
-        # Seed it from the entry rather than leaving it NULL: the high-water mark
-        # starts at the fill, and a NULL would make the first mark look like the
-        # best price so far even if the trade had already run.
-        conn.execute(
-            "UPDATE positions SET best_price = entry_price WHERE best_price IS NULL"
-        )
-    # The exchange-held protective order. Added after the fact so an existing
-    # ledger keeps working: a row with no protective order is exactly what every
-    # position written before this column existed is, and the startup reconcile
-    # treats that as "needs one" rather than as "protected".
-    if "protective_order_id" not in position_columns:
-        conn.execute("ALTER TABLE positions ADD COLUMN protective_order_id TEXT")
-    if "protective_stop" not in position_columns:
-        conn.execute("ALTER TABLE positions ADD COLUMN protective_stop REAL")
-    if "protective_status" not in position_columns:
-        conn.execute("ALTER TABLE positions ADD COLUMN protective_status TEXT")
 
 
 def _connect(path: Optional[str] = None) -> sqlite3.Connection:
@@ -650,11 +607,6 @@ def open_position(symbol: str, quantity: int, price: float, path: Optional[str] 
         # The key every scoped query filters on. Distinct from ``strategy`` so a
         # rename of the display name cannot silently orphan a book's history.
         "strategy_id": extra.pop("strategy_id", DEFAULT_STRATEGY_ID),
-        "sl_price": extra.pop("sl_price", None),
-        "initial_sl_price": extra.pop("initial_sl_price", None),
-        # The high-water mark starts at the fill, so the first mark can only ever
-        # move it in the favourable direction.
-        "best_price": extra.pop("best_price", price),
         "notes": extra.pop("notes", None),
     }
     cols.update(extra)
@@ -670,22 +622,11 @@ def open_position(symbol: str, quantity: int, price: float, path: Optional[str] 
 def update_position_price(
     position_id: int, price: float, path: Optional[str] = None
 ) -> None:
-    """Write a mark, advancing the high-water mark when it is a new best.
-
-    ``best_price`` is the high for a long and the low for a short, so the
-    comparison is direction-aware. It is still maintained so a ledger written by
-    an older build keeps a coherent column, even though nothing reads it now.
-    """
+    """Write a mark onto an open position."""
     with session(path) as conn:
         conn.execute(
-            "UPDATE positions SET last_price = ?, "
-            "best_price = CASE "
-            "  WHEN best_price IS NULL THEN ? "
-            "  WHEN position_key = 1 THEN MAX(best_price, ?) "
-            "  ELSE MIN(best_price, ?) "
-            "END "
-            "WHERE id = ? AND status = 'OPEN'",
-            (price, price, price, price, position_id),
+            "UPDATE positions SET last_price = ? WHERE id = ? AND status = 'OPEN'",
+            (price, position_id),
         )
 
 
@@ -737,14 +678,7 @@ def mark_open_positions(
 ) -> int:
     """Write ``prices`` onto the matching open positions. Returns rows touched.
 
-    The stop-loss compares ``last_price`` against the entry, so a mark that is
-    never written leaves the guard reading the entry price forever and it can
-    never trip. Kept as one connection for the whole sweep rather than a call per
-    position.
-
-    ``best_price`` is advanced in the same statement: it is the high for a long
-    and the low for a short. Nothing reads it now that the exit is signal-driven,
-    but keeping it in step costs nothing and leaves the column coherent.
+    Kept as one connection for the whole sweep rather than a call per position.
     """
     if not prices:
         return 0
@@ -753,162 +687,13 @@ def mark_open_positions(
         for symbol, price in prices.items():
             if price is None:
                 continue
-            query = (
-                "UPDATE positions SET last_price = ?, "
-                "best_price = CASE "
-                "  WHEN best_price IS NULL THEN ? "
-                "  WHEN position_key = 1 THEN MAX(best_price, ?) "
-                "  ELSE MIN(best_price, ?) "
-                "END "
-                "WHERE status = 'OPEN' AND symbol = ?"
-            )
-            params: list[Any] = [float(price), float(price), float(price), float(price), symbol]
+            query = "UPDATE positions SET last_price = ? WHERE status = 'OPEN' AND symbol = ?"
+            params: list[Any] = [float(price), symbol]
             if mode:
                 query += " AND mode = ?"
                 params.append(mode)
             touched += conn.execute(query, params).rowcount or 0
     return touched
-
-
-def update_position_stops(
-    position_id: int,
-    *,
-    stop: Optional[float],
-    best_price: Optional[float],
-    path: Optional[str] = None,
-) -> None:
-    """Persist a position's current stop and best price.
-
-    Written on every mark so a restart resumes the trail exactly where it was
-    rather than re-deriving it from the entry - a stop that resets on restart is
-    a stop that can be jumped by a gap the process slept through.
-    """
-    with session(path) as conn:
-        conn.execute(
-            "UPDATE positions SET trailing_stop = ?, best_price = ? "
-            "WHERE id = ? AND status = 'OPEN'",
-            (stop, best_price, position_id),
-        )
-
-
-def set_position_stop(
-    position_id: int,
-    stop: float,
-    *,
-    path: Optional[str] = None,
-) -> dict[str, Any]:
-    """Override a position's protective stop, and report what changed.
-
-    The engine's own trail only ever tightens (see :mod:`stops`), so an operator
-    override is held to the same rule: a stop may be moved **towards** the market
-    but never away from it. Loosening a stop is how a losing trade is turned into
-    a catastrophic one, and the engine would immediately re-tighten it on the
-    next mark anyway - so accepting a looser value would be a lie about what is
-    actually protecting the position.
-
-    Returns the previous and new level so the caller can log and alert on the
-    change. Raises ``ValueError`` when the position is not open or the new level
-    would widen the stop.
-    """
-    with session(path) as conn:
-        row = conn.execute(
-            "SELECT * FROM positions WHERE id = ?", (int(position_id),)
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Position {position_id} not found")
-        if row["status"] != "OPEN":
-            raise ValueError(f"Position {position_id} is not open")
-        key = int(row["position_key"])
-        entry = float(row["entry_price"])
-        previous = row["trailing_stop"]
-        initial = row["initial_sl_price"]
-        new_stop = float(stop)
-
-        # Never widen. This is the engine's own invariant (see :mod:`stops`): a
-        # stop may move towards the market but never away from it. Loosening a
-        # stop is how a losing trade becomes a catastrophic one, and the engine
-        # would re-tighten it on the next mark anyway - so accepting a looser
-        # value would show the operator a level that is not actually protecting
-        # the position.
-        #
-        # Note this is *not* a check against the entry: a profitable long's
-        # trailing stop sits above its entry, which is the whole point of a
-        # trail. Only the direction of the move matters.
-        if previous is not None:
-            tightened = (new_stop - float(previous)) * key
-            if tightened < 0:
-                raise ValueError(
-                    f"Stop {new_stop:.2f} would widen the current {float(previous):.2f}; "
-                    "a stop may only move towards the market"
-                )
-        # A level on the wrong side of the entry is not a stop at all - it would
-        # fire instantly or never. Refused so a typo cannot silently disable the
-        # protection.
-        if key == 1 and new_stop >= entry and previous is None:
-            raise ValueError(
-                f"A long stop must be below the entry ({entry:.2f}); {new_stop:.2f} is not"
-            )
-        if key == -1 and new_stop <= entry and previous is None:
-            raise ValueError(
-                f"A short stop must be above the entry ({entry:.2f}); {new_stop:.2f} is not"
-            )
-
-        conn.execute(
-            "UPDATE positions SET trailing_stop = ?, sl_price = ? "
-            "WHERE id = ? AND status = 'OPEN'",
-            (new_stop, new_stop, int(position_id)),
-        )
-        return {
-            "position_id": int(position_id),
-            "previous_stop": previous,
-            "initial_stop": initial,
-            "stop": new_stop,
-            "entry_price": entry,
-            "side": "LONG" if key == 1 else "SHORT",
-        }
-
-
-def set_position_protective_order(
-    position_id: int,
-    order_id: Optional[str],
-    stop: Optional[float],
-    status: Optional[str],
-    *,
-    path: Optional[str] = None,
-) -> None:
-    """Record the exchange-held protective order backing a position.
-
-    Kept separate from ``trailing_stop`` on purpose. The ledger's stop is the
-    level the engine *wants*; this is the level the exchange is actually
-    holding. A trail that moved in the ledger but whose broker modify failed
-    leaves the two disagreeing, and that gap is the thing an operator most needs
-    to see - collapsing them into one column would hide it.
-    """
-    with session(path) as conn:
-        conn.execute(
-            "UPDATE positions SET protective_order_id = ?, protective_stop = ?, "
-            "protective_status = ? WHERE id = ?",
-            (order_id, stop, status, int(position_id)),
-        )
-
-
-def positions_needing_protection(
-    mode: str, path: Optional[str] = None
-) -> list[dict[str, Any]]:
-    """Open LIVE positions with no exchange-held stop, or one that is not live.
-
-    The startup reconcile and the periodic pass both read this. A position in
-    this list is unprotected at the exchange: the engine may still be watching
-    it, but nothing will close it if the engine stops.
-    """
-    return _fetch_all(
-        "SELECT * FROM positions WHERE status = 'OPEN' AND mode = ? "
-        "AND (protective_order_id IS NULL OR protective_order_id = '' "
-        "     OR protective_status IS NULL "
-        "     OR protective_status NOT IN ('TRIGGER_PENDING', 'OPEN'))",
-        (mode,),
-        path,
-    )
 
 
 def close_position(
@@ -1184,8 +969,8 @@ def book_reconciled_fill(
         cur = conn.execute(
             "INSERT INTO positions "
             "(symbol, position_key, quantity, entry_price, entry_time, last_price, "
-            " mode, source, strategy, strategy_id, best_price, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " mode, source, strategy, strategy_id, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 symbol,
                 1 if signed_quantity > 0 else -1,
@@ -1197,7 +982,6 @@ def book_reconciled_fill(
                 "RECONCILE",
                 strategy_id,
                 strategy_id,
-                float(price),
                 json.dumps({"reconciled_order": exchange_order_id}),
             ),
         )

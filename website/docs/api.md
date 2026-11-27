@@ -105,13 +105,11 @@ that book still holds a live position, and requires `confirm=true` to arm `LIVE`
 
 `/api/books/manual-order` is routed through the same path as an automated
 signal, so a manual entry inherits the NSE session gate, the pause switch, the
-duplicate-entry guard, the lot and margin limits, the rollover rules and the
-book's own initial stop. The operator chooses the direction; the risk rules are
-not optional. It requires `confirm=true` because in `LIVE` it places a real
-order.
+duplicate-entry guard, the lot and margin limits and the rollover rules. The
+operator chooses the direction; the risk rules are not optional. It requires
+`confirm=true` because in `LIVE` it places a real order.
 
-Stops are configured per strategy with `STRATEGY_<n>_STOP_LOSS` and the trail
-keys, read from the environment rather than edited at runtime.
+There is no stop-loss to configure: the signal is the only exit on both books.
 
 ## Guards
 

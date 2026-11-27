@@ -3105,49 +3105,6 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
   color: var(--ink-3);
 }
 
-/* ── Stop-loss editing ──────────────────────────────────────────────────
-   The stop cell becomes interactive only when a position is open, because a
-   flat book has no level to move. The button is deliberately small and quiet:
-   it changes the protection on a live position, so it should be findable but
-   not the thing the eye lands on. */
-.book-band-stop.is-editable {
-  align-items: center;
-}
-
-.book-stop-edit {
-  margin-left: 0.35rem;
-  padding: 0.05rem 0.35rem;
-  border: 1px solid var(--edge);
-  border-radius: 0.3rem;
-  background: rgba(56, 189, 248, 0.08);
-  color: var(--brand);
-  font-size: 0.58rem;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease;
-}
-
-.book-stop-edit:hover {
-  background: rgba(56, 189, 248, 0.18);
-  border-color: var(--brand);
-}
-
-.book-stop-edit:disabled,
-.book-stop-edit.is-disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  background: transparent;
-  border-color: var(--edge-soft);
-  color: var(--ink-3);
-}
-
-.book-stop-edit:focus-visible {
-  outline: 2px solid var(--brand);
-  outline-offset: 1px;
-}
-
 /* ── NIFTY 50 group ─────────────────────────────────────────────────────
    The group is the instrument, and both books trade it. Giving it a header
    that states the shared facts once - instrument, venue, how many books - is
@@ -3249,15 +3206,10 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
 
   /* The foot is a three-column grid, so a narrow tile gives each column about
      100px - not enough for "Long 65" beside its label, and the value is what
-     gets clipped. Two columns, and the stop cell allowed to span, keeps every
-     number legible. The stop is the one figure that must never truncate. */
+     gets clipped. Two columns keeps every number legible. */
   .book-band-foot {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 0.3rem 0.6rem;
-  }
-
-  .book-band-stop {
-    grid-column: span 2;
   }
 
   .book-band-foot-value {
@@ -3265,178 +3217,6 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
     text-overflow: clip;
     white-space: nowrap;
   }
-}
-
-/* Points between the live mark and the stop. Shown beside the level because it
-   is the number a trader actually watches - "how much room is left" - and it
-   changes on every mark while the level itself only moves when the trail does. */
-.book-band-stop-distance {
-  margin-left: 0.3rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-variant-numeric: tabular-nums;
-  font-size: 0.6rem;
-  color: var(--ink-3);
-  white-space: nowrap;
-}
-
-/* ── Stop-loss editor ───────────────────────────────────────────────────
-   A form, not a prompt. The operator sees the four numbers that decide the
-   level - entry, live price, current stop, room left - and the resulting level
-   updates as they type, so the change is understood before it is committed. */
-.sl-card {
-  max-width: 30rem;
-  width: 100%;
-}
-
-.sl-facts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.4rem 0.9rem;
-  margin: 0.75rem 0 0.9rem;
-  padding: 0.6rem 0.7rem;
-  border: 1px solid var(--edge-soft);
-  border-radius: 0.5rem;
-  background: rgba(5, 7, 15, 0.45);
-}
-
-.sl-fact {
-  display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-  min-width: 0;
-}
-
-.sl-fact-label {
-  font-size: 0.56rem;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-}
-
-.sl-fact-value {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-variant-numeric: tabular-nums;
-  font-size: 0.82rem;
-  color: var(--ink-0);
-}
-
-.sl-mode {
-  display: inline-flex;
-  gap: 0.25rem;
-  padding: 0.2rem;
-  border: 1px solid var(--edge);
-  border-radius: 0.5rem;
-  background: rgba(5, 7, 15, 0.5);
-  margin-bottom: 0.7rem;
-}
-
-.sl-mode-btn {
-  padding: 0.3rem 0.7rem;
-  border: 0;
-  border-radius: 0.35rem;
-  background: transparent;
-  color: var(--ink-2);
-  font-size: 0.7rem;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.sl-mode-btn.is-active {
-  background: rgba(56, 189, 248, 0.16);
-  color: var(--brand);
-}
-
-.sl-mode-btn:focus-visible {
-  outline: 2px solid var(--brand);
-  outline-offset: 1px;
-}
-
-.sl-input-label {
-  display: block;
-  font-size: 0.6rem;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-  margin-bottom: 0.25rem;
-}
-
-.sl-input-row {
-  display: flex;
-  align-items: stretch;
-  gap: 0.4rem;
-}
-
-.sl-input {
-  flex: 1;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-variant-numeric: tabular-nums;
-  font-size: 1rem;
-}
-
-.sl-input-unit {
-  display: inline-flex;
-  align-items: center;
-  padding: 0 0.6rem;
-  border: 1px solid var(--edge);
-  border-radius: 0.4rem;
-  background: rgba(5, 7, 15, 0.5);
-  font-size: 0.65rem;
-  color: var(--ink-3);
-  white-space: nowrap;
-}
-
-.sl-preview {
-  display: flex;
-  align-items: baseline;
-  gap: 0.5rem;
-  margin-top: 0.7rem;
-  padding: 0.5rem 0.7rem;
-  border: 1px solid var(--edge-soft);
-  border-radius: 0.5rem;
-  background: rgba(56, 189, 248, 0.06);
-}
-
-.sl-preview-label {
-  font-size: 0.56rem;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-}
-
-.sl-preview-value {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-variant-numeric: tabular-nums;
-  font-size: 1rem;
-  font-weight: 650;
-  color: var(--brand);
-}
-
-.sl-preview-note {
-  font-size: 0.65rem;
-  color: var(--ink-3);
-}
-
-.sl-error {
-  margin-top: 0.6rem;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid rgba(244, 63, 94, 0.4);
-  border-radius: 0.4rem;
-  background: rgba(244, 63, 94, 0.1);
-  font-size: 0.7rem;
-  color: #fda4af;
-}
-
-@media (max-width: 480px) {
-  /* Keep the facts in two columns: the values are short and stacking them made
-     the dialog taller than the viewport on a phone. */
-  .sl-facts { gap: 0.35rem 0.6rem; }
-  .sl-fact-value { font-size: 0.76rem; }
-  /* The preview note is long enough to squeeze the value; give it its own row. */
-  .sl-preview { flex-wrap: wrap; gap: 0.15rem 0.5rem; }
-  .sl-preview-label { flex-basis: 100%; }
 }
 
 /* ── Unresolved orders ─────────────────────────────────────────────── */
@@ -3475,38 +3255,3 @@ button.cal-cell:hover { border-color: #2c3c5c; filter: brightness(1.15); }
   color: var(--ink-2);
 }
 
-/* ── Exchange-held stop badge ──────────────────────────────────────── */
-/* Distinguishes "the engine is watching a stop" from "the exchange is holding
-   one". Only the second survives this process dying, so a LIVE position without
-   it is called out rather than shown as protected. */
-.book-protect {
-  display: inline-flex;
-  align-items: center;
-  padding: 0.05rem 0.32rem;
-  border-radius: 0.28rem;
-  border: 1px solid transparent;
-  font-size: 0.56rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  cursor: help;
-}
-
-.book-protect.is-ok {
-  border-color: rgba(34, 197, 94, 0.4);
-  background: rgba(34, 197, 94, 0.14);
-  color: #4ade80;
-}
-
-.book-protect.is-warn {
-  border-color: rgba(245, 158, 11, 0.45);
-  background: rgba(245, 158, 11, 0.16);
-  color: var(--warn);
-}
-
-.book-protect.is-bad {
-  border-color: rgba(244, 63, 94, 0.5);
-  background: rgba(244, 63, 94, 0.16);
-  color: #fb7185;
-}

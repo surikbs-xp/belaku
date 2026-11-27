@@ -549,59 +549,6 @@
   </div>
 </div>
 
-<!-- Stop-loss editor. A real form rather than a browser prompt: the operator
-     needs to see the current level, the live price, and the resulting level as
-     they type, and a prompt() can show none of that. -->
-<div id="sl-modal" class="modal-backdrop hidden">
-  <div class="modal-card sl-card" role="dialog" aria-modal="true" aria-labelledby="sl-title">
-    <h3 id="sl-title" class="modal-title">Modify stop-loss</h3>
-    <p id="sl-sub" class="modal-body"></p>
-
-    <div class="sl-facts">
-      <div class="sl-fact">
-        <span class="sl-fact-label">Entry</span>
-        <span id="sl-entry" class="sl-fact-value">—</span>
-      </div>
-      <div class="sl-fact">
-        <span class="sl-fact-label">Live price</span>
-        <span id="sl-mark" class="sl-fact-value">—</span>
-      </div>
-      <div class="sl-fact">
-        <span class="sl-fact-label">Current stop</span>
-        <span id="sl-current" class="sl-fact-value">—</span>
-      </div>
-      <div class="sl-fact">
-        <span class="sl-fact-label">Room left</span>
-        <span id="sl-room" class="sl-fact-value">—</span>
-      </div>
-    </div>
-
-    <div class="sl-mode" role="tablist" aria-label="How to set the stop">
-      <button id="sl-mode-price" class="sl-mode-btn is-active" type="button" role="tab" aria-selected="true">By price</button>
-      <button id="sl-mode-points" class="sl-mode-btn" type="button" role="tab" aria-selected="false">By points</button>
-    </div>
-
-    <label id="sl-input-label" class="sl-input-label" for="sl-input">New stop price</label>
-    <div class="sl-input-row">
-      <input id="sl-input" class="field sl-input" type="number" step="0.05" inputmode="decimal" autocomplete="off" />
-      <span id="sl-input-unit" class="sl-input-unit">price</span>
-    </div>
-
-    <div class="sl-preview">
-      <span class="sl-preview-label">New stop</span>
-      <span id="sl-preview" class="sl-preview-value">—</span>
-      <span id="sl-preview-note" class="sl-preview-note"></span>
-    </div>
-
-    <p id="sl-error" class="sl-error hidden"></p>
-
-    <div class="modal-actions">
-      <button id="sl-cancel" class="btn btn-neutral" type="button">Cancel</button>
-      <button id="sl-apply" class="btn btn-danger" type="button" disabled>Move stop</button>
-    </div>
-  </div>
-</div>
-
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/app.js?v=trader-40" defer></script>
