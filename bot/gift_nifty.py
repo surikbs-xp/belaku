@@ -33,7 +33,7 @@ from typing import Any, Callable, Optional
 
 import database as db
 from config import settings
-from kite_client import IST, contract_expiry, future_symbol, get_client
+from kite_client import IST, MARKET_OPEN, contract_expiry, future_symbol, get_client
 
 log = logging.getLogger("gift_nifty")
 
@@ -156,9 +156,35 @@ def interval_to_seconds(interval: str) -> int:
 
 
 def bucket_start(moment: datetime, seconds: int) -> datetime:
-    """Floor ``moment`` to the start of its candle bucket."""
+    """Floor ``moment`` to the start of its candle bucket.
+
+    Buckets are aligned to the **NSE session open**, not to the UTC epoch. The
+    epoch is a multiple of every intraday interval, so flooring to it puts the
+    boundaries on UTC-aligned wall-clock times: on 60-minute bars that is 08:30,
+    09:30, 10:30 IST, and on 15-minute bars it happens to coincide with 09:15
+    only because 09:15 is a quarter-hour.
+
+    That is not how a chart draws them. TradingView and Kite both anchor
+    intraday bars to the session open, so a 60-minute chart shows 09:15-10:15,
+    10:15-11:15 and so on. Flooring to the epoch instead produced bars covering
+    08:30-09:30, 09:30-10:30 - a different window for every bar, and one fewer
+    bar per day. The indicators were then computed on a series the chart never
+    shows, so SuperTrend and PSAR sat at levels that could not be reconciled
+    against the chart no matter how correct the arithmetic was.
+
+    Anchoring to the session open makes the bot's bars the same bars the chart
+    draws. Outside the session the anchor still applies, so an overnight bar is
+    a clean multiple of the interval from 09:15 rather than from the epoch.
+    """
     epoch = int(moment.timestamp())
-    return datetime.fromtimestamp(epoch - (epoch % seconds), tz=IST)
+    anchor = int(
+        moment.replace(
+            hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0
+        ).timestamp()
+    )
+    return datetime.fromtimestamp(
+        anchor + ((epoch - anchor) // seconds) * seconds, tz=IST
+    )
 
 
 @dataclass

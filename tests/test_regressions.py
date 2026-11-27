@@ -5564,7 +5564,11 @@ def test_nifty_source_yields_closed_bars_the_strategy_accepts(monkeypatch) -> No
     class FakeClient:
         def historical_data(self, instrument_token, from_date, to_date, interval):
             assert instrument_token == bar_source.NIFTY_SPOT_TOKEN
-            assert interval == "60minute"
+            # A 60-minute book asks for 15-minute source bars and re-buckets
+            # them, because Kite floors intraday bars to the UTC epoch (09:30,
+            # 10:30 IST) while a chart anchors them to the 09:15 open. See
+            # bar_source.align_to_session.
+            assert interval == "15minute"
             return list(rows)
 
     src = bar_source.NiftyBarSource(interval="60minute", client=FakeClient())
@@ -5574,6 +5578,9 @@ def test_nifty_source_yields_closed_bars_the_strategy_accepts(monkeypatch) -> No
     candles = src.candles()
     assert [c["time"] for c in candles] == sorted(c["time"] for c in candles)
     assert src.seconds == 3600
+    # The bars are the chart's: 09:15-10:15, 10:15-11:15, ... not 09:30-10:30.
+    assert candles[0]["time"].endswith("09:15:00"), candles[0]["time"]
+    assert candles[1]["time"].endswith("10:15:00"), candles[1]["time"]
     verdict = strategy.evaluate(candles, {})
     assert verdict.signal in {strategy.BULL, strategy.BEAR, strategy.NO_SIGNAL}
     assert verdict.bars == 60
@@ -9042,6 +9049,97 @@ def test_the_newest_closed_bar_survives_a_refresh(monkeypatch) -> None:
 # 50-point stop on the 15-minute book. So the gate belongs on the *signal*, not
 # only on execution.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Session-aligned bars
+#
+# The indicators are only reconcilable against a chart if the bot buckets the
+# same ticks into the same windows. Kite floors intraday bars to the UTC epoch,
+# so a 60-minute series comes back at 09:30, 10:30, 11:30 IST; a chart anchors
+# the interval to the 09:15 open and draws 09:15-10:15, 10:15-11:15. Those are
+# different windows over the same ticks, so SuperTrend and PSAR sat at levels the
+# chart never showed - and no amount of correct arithmetic fixes a wrong window.
+# ---------------------------------------------------------------------------
+def test_bars_are_bucketed_from_the_session_open_not_the_epoch() -> None:
+    """A 60-minute bar starts at 09:15, not 08:30 or 09:30.
+
+    The epoch is a multiple of every intraday interval, so flooring to it puts
+    the boundaries on UTC-aligned wall-clock times. Anchoring to the session open
+    is what makes the bot's bars the bars the chart draws.
+    """
+    import gift_nifty
+    from kite_client import IST
+
+    def start(hour: int, minute: int, seconds: int = 3600) -> str:
+        moment = datetime(2026, 11, 27, hour, minute, tzinfo=IST)
+        return gift_nifty.bucket_start(moment, seconds).strftime("%H:%M")
+
+    # 60-minute: the chart's boundaries.
+    assert start(9, 15) == "09:15"
+    assert start(9, 20) == "09:15"
+    assert start(10, 0) == "09:15"
+    assert start(10, 15) == "10:15"
+    assert start(15, 15) == "15:15"
+    assert start(15, 29) == "15:15"
+
+    # 15-minute: unchanged, because 09:15 is already a quarter-hour boundary.
+    assert start(9, 15, 900) == "09:15"
+    assert start(9, 30, 900) == "09:30"
+    assert start(15, 15, 900) == "15:15"
+
+
+def test_a_full_session_re_buckets_into_the_seven_bars_a_chart_draws() -> None:
+    """15-minute source bars aggregate onto 09:15, 10:15, ... 15:15.
+
+    This is the shape a 60-minute chart shows for an NSE day. The old epoch
+    flooring produced six bars starting at 09:30, so the bot was one bar short
+    and every bar covered a different window.
+    """
+    import bar_source
+
+    rows = []
+    moment = datetime(2026, 11, 27, 9, 15)
+    while moment < datetime(2026, 11, 27, 15, 30):
+        rows.append({
+            "time": moment.isoformat(sep=" "),
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+        })
+        moment += timedelta(minutes=15)
+
+    out = bar_source.align_to_session(rows, 3600)
+    assert [bar["time"][11:16] for bar in out] == [
+        "09:15", "10:15", "11:15", "12:15", "13:15", "14:15", "15:15",
+    ], [bar["time"] for bar in out]
+
+
+def test_re_bucketing_aggregates_ohlc_rather_than_picking_one_bar() -> None:
+    """The hour's high is the highest of its quarters, not the last one's."""
+    import bar_source
+
+    rows = [
+        {"time": "2026-11-27 09:15:00", "open": 100.0, "high": 105.0, "low": 99.0, "close": 101.0},
+        {"time": "2026-11-27 09:30:00", "open": 101.0, "high": 112.0, "low": 98.0, "close": 110.0},
+        {"time": "2026-11-27 09:45:00", "open": 110.0, "high": 111.0, "low": 95.0, "close": 96.0},
+        {"time": "2026-11-27 10:00:00", "open": 96.0, "high": 97.0, "low": 94.0, "close": 95.0},
+    ]
+    out = bar_source.align_to_session(rows, 3600)
+    assert len(out) == 1, out
+    assert out[0]["open"] == 100.0, "the open is the first quarter's open"
+    assert out[0]["high"] == 112.0, "the high is the highest quarter"
+    assert out[0]["low"] == 94.0, "the low is the lowest quarter"
+    assert out[0]["close"] == 95.0, "the close is the last quarter's close"
+
+
+def test_re_bucketing_is_a_no_op_when_the_source_is_already_the_book_interval() -> None:
+    """A 15-minute book must not have its own bars re-aggregated."""
+    import bar_source
+
+    rows = [
+        {"time": "2026-11-27 09:15:00", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5},
+        {"time": "2026-11-27 09:30:00", "open": 1.5, "high": 3.0, "low": 1.0, "close": 2.5},
+    ]
+    assert bar_source.align_to_session(rows, 900) == rows
+
+
 def test_session_gate_keeps_both_edge_bars_and_drops_the_night() -> None:
     """The overlap rule, at both ends of the session.
 

@@ -141,6 +141,35 @@ The gate is worth more than any stop or trail tuning tested, and it is a
 structural fix rather than a fitted parameter: it removes trades the execution
 venue could never have taken at the price the signal assumed.
 
+## Bar alignment
+
+The gate decides *which* bars the strategy sees. Alignment decides *what window
+each bar covers*, and it matters just as much: the indicators are only
+reconcilable against a chart if the bot buckets the same ticks into the same
+windows.
+
+Kite floors intraday bars to the **UTC epoch**. A 60-minute series therefore
+comes back at 09:30, 10:30, 11:30 IST — six bars a day. A chart anchors the same
+interval to the **09:15 session open** and draws 09:15–10:15, 10:15–11:15 — seven
+bars a day. Same ticks, different windows, so SuperTrend and PSAR sat at levels
+the chart never showed. No amount of correct arithmetic fixes a wrong window.
+
+Both paths are now anchored to the session open:
+
+| Path | Before | After |
+|---|---|---|
+| `gift-15m` (tick-built) | 08:30, 09:30, 10:30 … | **09:15, 10:15, 11:15 …** |
+| `nifty-60m` (Kite history) | 09:30, 10:30 … (6/day) | **09:15, 10:15 … (7/day)** |
+
+`bucket_start()` anchors to `MARKET_OPEN` instead of the epoch, and
+`NiftyBarSource` fetches 15-minute source bars and re-buckets them with
+`align_to_session()`, because Kite will not serve a session-aligned 60-minute
+series directly.
+
+The indicator arithmetic itself was verified against the Pine reference on the
+same 16,226 bars: **PSAR is exact** (max difference 0.000000), and SuperTrend
+matches `ta.supertrend` to within 0.01 points after its 14-bar warm-up.
+
 ## Conclusions to carry forward
 
 1. **The exit rule is not the problem.** Flip is modestly better than flat on the

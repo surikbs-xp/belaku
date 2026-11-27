@@ -31,7 +31,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 import database as db
 import kite_client
 from config import settings
-from gift_nifty import HISTORY_REFRESH_SECONDS, interval_to_seconds
+from gift_nifty import HISTORY_REFRESH_SECONDS, bucket_start, interval_to_seconds
 
 log = logging.getLogger("bar_source")
 
@@ -95,6 +95,83 @@ def bar_in_session(bar_at: Any, seconds: int) -> bool:
 def session_bars(candles: list[dict[str, Any]], seconds: int) -> list[dict[str, Any]]:
     """``candles`` restricted to the bars that overlap the NSE session."""
     return [c for c in candles if bar_in_session(c.get("time"), seconds)]
+
+
+def align_to_session(
+    candles: list[dict[str, Any]], seconds: int
+) -> list[dict[str, Any]]:
+    """Re-bucket ``candles`` onto session-aligned boundaries.
+
+    Kite's ``historical_data`` returns intraday bars floored to the **UTC
+    epoch**, so a 60-minute series comes back at 09:30, 10:30, 11:30 IST. A chart
+    anchors the same interval to the **session open**, so it draws 09:15-10:15,
+    10:15-11:15. The two are different windows over the same ticks, which is why
+    the bot's SuperTrend and PSAR could not be reconciled against the chart even
+    though the arithmetic was exact.
+
+    This rebuilds the series from the finest bars available, so the boundaries
+    are the chart's. It is a no-op when the input is already aligned, and it
+    refuses to invent data: a bucket with no source bars is skipped rather than
+    filled, and the caller keeps whatever it had.
+
+    ``candles`` must be finer than ``seconds`` for this to do anything. When it
+    is not - a 60-minute request for a 60-minute series - the input is returned
+    unchanged, because there is nothing to re-bucket from.
+    """
+    if not candles:
+        return candles
+    try:
+        source_seconds = _infer_interval(candles)
+    except Exception:  # pragma: no cover - defensive
+        return candles
+    if source_seconds <= 0 or source_seconds >= seconds:
+        return candles
+
+    buckets: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for candle in candles:
+        try:
+            opened = datetime.fromisoformat(str(candle["time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        start = bucket_start(opened, seconds).isoformat(sep=" ")
+        bucket = buckets.get(start)
+        if bucket is None:
+            buckets[start] = {
+                "time": start,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+            }
+            order.append(start)
+            continue
+        bucket["high"] = max(bucket["high"], float(candle["high"]))
+        bucket["low"] = min(bucket["low"], float(candle["low"]))
+        bucket["close"] = float(candle["close"])
+    return [buckets[key] for key in order]
+
+
+def _infer_interval(candles: list[dict[str, Any]]) -> int:
+    """The spacing between consecutive bars, in seconds.
+
+    Taken as the *smallest* positive gap rather than the first one: a series that
+    spans a session break has a large overnight gap, and using that would make
+    every bar look like a daily bar.
+    """
+    gaps: list[int] = []
+    previous: Optional[datetime] = None
+    for candle in candles:
+        try:
+            opened = datetime.fromisoformat(str(candle["time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if previous is not None:
+            gap = int((opened - previous).total_seconds())
+            if gap > 0:
+                gaps.append(gap)
+        previous = opened
+    return min(gaps) if gaps else 0
 
 
 @runtime_checkable
@@ -303,12 +380,23 @@ class NiftyBarSource:
         span_seconds = self.seconds * self._bars * 4
         from_date = now - timedelta(seconds=span_seconds)
 
+        # Fetch a *finer* interval than the book needs and aggregate it onto
+        # session-aligned boundaries. Kite floors intraday bars to the UTC epoch,
+        # so asking for 60minute returns 09:30, 10:30, 11:30 IST - while a chart
+        # anchors the same interval to the 09:15 open and draws 09:15-10:15,
+        # 10:15-11:15. Those are different windows over the same ticks, so the
+        # indicators ran on a series the chart never shows and could not be
+        # reconciled against it. 15-minute source bars are the finest Kite serves
+        # for a long window, and they re-bucket exactly onto the chart's hours.
+        source_interval = self.interval
+        if self.seconds >= 3600:
+            source_interval = "15minute"
         try:
             rows = self.client.historical_data(
                 instrument_token=self._token,
                 from_date=from_date,
                 to_date=now,
-                interval=self.interval,
+                interval=source_interval,
             )
         except Exception as exc:  # pragma: no cover - defensive
             rows = []
@@ -343,6 +431,9 @@ class NiftyBarSource:
             if row.get("date") is not None
         ]
         series.sort(key=lambda candle: candle["time"])
+        # Re-bucket onto the chart's boundaries. A no-op when the source interval
+        # already matches the book's, which is the case for the 15-minute book.
+        series = align_to_session(series, self.seconds)
         # The newest bar may still be forming; Kite includes it. Dropping it is
         # what keeps "closed bar" true, and it matches the GIFT feed's contract.
         if series and self._is_forming(series[-1]["time"], now):
