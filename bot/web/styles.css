@@ -978,6 +978,35 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* The close is the *signal series*, not the future the book holds. Naming the
+   series inline is what stops the reader comparing an index level against the
+   price Zerodha quotes for the contract. */
+.book-band-close-series {
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-right: 0.3rem;
+}
+
+/* The basis to the execution future. Muted because it is context, not a level:
+   it explains why the numbers differ from the broker rather than being one. */
+.book-band-close-basis {
+  margin-left: 0.35rem;
+  font-size: 0.62rem;
+  font-weight: 500;
+  color: var(--ink-3);
+}
+
+/* States which series the rule levels belong to, once, under both rows. */
+.book-band-rules-note {
+  font-size: 0.58rem;
+  color: var(--ink-3);
+  padding: 0.1rem 0.45rem 0;
+  line-height: 1.35;
+}
+
 /* Which series the verdict was computed on. On a split tile the legs are on
    other venues, so the signal's own series has to be stated or the reader will
    assume it came from whichever leg they are looking at. */

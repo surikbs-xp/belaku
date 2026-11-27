@@ -9450,6 +9450,70 @@ def test_no_stop_loss_architecture_remains() -> None:
         assert not hasattr(database, gone), f"database still has {gone}"
 
 
+def test_the_lot_budget_can_fund_every_enabled_book() -> None:
+    """MAX_OPEN_LOTS is a portfolio budget, so it must cover both books.
+
+    It is not a per-book size. With two books enabled and a budget of one lot,
+    the first book to enter consumes the whole budget and the second is refused
+    on every signal with "2 lots would exceed MAX_OPEN_LOTS=1". On the dashboard
+    that is indistinguishable from a strategy that has stopped working - the
+    book evaluates, reports its signal, and never places an order.
+
+    The books are specified as independent, so the shipped configuration has to
+    be able to fund both. This pins the arithmetic rather than the number, so
+    raising a book's size without raising the budget fails here.
+    """
+    import config
+
+    enabled = [cfg for cfg in config.strategy_configs() if cfg.enabled]
+    needed = sum(max(1, int(cfg.lots or 1)) for cfg in enabled)
+    assert config.settings.max_open_lots >= needed, (
+        f"MAX_OPEN_LOTS={config.settings.max_open_lots} cannot fund {len(enabled)} "
+        f"book(s) needing {needed} lot(s); the books will refuse each other's entries"
+    )
+
+
+def test_a_short_lot_budget_is_reported_as_a_warning(monkeypatch) -> None:
+    """The misconfiguration is surfaced, not left to be diagnosed from silence."""
+    import config
+
+    original = config.settings
+    monkeypatch.setattr(
+        config, "settings",
+        SimpleNamespace(**{**original.__dict__, "max_open_lots": 1}),
+    )
+    warnings = config.validate()
+    assert any("MAX_OPEN_LOTS" in w for w in warnings), (
+        f"a 1-lot budget for two books produced no warning: {warnings}"
+    )
+
+
+def test_every_decision_is_logged_with_its_reason(monkeypatch, tmp_path, caplog) -> None:
+    """A book that evaluates and does not trade must say why.
+
+    The entry and exit gates return a reason for *not* acting - "waiting for a
+    transition", "position already matches the verdict", "held until the first
+    bar that closes in-session". None of those logged, so a book that evaluated
+    every bar and never traded left no trace: the only evidence was the absence
+    of an order, which is exactly what a broken engine looks like too.
+    """
+    import logging
+
+    eng, feed, client = _fresh_signal_env(monkeypatch, tmp_path, [
+        # A BULL that is *not* a transition: the previous bar was BULL too, so
+        # the entry gate refuses it and the reason is the only thing to see.
+        _verdict(strategy.BULL, strategy.BULL),
+    ])
+    feed.n = 1
+    with caplog.at_level(logging.INFO, logger="engine"):
+        result = eng.evaluate_now()
+
+    assert result["action"] is None, result
+    reasons = [r.getMessage() for r in caplog.records if "Decision strategy=" in r.getMessage()]
+    assert reasons, "the refused entry logged no decision line"
+    assert "not a new signal" in reasons[-1], reasons[-1]
+
+
 def test_a_position_is_opened_with_no_stop_level(monkeypatch, tmp_path) -> None:
     """An entry records no stop, and no SL-M is placed behind it.
 

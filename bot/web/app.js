@@ -65,6 +65,10 @@ const state = {
   // it, but the tab can be opened (or the venue switched) between two fast
   // polls, so the tiles read this cache instead of blanking to "—".
   portfolio: null,
+  // Last /api/status payload. The book tiles need the execution future's own
+  // price to show the basis against the signal series, and that price rides the
+  // status feed rather than the strategies feed.
+  status: null,
   failures: 0,
   lastSync: null,
   busy: false,
@@ -1517,6 +1521,7 @@ async function poll() {
 
     state.lastSync = new Date();
     state.failures = 0;
+    state.status = status;
 
     // Track server clock drift so the countdown can trust it.
     const serverTime = status.server_time ? new Date(status.server_time) : null;
@@ -2431,6 +2436,21 @@ function renderBookBand(run, perf, accounts, columnKey) {
 
   const g = flipGaps(num(run.last_close), values);
 
+  // The levels below are the *signal series*, which is an index and cannot be
+  // traded. The book is exposed to the NIFTY future, and the two differ by the
+  // basis - a few hundred points on a normal day. Showing the index levels with
+  // no label read as "these are my levels" and they never matched the price on
+  // Zerodha, which quotes the future. So the series is named, and the basis to
+  // the future is stated beside it: that gap is what the trade has to overcome
+  // before it is profitable, and it is the number that explains the mismatch.
+  const exec = (state.status && state.status.feed && state.status.feed.exec) || null;
+  const execPrice = exec ? num(exec.price) : null;
+  const basis = execPrice !== null && g.close !== null ? execPrice - g.close : null;
+  const seriesLabel = signalVenue || 'signal';
+  const basisNote = basis === null
+    ? ''
+    : ` · future ${level(execPrice)} (${basis >= 0 ? '+' : ''}${level(basis, 1)})`;
+
   // Indicators and rule checks are the same two numbers read two ways, so they
   // share one row: each states the indicator's level, its own direction and how
   // far price is from flipping it. A single "2 of 2 confirmed" count hides which
@@ -2489,18 +2509,31 @@ function renderBookBand(run, perf, accounts, columnKey) {
   // What the book is doing next, in words. The verdict ships a compact string
   // ("close=… psar=… ST bullish confirm BUY 2/2 SELL 0/2") which is useful in a
   // tooltip and unreadable as the last line of a tile.
+  //
+  // The level named here is the *signal series* level, not a price the position
+  // can be closed at. The book holds the future, so the exit happens when the
+  // future's own price crosses the equivalent level - the index level plus the
+  // basis. Saying "exits at <index level>" beside a future position was the
+  // claim that made the tile look wrong against Zerodha.
   const singleLevels = [g.st, g.psar].filter((v) => v !== null);
   const singleFlip = singleLevels.length === 0
     ? null
     : (signal === 'BEAR' ? Math.max(...singleLevels) : Math.min(...singleLevels));
+  const flipOnFuture = singleFlip === null || basis === null
+    ? null
+    : singleFlip + basis;
+  const flipText = singleFlip === null
+    ? ''
+    : `${seriesLabel} ${level(singleFlip)}`
+      + (flipOnFuture === null ? '' : ` (future ≈ ${level(flipOnFuture)})`);
   const singleFooter = singleFlip === null
     ? 'No level to act on yet - the indicators have not produced a value.'
     : open === 0
       ? (signal === 'NO_SIGNAL'
         ? 'Waiting for SuperTrend and PSAR to agree.'
         : `Rules already ${signal === 'BULL' ? 'long' : 'short'} - `
-          + `enters on the next flip, at ${level(singleFlip)}.`)
-      : `Holding ${open > 0 ? 'long' : 'short'} ${Math.abs(open)}; exits at ${level(singleFlip)} `
+          + `enters on the next flip, at ${flipText}.`)
+      : `Holding ${open > 0 ? 'long' : 'short'} ${Math.abs(open)}; exits at ${flipText} `
         + 'or on the next flip.';
 
   // There is no stop. The signal is the only exit, so the tile shows the level
@@ -2589,8 +2622,14 @@ function renderBookBand(run, perf, accounts, columnKey) {
       <div class="book-band-signal">
         <span class="book-band-signal-value ${signalClass}">${escapeHtml(signal)}</span>
         <span class="book-band-signal-note">${escapeHtml(signalNote)}</span>
-        <span class="book-band-close-inline" title="${escapeHtml(`bar range ${g.range ? level(g.range, 1) : '—'}`)}">
-          ${g.close === null ? '—' : level(g.close)}
+        <span class="book-band-close-inline" title="${escapeHtml(
+          `${seriesLabel} close ${g.close === null ? '—' : level(g.close)}`
+          + ` · bar range ${g.range ? level(g.range, 1) : '—'}`
+          + (basis === null ? '' : ` · NIFTY future ${level(execPrice)} (basis ${basis >= 0 ? '+' : ''}${level(basis, 1)})`)
+          + '. The levels below are the signal series, not the future you trade.')}">
+          <span class="book-band-close-series">${escapeHtml(seriesLabel)}</span>
+          ${g.close === null ? '—' : level(g.close)}${basisNote
+            ? `<span class="book-band-close-basis">${escapeHtml(basisNote)}</span>` : ''}
         </span>
       </div>
 
@@ -2599,6 +2638,9 @@ function renderBookBand(run, perf, accounts, columnKey) {
           g.stGap === null ? '—' : `${level(g.stGap, 1)}`, g.stNear)}
         ${ruleRow('PSAR', g.psar === null ? '—' : level(g.psar), psarDir,
           g.psarGap === null ? '—' : `${level(g.psarGap, 1)}`, g.psarNear)}
+        <div class="book-band-rules-note">${escapeHtml(
+          `${seriesLabel} levels · the book trades the NIFTY future`
+          + (basis === null ? '' : `, currently ${basis >= 0 ? '+' : ''}${level(basis, 1)} away`))}</div>
       </div>
 
       <div class="book-band-foot">

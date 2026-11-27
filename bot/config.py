@@ -356,6 +356,24 @@ def validate() -> list[str]:
             )
     except Exception:  # pragma: no cover - defensive
         pass
+    # MAX_OPEN_LOTS is a *portfolio* budget shared by every book, not a per-book
+    # size. With two books enabled and a budget of one lot, the first book to
+    # enter consumes the whole budget and the second is refused on every signal
+    # with "2 lots would exceed MAX_OPEN_LOTS=1" - which on the dashboard is
+    # indistinguishable from a strategy that has stopped working. The books are
+    # specified as independent, so the budget has to be able to fund both.
+    try:
+        enabled = [cfg for cfg in strategy_configs() if cfg.enabled]
+        needed = sum(max(1, int(cfg.lots or 1)) for cfg in enabled)
+        if enabled and settings.max_open_lots < needed:
+            warnings.append(
+                f"MAX_OPEN_LOTS={settings.max_open_lots} cannot fund "
+                f"{len(enabled)} enabled book(s) needing {needed} lot(s) in total. "
+                "The budget is shared by every strategy, so the books will refuse "
+                "each other's entries. Raise MAX_OPEN_LOTS or disable a book."
+            )
+    except Exception:  # pragma: no cover - defensive
+        pass
     return warnings
 
 

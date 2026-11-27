@@ -1095,6 +1095,22 @@ class StrategyEngine:
         market_open = market_status()["is_open"]
 
         def decision(action: Optional[str], reason: str, **extra: Any) -> dict[str, Any]:
+            # Every decision is logged, not just the ones that place an order.
+            # The entry and exit gates below return a reason for *not* trading -
+            # "waiting for a transition", "position already matches", "held until
+            # the first bar that closes in-session" - and none of them logged, so
+            # a book that evaluated every bar and never traded left no trace of
+            # why. The only evidence was the absence of an order, which is
+            # indistinguishable from a broken engine. One line per evaluation
+            # makes the reason the visible thing.
+            log.info(
+                "Decision strategy=%s bar=%s signal=%s action=%s reason=%s",
+                run.id if run is not None else self.strategy_id,
+                newest,
+                signal,
+                action or "NONE",
+                reason,
+            )
             return {
                 "ok": True,
                 "signal": signal,

@@ -288,6 +288,14 @@ only exit, so a single loss is not capped by a level. `MAX_DAILY_LOSS` blocks ne
 entries once the day's settled loss reaches it, and never flattens an open
 position.
 
+It is a **portfolio** budget, not a per-book size. Both books trade the same
+contract, so the limit is shared: with two books enabled and `MAX_OPEN_LOTS=1`,
+the first book to enter consumes the whole budget and the second is refused on
+every signal with `2 lots would exceed MAX_OPEN_LOTS=1`. That looks exactly like
+a strategy that has stopped working — the book evaluates, reports its signal, and
+never places an order. The budget must be at least the sum of the enabled books'
+sizes, and `config.validate()` warns at startup when it is not.
+
 `STOP_LOSS_POINTS`, `TRAILING_STOP_ENABLED`, `TRAILING_INITIAL_POINTS`,
 `TRAILING_STEP_POINTS`, `TRAILING_TIGHTEN_AT_POINTS`, `TRAILING_TIGHT_POINTS`,
 `LARGE_CANDLE_ATR_MULTIPLIER` and `LARGE_CANDLE_MAX_POINTS` are **no longer
